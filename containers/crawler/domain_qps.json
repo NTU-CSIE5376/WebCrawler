@@ -1,0 +1,5 @@
+{
+    "_default": { "delay": 5.0, "concurrency": 4 },
+    "wikipedia.org": { "delay": 2.0, "concurrency": 8 }
+}
+

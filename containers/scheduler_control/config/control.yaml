@@ -1,0 +1,24 @@
+offerer:
+  # Offerer IDs to run (inclusive)
+  id_start: 0
+  id_end: 15
+
+  # Disk path
+  # The crawler id equals offerer id by default in this mapping.
+  queue_dir_template: "/data/ipc/url_queue/crawler_{id:02d}"
+  stats_dir: "/data/ipc/stats"
+
+  # Shard assignment rule
+  total_shards: 256
+  shards_per_offerer: 16
+
+  # Refill policy
+  scan_interval_sec: 300
+  low_watermark_batches: 20
+  batch_size: 512
+  per_shard_select_cap: 4096
+
+
+postgres:
+  dsn: "postgresql+psycopg2://crawler:crawler@172.16.191.1:5432/crawlerdb"
+

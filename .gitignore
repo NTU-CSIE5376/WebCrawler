@@ -1,0 +1,12 @@
+__pycache__/
+.venv/
+
+.scrapy/
+httpcache/
+tmp/
+
+.DS_Store
+.vscode/
+*.swp
+*.swo
+

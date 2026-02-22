@@ -1,0 +1,40 @@
+router:
+  progress_template: "/data/ipc/progress/router/{id:02d}.json"
+  crawler_dir_template: "/data/ipc/crawl_result/crawler_{id:02d}"
+  ingestor_dir_template: "/data/ipc/crawl_result/ingestor_{id:02d}"
+  stats_dir: "/data/ipc/stats"
+  interval_minutes: 30
+
+  num_shards: 256
+  shards_per_ingestor: 16
+
+  # explicitly route top-level domains
+  domain_overrides:
+    wikipedia.org: 0
+    x.com: 32
+    youtube.com: 64
+    reddit.com: 96
+    instagram.com: 128
+    espn.com: 160
+    facebook.com: 192
+    yahoo.com: 224
+
+ingestor:
+  progress_template: "/data/ipc/progress/ingestor/{id:02d}.json"
+  result_dir_template: "/data/ipc/crawl_result/ingestor_{id:02d}"
+  stats_dir: "/data/ipc/stats"
+  interval_minutes: 30
+
+extractor:
+  progress_template: "/data/ipc/progress/extractor/{id:02d}.json"
+  result_dir_template: "/data/ipc/crawl_result/ingestor_{id:02d}"
+  stats_dir: "/data/ipc/stats"
+  interval_minutes: 30
+
+stats:
+  stats_dir: "/data/ipc/stats"
+  bad_dir: "/data/ipc/stats/bad"
+
+postgres:
+  dsn: "postgresql+psycopg2://crawler:crawler@172.16.191.1:5432/crawlerdb"
+
