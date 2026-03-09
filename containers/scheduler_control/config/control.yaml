@@ -22,3 +22,17 @@ offerer:
 postgres:
   dsn: "postgresql+psycopg2://crawler:crawler@172.16.191.1:5432/crawlerdb"
 
+accounting:
+  total_shards: 256
+  event_retention_days: 90
+  batch_size: 1000
+
+  # Daily UTC schedule for rolling out aged counters.
+  run_hour_utc: 3
+  run_minute_utc: 0
+
+  # Polling cadence for schedule check.
+  check_interval_sec: 3600
+
+  # If the service starts after today's schedule, run immediately once.
+  catch_up_on_start: true
