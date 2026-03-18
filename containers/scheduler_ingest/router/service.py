@@ -82,6 +82,8 @@ class RouterService:
         error = 0
         file_cnt = 0
 
+        domain_cache = {}
+
         for f in folder.iterdir():
             if not f.is_file():
                 continue
@@ -111,7 +113,7 @@ class RouterService:
                 for attempt in range(3):
                     try:
                         with self.Session() as sess:
-                            domain_resolver = DomainResolver(sess)
+                            domain_resolver = DomainResolver(sess, domain_cache)
                             with sess.begin():
                                 # resolve domain_id from DB (insert if missing)
                                 domain_id, _ = domain_resolver.ensure_and_get(domain, shard_id)
