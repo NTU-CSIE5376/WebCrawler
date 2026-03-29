@@ -20,6 +20,10 @@ DOWNLOAD_DELAY = _DEFAULT_QPS.get("delay", 1.0)
 DOWNLOAD_SLOTS = _DOMAIN_QPS
 AUTOTHROTTLE_ENABLED = False
 
+# Keep a local request backlog so one slow domain does not block the next IPC batch.
+IPC_PREFETCH_LOW_WATERMARK_REQUESTS = CONCURRENT_REQUESTS * 2
+IPC_PREFETCH_TARGET_REQUESTS = CONCURRENT_REQUESTS * 8
+
 DNS_TIMEOUT = 15
 DOWNLOAD_TIMEOUT = 15
 DOWNLOAD_MAXSIZE = 10 * 1024 * 1024
@@ -46,4 +50,3 @@ ITEM_PIPELINES = {
 URL_QUEUE_TEMPLATE = "/data/ipc/url_queue/crawler_{id:02d}"
 RESULT_DIR_TEMPLATE = "/data/ipc/crawl_result/crawler_{id:02d}"
 INTERVAL_MINUTES = 10
-
