@@ -15,11 +15,9 @@ from urllib.parse import urlparse
 
 import psycopg2
 
-NUM_SHARDS = 256
-INJECT_AFTER_WEEKS = 4
+from constants import NUM_SHARDS, CRAWLERDB, METRICDB, SOURCE_GOLDEN
 
-CRAWLERDB = dict(host="172.16.191.1", port=5432, user="crawler", password="crawler", dbname="crawlerdb")
-METRICDB = dict(host="172.16.191.1", port=5433, user="metric", password="metric", dbname="metricdb")
+INJECT_AFTER_WEEKS = 4
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -53,7 +51,6 @@ def fetch_urls_by_batches(metric_cur, batch_ids: list[int]) -> list[dict]:
         FROM metric_url u
         JOIN metric_queries q ON u.query_id = q.id
         WHERE q.batch_id = ANY(%s)
-          AND u.is_discovered = FALSE
         """,
         (batch_ids,),
     )
@@ -80,15 +77,15 @@ def ensure_domain(crawler_cur, domain: str, shard_id: int) -> tuple[int, float]:
 
 
 def inject_url(crawler_cur, url: str, domain_id: int, shard_id: int, domain_score: float) -> bool:
-    tcur = f"url_state_current_{shard_id:03d}"
+    table = f"url_state_current_{shard_id:03d}"
     crawler_cur.execute(
         f"""
-        INSERT INTO {tcur} (url, domain_id, domain_score)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (url) DO NOTHING
+        INSERT INTO {table} (url, domain_id, domain_score, source)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (url) DO UPDATE SET source = EXCLUDED.source
         RETURNING url
         """,
-        (url, domain_id, domain_score),
+        (url, domain_id, domain_score, SOURCE_GOLDEN),
     )
     return crawler_cur.fetchone() is not None
 
