@@ -13,33 +13,52 @@ class QueueConsumer:
     Per-domain queue consumer:
       - list domain_*.json files
       - read then DELETE immediately
-      - return {domain_name: [urls]}
+      - return {domain_id: [urls]}
     """
 
     def __init__(self, queue_dir: str):
         self.queue_dir = Path(queue_dir)
 
-    def pop_domain_batches(self, limit: int = 0) -> dict[str, list[str]]:
+    def pop_domain_batches(
+        self,
+        limit: int = 0,
+        exclude_domain_ids: set[int] | None = None,
+    ) -> dict[int, list[str]]:
         """
         Read up to `limit` domain files (0 = all available).
-        Returns {domain_name: [url, ...]}.
-        Each file is deleted immediately after reading.
+        Files whose domain_id is in `exclude_domain_ids` are skipped
+        (left on disk for a future pop).
+        Returns {domain_id: [url, ...]}.
+        Each consumed file is deleted immediately after reading.
         """
         if not self.queue_dir.exists():
             return {}
 
-        files = sorted(
+        candidates = sorted(
             f for f in self.queue_dir.iterdir()
             if _DOMAIN_FILE_RE.match(f.name)
         )
-        if not files:
+        if not candidates:
+            return {}
+
+        # Filter out domains that the caller already has in-flight.
+        if exclude_domain_ids:
+            candidates = [
+                f for f in candidates
+                if int(_DOMAIN_FILE_RE.match(f.name).group(1)) not in exclude_domain_ids
+            ]
+
+        if not candidates:
             return {}
 
         if limit > 0:
-            files = files[:limit]
+            candidates = candidates[:limit]
 
-        result: dict[str, list[str]] = {}
-        for p in files:
+        result: dict[int, list[str]] = {}
+        for p in candidates:
+            m = _DOMAIN_FILE_RE.match(p.name)
+            domain_id = int(m.group(1))
+
             try:
                 data = read_json(p)
             except Exception:
@@ -53,8 +72,7 @@ class QueueConsumer:
             if not isinstance(urls, list) or not urls:
                 continue
 
-            domain = str(data.get("domain_id", p.stem))
-            result[domain] = [str(u) for u in urls]
+            result[domain_id] = [str(u) for u in urls]
 
         return result
 
