@@ -1,11 +1,45 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from libs.ipc.jsonio import read_json
 
 _DOMAIN_FILE_RE = re.compile(r"^domain_(\d+)\.json$")
+
+
+@dataclass(frozen=True)
+class _DomainQueueFile:
+    path: Path
+    domain_id: int
+    mtime_ns: int
+
+
+def _parse_domain_queue_file(path: Path) -> _DomainQueueFile | None:
+    m = _DOMAIN_FILE_RE.match(path.name)
+    if not m:
+        return None
+
+    try:
+        ns = path.stat().st_mtime_ns
+    except OSError:
+        ns = (1 << 63) - 1
+
+    return _DomainQueueFile(
+        path=path,
+        domain_id=int(m.group(1)),
+        mtime_ns=ns,
+    )
+
+
+def _domain_json_sort_key(entry: _DomainQueueFile) -> tuple[int, int]:
+    """
+    Order queue files for consumption: oldest mtime first, then by domain_id.
+    Filename ordering is not a reliable proxy for queue age.
+    Id-only ordering starves high domain_ids when many low-id files keep arriving.
+    """
+    return (entry.mtime_ns, entry.domain_id)
 
 
 class QueueConsumer:
@@ -35,8 +69,12 @@ class QueueConsumer:
             return {}
 
         candidates = sorted(
-            f for f in self.queue_dir.iterdir()
-            if _DOMAIN_FILE_RE.match(f.name)
+            [
+                entry
+                for f in self.queue_dir.iterdir()
+                if (entry := _parse_domain_queue_file(f)) is not None
+            ],
+            key=_domain_json_sort_key,
         )
         if not candidates:
             return {}
@@ -44,8 +82,7 @@ class QueueConsumer:
         # Filter out domains that the caller already has in-flight.
         if exclude_domain_ids:
             candidates = [
-                f for f in candidates
-                if int(_DOMAIN_FILE_RE.match(f.name).group(1)) not in exclude_domain_ids
+                entry for entry in candidates if entry.domain_id not in exclude_domain_ids
             ]
 
         if not candidates:
@@ -55,9 +92,9 @@ class QueueConsumer:
             candidates = candidates[:limit]
 
         result: dict[int, list[str]] = {}
-        for p in candidates:
-            m = _DOMAIN_FILE_RE.match(p.name)
-            domain_id = int(m.group(1))
+        for entry in candidates:
+            p = entry.path
+            domain_id = entry.domain_id
 
             try:
                 data = read_json(p)

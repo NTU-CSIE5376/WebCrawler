@@ -101,14 +101,14 @@ class HtmlSpider(scrapy.Spider):
         print(f"[crawler-{self.crawler_id:02d}] {message}, {self._runtime_suffix()}", flush=True)
 
     def _build_request(self, url: str, domain_id: int) -> scrapy.Request:
-        source_url, fetch_url = split_bench_url(url)
         self._domain_pending[domain_id] = self._domain_pending.get(domain_id, 0) + 1
         return scrapy.Request(
-            url=fetch_url,
+            url=url,
             callback=self.parse,
             errback=self.errback,
-            meta={"source_url": source_url, "_track_domain_id": domain_id},
+            meta={"source_url": url, "_track_domain_id": domain_id},
         )
+
 
     def _reserve_urls(self, reason: str, force: bool = False) -> list[tuple[int, str]]:
         needs_domains = len(self._domain_pending) < self.domain_low_watermark
