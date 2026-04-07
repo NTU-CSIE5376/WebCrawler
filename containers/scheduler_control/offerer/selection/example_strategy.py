@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from typing import List, Tuple
 
 from sqlalchemy import text
@@ -18,25 +19,51 @@ class ExampleStrategy(SelectionStrategy):
     def _event_table(self, shard_id: int) -> str:
         return f"url_event_counter_{shard_id:03d}"
 
-    def _select_and_update(
+    def select_by_domain(
         self,
-        sess,
-        table: str,
-        event_table: str,
-        limit: int,
-        order_by_sql: str,
-    ) -> List[Tuple[str, int]]:
-        if limit <= 0:
-            return []
+        shard_id: int,
+        exclude_domain_ids: set[int],
+        per_domain_cap: int,
+        max_domains: int,
+    ) -> dict[int, list[str]]:
+        if max_domains <= 0 or per_domain_cap <= 0:
+            return {}
+
+        table = self._table(shard_id)
+        event_table = self._event_table(shard_id)
+
+        exclude_clause = ""
+        params: dict = {
+            "max_domains": max_domains,
+            "per_domain_cap": per_domain_cap,
+        }
+        if exclude_domain_ids:
+            exclude_clause = "AND domain_id NOT IN :exclude"
+            params["exclude"] = tuple(exclude_domain_ids)
 
         sql = text(f"""
-        WITH picked AS (
-            SELECT url, domain_id
+        WITH eligible_domains AS (
+            SELECT DISTINCT domain_id
             FROM {table}
             WHERE should_crawl = TRUE
-            ORDER BY {order_by_sql}
-            LIMIT :limit
-            FOR UPDATE SKIP LOCKED
+              {exclude_clause}
+            ORDER BY domain_id
+            LIMIT :max_domains
+        ),
+        picked AS (
+            SELECT u.url, u.domain_id
+            FROM eligible_domains d,
+            LATERAL (
+                SELECT url, domain_id
+                FROM {table}
+                WHERE should_crawl = TRUE AND domain_id = d.domain_id
+                ORDER BY url_score DESC NULLS LAST,
+                         domain_score DESC NULLS LAST,
+                         last_scheduled ASC NULLS FIRST,
+                         first_seen ASC
+                LIMIT :per_domain_cap
+                FOR UPDATE SKIP LOCKED
+            ) u
         ),
         updated AS (
             UPDATE {table} x
@@ -61,55 +88,11 @@ class ExampleStrategy(SelectionStrategy):
         FROM updated u;
         """)
 
-        rows = sess.execute(
-            sql,
-            {"limit": limit},
-        ).fetchall()
-
-        return [(r.url, r.domain_id) for r in rows]
-
-    def select_and_update(self, shard_id: int, limit: int) -> List[Tuple[str, int]]:
-        if limit <= 0:
-            return []
-
-        table = self._table(shard_id)
-        event_table = self._event_table(shard_id)
-        half = limit // 2
-        rest = limit - half
-
-        results: List[Tuple[str, int]] = []
-
         with self.Session() as sess:
-            # Phase A: score-aware
-            if half > 0:
-                results += self._select_and_update(
-                    sess,
-                    table,
-                    event_table,
-                    half,
-                    order_by_sql="""
-                        url_score DESC NULLS LAST,
-                        domain_score DESC NULLS LAST,
-                        last_scheduled ASC NULLS FIRST,
-                        first_seen ASC
-                    """,
-                )
-
-            # Phase B: fairness / recency-based
-            if rest > 0:
-                results += self._select_and_update(
-                    sess,
-                    table,
-                    event_table,
-                    rest,
-                    order_by_sql="""
-                        last_scheduled ASC NULLS FIRST,
-                        first_seen ASC
-                    """,
-                )
-
+            rows = sess.execute(sql, params).fetchall()
             sess.commit()
 
-        return results
-
-
+        result: dict[int, list[str]] = defaultdict(list)
+        for r in rows:
+            result[r.domain_id].append(r.url)
+        return dict(result)

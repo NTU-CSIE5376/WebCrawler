@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 import time
-import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
 from libs.ipc.jsonio import atomic_write_json
-from libs.ipc.queue_scan import count_ready_batches
+from libs.ipc.queue_scan import list_queued_domain_ids, count_domain_files
 from libs.stats.delta_writer import StatsDeltaWriter, now_iso
 from .selection.base import SelectionStrategy
-from .batching import round_robin_mix, chunk
 
 
 @dataclass(frozen=True)
@@ -38,9 +36,9 @@ class OffererConfig:
     offerer_id: int
 
     scan_interval_sec: int
-    low_watermark_batches: int
-    batch_size: int
-    per_shard_select_cap: int
+    max_domain_files: int
+    low_watermark_domains: int
+    per_domain_url_cap: int
 
     stats_dir: str
 
@@ -57,80 +55,104 @@ class OffererService:
         self.selector = selector
         self.stats = StatsDeltaWriter(stats_dir=cfg.stats_dir)
 
-    def _write_one_batch_file(self, queue_dir: str, urls: list[str]) -> str:
+    def _write_domain_file(self, queue_dir: str, domain_id: int, urls: list[str]) -> str:
         """
-        Writes url_queue schema:
-          {"generated_at": "...", "urls": [...]}
-        Filename: <unix_ts>_<uuid>.json
+        Writes one per-domain queue file:
+          {"generated_at": "...", "domain_id": N, "urls": [...]}
+        Filename: domain_{domain_id:06d}.json
         """
         Path(queue_dir).mkdir(parents=True, exist_ok=True)
-        name = f"{int(time.time())}_{uuid.uuid4()}.json"
+        name = f"domain_{domain_id:06d}.json"
         final_path = str(Path(queue_dir) / name)
 
-        payload = {"generated_at": now_iso(), "urls": urls}
+        payload = {
+            "generated_at": now_iso(),
+            "domain_id": domain_id,
+            "urls": urls,
+        }
         atomic_write_json(final_path, payload)
         return final_path
 
     def _refill_once_if_needed(self) -> dict:
         offerer_id = self.cfg.offerer_id
         queue_dir = self.deriv.queue_dir(offerer_id)
-        cur_batches = count_ready_batches(queue_dir)
 
-        if cur_batches >= self.cfg.low_watermark_batches:
-            return {"action": "noop", "queue_dir": queue_dir, "current_batches": cur_batches}
+        existing_domain_ids = list_queued_domain_ids(queue_dir)
+        cur_count = len(existing_domain_ids)
+
+        if cur_count >= self.cfg.low_watermark_domains:
+            return {
+                "action": "noop",
+                "queue_dir": queue_dir,
+                "current_domains": cur_count,
+            }
+
+        slots_to_fill = self.cfg.max_domain_files - cur_count
+        if slots_to_fill <= 0:
+            return {
+                "action": "noop",
+                "queue_dir": queue_dir,
+                "current_domains": cur_count,
+            }
 
         shard_start, shard_end = self.deriv.shard_range(offerer_id)
         shard_ids = list(range(shard_start, shard_end + 1))
 
-        # Pick up to cap per shard, then mix and batch.
-        per_shard_urls = defaultdict(list)
+        exclude = set(existing_domain_ids)
+        new_domains: dict[int, list[str]] = {}
+        domain_counter: dict[int, int] = defaultdict(int)
         total_picked = 0
-        domain_counter = defaultdict(int)
 
         for sid in shard_ids:
-            picked = self.selector.select_and_update(sid, self.cfg.per_shard_select_cap)
-            total_picked += len(picked)
-            for url, domain_id in picked:
-                per_shard_urls[sid].append(url)
-                domain_counter[domain_id] += 1
+            if slots_to_fill <= 0:
+                break
 
-        # If nothing picked, do nothing.
+            per_shard = self.selector.select_by_domain(
+                shard_id=sid,
+                exclude_domain_ids=exclude,
+                per_domain_cap=self.cfg.per_domain_url_cap,
+                max_domains=slots_to_fill,
+            )
+
+            for domain_id, urls in per_shard.items():
+                if not urls:
+                    continue
+                new_domains[domain_id] = urls
+                exclude.add(domain_id)
+                domain_counter[domain_id] += len(urls)
+                total_picked += len(urls)
+                slots_to_fill -= 1
+
         if total_picked == 0:
             return {
                 "action": "refill_empty",
                 "queue_dir": queue_dir,
-                "current_batches": cur_batches,
+                "current_domains": cur_count,
                 "picked_urls": 0,
             }
 
-        mixed = round_robin_mix(per_shard_urls)
-        parts = chunk(mixed, self.cfg.batch_size)
-
         written = 0
-        for part in parts:
-            self._write_one_batch_file(queue_dir, part)
+        for domain_id, urls in new_domains.items():
+            self._write_domain_file(queue_dir, domain_id, urls)
             written += 1
 
-        # Stats delta: offerer only knows how many urls/batches it emitted.
         self.stats.write(
             source="offerer",
             counters={
                 "num_scheduled": total_picked,
             },
             domains={
-                int(domain_id): {
-                    "num_scheduled": cnt
-                }
+                int(domain_id): {"num_scheduled": cnt}
                 for domain_id, cnt in domain_counter.items()
-            }
+            },
         )
 
         return {
             "action": "refill",
             "queue_dir": queue_dir,
-            "current_batches": cur_batches,
+            "current_domains": cur_count,
+            "new_domains": written,
             "picked_urls": total_picked,
-            "written_batches": written,
             "shards": {"start": shard_start, "end": shard_end},
         }
 
@@ -149,4 +171,3 @@ class OffererService:
                     },
                 )
             time.sleep(self.cfg.scan_interval_sec)
-

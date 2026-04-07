@@ -21,6 +21,13 @@ class HtmlSpider(scrapy.Spider):
     def __init__(self, crawler_id: int = 0, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.crawler_id = int(crawler_id)
+        self._inflight = 0
+        self._max_inflight = 0
+        self._max_transferring = 0
+        self._max_slot_queue = 0
+        self._pending_requests = 0
+        self._max_pending_requests = 0
+        self._domain_pending: dict[int, int] = {}
 
     @classmethod
     def from_crawler(cls, crawler, *args, **kwargs):
@@ -30,6 +37,10 @@ class HtmlSpider(scrapy.Spider):
         spider.queue = QueueConsumer(queue_dir=qtpl.format(id=spider.crawler_id))
         spider.link_extractor = LinkExtractor(canonicalize=True)
 
+        spider.domain_low_watermark = max(
+            0, crawler.settings.getint("IPC_DOMAIN_LOW_WATERMARK", 10)
+        )
+
         crawler.signals.connect(spider.on_idle, signal=signals.spider_idle)
         crawler.signals.connect(spider.req_scheduled, signal=signals.request_scheduled)
         crawler.signals.connect(spider.req_start, signal=signals.request_reached_downloader)
@@ -37,32 +48,137 @@ class HtmlSpider(scrapy.Spider):
 
         return spider
 
-    async def start(self):
-        urls = self.queue.pop_batch()
-        t = datetime.now()
-        print(f"[crawler-{self.crawler_id:02d}] Get {len(urls)} new requests, time={t}", flush=True)
+    def _set_inflight_stats(self):
+        stats = getattr(self.crawler, "stats", None)
+        if stats is None:
+            return
+        stats.set_value("inflight/current", self._inflight, spider=self)
+        stats.set_value("inflight/max", self._max_inflight, spider=self)
+        stats.set_value("pending/current", self._pending_requests, spider=self)
+        stats.set_value("pending/max", self._max_pending_requests, spider=self)
+        stats.set_value("active_domains/current", len(self._domain_pending), spider=self)
+        runtime = self._downloader_runtime()
+        stats.set_value("transferring/current", runtime["transferring"], spider=self)
+        stats.set_value("transferring/max", self._max_transferring, spider=self)
+        stats.set_value("slot_queue/current", runtime["slot_queue"], spider=self)
+        stats.set_value("slot_queue/max", self._max_slot_queue, spider=self)
 
-        for u in urls:
-            yield scrapy.Request(
-                url=u,
-                callback=self.parse,
-                errback=self.errback
+    def _downloader_runtime(self) -> dict[str, int]:
+        downloader = getattr(getattr(self.crawler, "engine", None), "downloader", None)
+        slots = getattr(downloader, "slots", {}) or {}
+
+        transferring = 0
+        slot_queue = 0
+        slot_active = 0
+
+        for slot in slots.values():
+            transferring += len(getattr(slot, "transferring", ()) or ())
+            slot_queue += len(getattr(slot, "queue", ()) or ())
+            slot_active += len(getattr(slot, "active", ()) or ())
+
+        self._max_transferring = max(self._max_transferring, transferring)
+        self._max_slot_queue = max(self._max_slot_queue, slot_queue)
+
+        return {
+            "transferring": transferring,
+            "slot_queue": slot_queue,
+            "slot_active": slot_active,
+            "slots": len(slots),
+        }
+
+    def _runtime_suffix(self) -> str:
+        runtime = self._downloader_runtime()
+        return (
+            f"active_domains={len(self._domain_pending)}, "
+            f"pending={self._pending_requests}, pending_max={self._max_pending_requests}, "
+            f"inflight={self._inflight}, inflight_max={self._max_inflight}, "
+            f"transferring={runtime['transferring']}, transferring_max={self._max_transferring}, "
+            f"slot_queue={runtime['slot_queue']}, slot_queue_max={self._max_slot_queue}, "
+            f"slot_active={runtime['slot_active']}, slots={runtime['slots']}"
+        )
+
+    def _log(self, message: str):
+        print(f"[crawler-{self.crawler_id:02d}] {message}, {self._runtime_suffix()}", flush=True)
+
+    def _build_request(self, url: str, domain_id: int) -> scrapy.Request:
+        self._domain_pending[domain_id] = self._domain_pending.get(domain_id, 0) + 1
+        return scrapy.Request(
+            url=url,
+            callback=self.parse,
+            errback=self.errback,
+            meta={"source_url": url, "_track_domain_id": domain_id},
+        )
+
+
+    def _reserve_urls(self, reason: str, force: bool = False) -> list[tuple[int, str]]:
+        needs_domains = len(self._domain_pending) < self.domain_low_watermark
+        if not force and not needs_domains:
+            return []
+
+        pending_before = self._pending_requests
+        slots = self.domain_low_watermark - len(self._domain_pending)
+        if slots <= 0:
+            slots = 1 if force else 0
+        if slots <= 0:
+            return []
+
+        batch = self.queue.pop_domain_batches(
+            limit=slots,
+            exclude_domain_ids=set(self._domain_pending.keys()),
+        )
+
+        reserved: list[tuple[int, str]] = []
+        for domain_id, urls in batch.items():
+            for url in urls:
+                reserved.append((domain_id, url))
+            self._pending_requests += len(urls)
+
+        if reserved:
+            self._max_pending_requests = max(self._max_pending_requests, self._pending_requests)
+            self._set_inflight_stats()
+            self._log(
+                "Top-up loaded "
+                f"{len(reserved)} requests in {len(batch)} domain files, reason={reason}, "
+                f"pending_before={pending_before}, pending_after={self._pending_requests}, "
+                f"new_domains={len(batch)}"
             )
+        elif force or needs_domains:
+            self._set_inflight_stats()
+            self._log(
+                f"Top-up found no batch, reason={reason}, "
+                f"pending_before={pending_before}, pending_after={self._pending_requests}"
+            )
+
+        return reserved
+
+    def _schedule_reserved_urls(self, entries: list[tuple[int, str]]) -> int:
+        for domain_id, url in entries:
+            self.crawler.engine.crawl(self._build_request(url, domain_id))
+        return len(entries)
+
+    def _maybe_top_up(self, reason: str, force: bool = False) -> int:
+        entries = self._reserve_urls(reason=reason, force=force)
+        return self._schedule_reserved_urls(entries)
+
+    def _finish_owned_request(self, reason: str, domain_id: int = 0) -> None:
+        self._pending_requests = max(0, self._pending_requests - 1)
+        if domain_id and domain_id in self._domain_pending:
+            self._domain_pending[domain_id] -= 1
+            if self._domain_pending[domain_id] <= 0:
+                del self._domain_pending[domain_id]
+        self._set_inflight_stats()
+        if len(self._domain_pending) < self.domain_low_watermark:
+            self._maybe_top_up(reason=f"{reason}_low_watermark")
+
+    def spider_opened(self, spider=None):
+        self._set_inflight_stats()
+
+    async def start(self):
+        for domain_id, url in self._reserve_urls(reason="start", force=True):
+            yield self._build_request(url, domain_id)
 
     def on_idle(self):
-        urls = self.queue.pop_batch()
-        t = datetime.now()
-        print(f"[crawler-{self.crawler_id:02d}] Get {len(urls)} new requests, time={t}", flush=True)
-
-        for u in urls:
-            self.crawler.engine.crawl(
-                scrapy.Request(
-                    url=u,
-                    callback=self.parse,
-                    errback=self.errback
-                )
-            )
-
+        self._maybe_top_up(reason="idle", force=True)
         raise DontCloseSpider
 
     def _extract_domain(self, url):
@@ -73,10 +189,14 @@ class HtmlSpider(scrapy.Spider):
 
     def parse(self, response):
         url = canonicalize_url(response.url)
-        domain = self._extract_domain(url)
+        source_url = response.meta.get("source_url", response.url)
+        track_domain_id = response.meta.get("_track_domain_id", 0)
+        fetched_url = canonicalize_url(response.url)
+        domain = self._extract_domain(fetched_url)
 
         ctype = response.headers.get("Content-Type", b"").decode().lower()
         if not any(t in ctype for t in ACCEPTED_CONTENT_TYPES):
+            self._finish_owned_request(reason="non_html", domain_id=track_domain_id)
             yield PageItem(
                 url=url,
                 domain=domain,
@@ -97,6 +217,7 @@ class HtmlSpider(scrapy.Spider):
                     "anchor": (link.text or "").strip()[:200]
                 })
 
+        self._finish_owned_request(reason="parse", domain_id=track_domain_id)
         yield PageItem(
             url=url,
             domain=domain,
@@ -107,7 +228,10 @@ class HtmlSpider(scrapy.Spider):
 
     def errback(self, failure):
         url = canonicalize_url(failure.request.url)
-        domain = self._extract_domain(url)
+        source_url = failure.request.meta.get("source_url", failure.request.url)
+        track_domain_id = failure.request.meta.get("_track_domain_id", 0)
+        fetched_url = canonicalize_url(failure.request.url)
+        domain = self._extract_domain(fetched_url)
 
         item = PageItem(
             url=url,
@@ -124,6 +248,7 @@ class HtmlSpider(scrapy.Spider):
             if "exceeded DOWNLOAD_MAXSIZE" in item["fail_reason"]:
                 item["fail_reason"] = f"IgnoreRequest exceeded DOWNLOAD_MAXSIZE"
 
+        self._finish_owned_request(reason="errback", domain_id=track_domain_id)
         yield item
 
     def req_scheduled(self, request):

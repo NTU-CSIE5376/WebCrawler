@@ -57,10 +57,10 @@ def main() -> None:
 
     cfg = OffererConfig(
         offerer_id=offerer_id,
-        scan_interval_sec=int(offerer.get("scan_interval_sec", 5)),
-        low_watermark_batches=int(offerer.get("low_watermark_batches", 20)),
-        batch_size=int(offerer.get("batch_size", 512)),
-        per_shard_select_cap=int(offerer.get("per_shard_select_cap", 4096)),
+        scan_interval_sec=int(offerer.get("scan_interval_sec", 300)),
+        max_domain_files=int(offerer.get("max_domain_files", 32)),
+        low_watermark_domains=int(offerer.get("low_watermark_domains", 16)),
+        per_domain_url_cap=int(offerer.get("per_domain_url_cap", 100)),
         stats_dir=str(offerer.get("stats_dir", "/data/ipc/stats")),
     )
 

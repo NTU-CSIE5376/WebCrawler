@@ -12,11 +12,11 @@ offerer:
   total_shards: 256
   shards_per_offerer: 16
 
-  # Refill policy
-  scan_interval_sec: 300
-  low_watermark_batches: 20
-  batch_size: 512
-  per_shard_select_cap: 4096
+  # Refill policy (per-domain)
+  scan_interval_sec: 60
+  max_domain_files: 128
+  low_watermark_domains: 70
+  per_domain_url_cap: 200
 
 
 postgres:
