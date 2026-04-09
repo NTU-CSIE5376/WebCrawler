@@ -123,12 +123,14 @@ Key columns:
 - rolling counters: `num_scheduled_90d`, `num_fetch_ok_90d`, `num_fetch_fail_90d`, `num_content_update_90d`
 - quality/failure: `num_consecutive_fail`, `last_fail_reason`, `content_hash`
 - scheduling flags/signals: `should_crawl`, `url_score`, `domain_score`
+- provenance: `source SMALLINT NOT NULL DEFAULT 0` (`0` = natural discovery, `1` = golden set membership; see `scripts/golden_inject.py`)
 
 Write patterns:
 
 - Offerer: selects `should_crawl=TRUE`, then updates scheduling fields.
 - Ingestor: upserts fetch outcomes and resets/extends failure counters.
 - Router-discovered links: inserted with initial `domain_score`.
+- Golden set injection (`scripts/golden_inject.py`): inserts new URLs with `source=1`, or upserts `source=1` onto existing rows so that golden set membership is identifiable even when the crawler discovered the URL naturally first.
 
 ### `url_state_history_{shard}`
 
@@ -147,6 +149,7 @@ Write pattern:
 
 - Ingestor inserts a row after each current-table upsert (full snapshot copy).
 - Accounting rolloff appends snapshots after each maintenance update batch.
+- Golden set injection (`scripts/golden_inject.py`): inserts a snapshot only when a new row is added to `url_state_current_{shard}`. Source-only updates on existing URLs do not generate a history entry.
 
 ### `url_event_counter_{shard}`
 
