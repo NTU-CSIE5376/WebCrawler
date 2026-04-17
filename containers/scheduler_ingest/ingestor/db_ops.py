@@ -53,6 +53,7 @@ _HIST_COLS = (
     "url_score",
     "domain_score",
     "source",
+    "discovered_from",
 )
 
 
@@ -263,13 +264,13 @@ class IngestDB:
                 unique_items.append((idx, rec))
 
         link_rows = [
-            (rec["url"], int(rec["domain_id"]), float(rec.get("domain_score", 0.0)))
+            (rec["url"], int(rec["domain_id"]), float(rec.get("domain_score", 0.0)), rec.get("discovered_from"))
             for _, rec in unique_items
         ]
         inserted_rows = execute_values(
             cur,
             f"""
-            INSERT INTO {tcur} (url, domain_id, domain_score)
+            INSERT INTO {tcur} (url, domain_id, domain_score, discovered_from)
             VALUES %s
             ON CONFLICT (url) DO NOTHING
             RETURNING url
@@ -284,7 +285,7 @@ class IngestDB:
         if history_rows:
             execute_values(
                 cur,
-                f"INSERT INTO {this} (url, domain_id, domain_score) VALUES %s",
+                f"INSERT INTO {this} (url, domain_id, domain_score, discovered_from) VALUES %s",
                 history_rows,
                 page_size=len(history_rows),
             )

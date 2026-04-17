@@ -26,7 +26,19 @@ uv run scripts/migrate_add_source.py [--dry-run]
 uv run scripts/golden_inject.py [--dry-run]
 ```
 
-## 6.3 `constants.py`
+## 6.3 `migrate_add_discovered_from.py`
+
+- One-time migration.
+- Adds `discovered_from VARCHAR` (nullable, no default) to all 256 shards of `url_state_current_{shard}` and `url_state_history_{shard}` (512 ALTERs total).
+- Idempotent via `IF NOT EXISTS`.
+- PG 11+ treats this as metadata-only, no table rewrite.
+- Phase 1 of NTU-CSIE5376/WebCrawler#6: ingestor `_bulk_links` writes the parent page URL on first discovery; `ON CONFLICT DO NOTHING` preserves the first writer.
+
+```bash
+uv run scripts/migrate_add_discovered_from.py [--dry-run]
+```
+
+## 6.4 `constants.py`
 
 Shared constants:
 

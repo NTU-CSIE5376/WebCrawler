@@ -118,9 +118,10 @@ class RouterService:
                                 # resolve domain_id from DB (insert if missing)
                                 domain_id, _ = domain_resolver.ensure_and_get(domain, shard_id)
 
+                                src_url = rec.get("url")
                                 new_outlinks = []
                                 for link in outlinks:
-                                    l = self._process_link(domain_resolver, link)
+                                    l = self._process_link(domain_resolver, link, src_url)
                                     if l:
                                         new_outlinks.append(l)
 
@@ -170,7 +171,7 @@ class RouterService:
             )
         print(f"[router {self.cfg.router_id:02d}] finish processing '{folder}', {file_cnt} files", flush=True)
 
-    def _process_link(self, domain_resolver: DomainResolver, link: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    def _process_link(self, domain_resolver: DomainResolver, link: Dict[str, str], src_url: Optional[str]) -> Optional[Dict[str, Any]]:
         url = link.get("url")
         domain = link.get("domain")
         anchor = link.get("anchor")
@@ -188,6 +189,7 @@ class RouterService:
                 "shard_id": shard_id,
                 "domain_id": domain_id,
                 "domain_score": domain_score,
+                "discovered_from": src_url,
             }
 
             out_dir = self._out_dir(ingestor_id)
