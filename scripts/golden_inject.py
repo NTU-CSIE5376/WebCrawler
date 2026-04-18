@@ -12,9 +12,9 @@ import argparse
 import hashlib
 import logging
 from pathlib import Path
-from urllib.parse import urlparse
 
 import psycopg2
+import tldextract
 
 from constants import NUM_SHARDS, CRAWLERDB, METRICDB, SOURCE_GOLDEN
 from libs.config.loader import load_yaml
@@ -45,11 +45,12 @@ def domain_to_shard(domain: str, overrides: dict[str, int]) -> int:
 
 
 def extract_domain(url: str) -> str | None:
-    try:
-        parsed = urlparse(url)
-        return parsed.hostname
-    except Exception:
+    # Must match crawler spider's _extract_domain (eTLD+1) so golden and
+    # natural-discovery rows share the same domain_id / shard.
+    e = tldextract.extract(url)
+    if not e.suffix or not e.domain:
         return None
+    return f"{e.domain}.{e.suffix}"
 
 
 def fetch_injectable_batch_ids(metric_cur) -> list[int]:

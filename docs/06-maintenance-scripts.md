@@ -26,7 +26,20 @@ uv run scripts/migrate_add_source.py [--dry-run]
 uv run scripts/golden_inject.py [--dry-run]
 ```
 
-## 6.3 `constants.py`
+## 6.3 `migrate_merge_subdomain_rows.py`
+
+- One-time migration.
+- Cleans up legacy `domain_state` rows in subdomain form (e.g. `en.wikipedia.org`) left by an older `golden_inject` that used `urlparse().hostname` instead of eTLD+1.
+- For each dirty row, merges per-shard `url_state_current`, `url_event_counter`, `content_feature_current`, and `domain_stats_daily` into the canonical `(shard, domain_id)`. URL conflicts keep the canonical row and bump `source` to `GREATEST`. History tables are left untouched (append-only).
+- Skips rows whose `domain` value is not a valid DNS hostname (anchor-text leakage).
+- Default is `--dry-run`; pass `--execute` to mutate. `--domain-like` limits scope.
+
+```bash
+uv run scripts/migrate_merge_subdomain_rows.py --dry-run
+uv run scripts/migrate_merge_subdomain_rows.py --execute
+```
+
+## 6.4 `constants.py`
 
 Shared constants:
 
