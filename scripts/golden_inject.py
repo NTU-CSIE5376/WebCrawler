@@ -9,7 +9,6 @@ Usage:
 """
 
 import argparse
-import hashlib
 import logging
 from pathlib import Path
 
@@ -18,30 +17,21 @@ import tldextract
 
 from constants import NUM_SHARDS, CRAWLERDB, METRICDB, SOURCE_GOLDEN
 from libs.config.loader import load_yaml
+from libs.db.sharding.key import compute_shard, load_sharding_config
 
 INJECT_AFTER_WEEKS = 4
 INGEST_CONFIG = (
     Path(__file__).resolve().parents[1]
     / "containers/scheduler_ingest/config/ingest.yaml"
 )
+SPLIT_CONFIG = INGEST_CONFIG.parent / "shard_split.yaml"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 
-def load_domain_overrides() -> dict[str, int]:
-    try:
-        cfg = load_yaml(str(INGEST_CONFIG))
-    except FileNotFoundError:
-        return {}
-    return dict((cfg.get("router") or {}).get("domain_overrides") or {})
-
-
-def domain_to_shard(domain: str, overrides: dict[str, int]) -> int:
-    if domain in overrides:
-        return int(overrides[domain])
-    h = hashlib.md5((domain or "unknown").encode("utf-8")).hexdigest()
-    return int(h, 16) % NUM_SHARDS
+def domain_to_shard(domain: str, overrides: dict[str, int], split_etld1: set[str] | None = None) -> int:
+    return compute_shard(domain, NUM_SHARDS, overrides, split_etld1)
 
 
 def extract_domain(url: str) -> str | None:
@@ -162,7 +152,7 @@ def main():
             log.info("Nothing to inject")
             return
 
-        overrides = load_domain_overrides()
+        overrides, split_etld1 = load_sharding_config(INGEST_CONFIG, SPLIT_CONFIG)
         injected = 0
         marked = 0
         failed = 0
@@ -179,7 +169,7 @@ def main():
                 continue
 
             if domain not in domain_cache:
-                shard_id = domain_to_shard(domain, overrides)
+                shard_id = domain_to_shard(domain, overrides, split_etld1)
                 if args.dry_run:
                     domain_cache[domain] = (0, shard_id, 0.0)
                 else:

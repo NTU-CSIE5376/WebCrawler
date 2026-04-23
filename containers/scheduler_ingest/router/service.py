@@ -4,14 +4,16 @@ import hashlib
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import OperationalError, InterfaceError
 
 from libs.config.loader import load_yaml, require
+from libs.db.sharding.key import load_sharding_config
 from libs.ipc.jsonio import read_json, read_jsonl, append_jsonl
 from libs.stats.delta_writer import StatsDeltaWriter
 from libs.ipc.folder_reader import current_interval
@@ -22,6 +24,12 @@ from .domain_resolver import DomainResolver
 
 def sha1_hex(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8", errors="replace")).hexdigest()
+
+
+def host_of(url: Optional[str]) -> str:
+    if not url:
+        return ""
+    return (urlparse(url).hostname or "").lower()
 
 @dataclass(frozen=True)
 class RouterConfig:
@@ -39,6 +47,7 @@ class RouterConfig:
     shards_per_ingestor: int
 
     domain_overrides: Dict[str, int]
+    split_etld1: Set[str]
 
     postgres_dsn: str
 
@@ -50,6 +59,7 @@ class RouterService:
             num_shards=self.cfg.num_shards,
             shards_per_ingestor=self.cfg.shards_per_ingestor,
             domain_overrides=self.cfg.domain_overrides,
+            split_etld1=self.cfg.split_etld1,
         )
         self.engine = create_engine(
             self.cfg.postgres_dsn,
@@ -98,12 +108,13 @@ class RouterService:
                 continue
 
             for rec in recs:
-                domain = rec.get("domain")
                 status = rec.get("status")  # "ok"/"fail"
                 content = rec.get("content")
                 outlinks = rec.get("outlinks", [])
 
-                shard_id = self.sharder.domain_to_shard(domain)
+                host = host_of(rec.get("url"))
+                domain = self.sharder.domain_key(host)
+                shard_id = self.sharder.domain_to_shard(host)
                 ingestor_id = self.sharder.shard_to_ingestor(shard_id)
 
                 content_hash = None
@@ -173,12 +184,13 @@ class RouterService:
 
     def _process_link(self, domain_resolver: DomainResolver, link: Dict[str, str], src_url: Optional[str]) -> Optional[Dict[str, Any]]:
         url = link.get("url")
-        domain = link.get("domain")
         anchor = link.get("anchor")
         if not url:
             return None
 
-        shard_id = self.sharder.domain_to_shard(domain)
+        host = host_of(url)
+        domain = self.sharder.domain_key(host)
+        shard_id = self.sharder.domain_to_shard(host)
         ingestor_id = self.sharder.shard_to_ingestor(shard_id)
 
         try:
@@ -212,6 +224,9 @@ def load_router_config(path: str, router_id: int) -> RouterConfig:
     r = require(raw, "router")
     pg = require(raw, "postgres")
 
+    split_path = Path(path).parent / "shard_split.yaml"
+    overrides, split_etld1 = load_sharding_config(path, split_path)
+
     return RouterConfig(
         router_id=router_id,
         crawler_dir_template=str(require(r, "crawler_dir_template")),
@@ -222,7 +237,8 @@ def load_router_config(path: str, router_id: int) -> RouterConfig:
         scan_sleep_minutes=int(r.get("scan_sleep_minutes", 5)),
         num_shards=int(require(r, "num_shards")),
         shards_per_ingestor=int(require(r, "shards_per_ingestor")),
-        domain_overrides=r.get("domain_overrides", {}) or {},
+        domain_overrides=overrides,
+        split_etld1=split_etld1,
         postgres_dsn=str(require(pg, "dsn")),
     )
 

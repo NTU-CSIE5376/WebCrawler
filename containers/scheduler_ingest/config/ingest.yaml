@@ -8,7 +8,8 @@ router:
   num_shards: 256
   shards_per_ingestor: 16
 
-  # explicitly route top-level domains
+  # Pin top-traffic domains 32 apart so each lands on a distinct ingestor.
+  # For eTLD+1s in shard_split.yaml, pin the dominant hostname instead.
   domain_overrides:
     wikipedia.org: 0
     x.com: 32
@@ -16,7 +17,7 @@ router:
     reddit.com: 96
     instagram.com: 128
     espn.com: 160
-    facebook.com: 192
+    www.facebook.com: 192
     yahoo.com: 224
 
 ingestor:

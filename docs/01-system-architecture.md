@@ -37,7 +37,7 @@ Data exchange between non-DB services is file-based under `/data/ipc`.
 
 Shard mapping rules:
 
-- `domain -> shard_id`: explicit override for selected top domains, otherwise `md5(domain) % 256`.
+- `domain -> shard_id`: explicit override for selected top domains, otherwise `md5(domain) % 256`. eTLD+1s listed in `containers/scheduler_ingest/config/shard_split.yaml` are hashed per-hostname instead, and their `domain_overrides` entry (if any) is auto-stripped at load; to preserve the intended inter-domain distribution, add a per-host override for the dominant subdomain (e.g. `www.facebook.com: 192`).
 - `shard_id -> ingestor_id`: `shard_id // 16`.
 - `offerer_id -> shard range`: `[offerer_id*16, offerer_id*16+15]`.
 

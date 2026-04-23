@@ -17,7 +17,7 @@ uv run scripts/migrate_add_source.py [--dry-run]
 
 - Recurring job (intended weekly).
 - Force-injects golden set URLs older than 4 weeks from metricdb into crawlerdb.
-- Source resolution: `domain_overrides` from `containers/scheduler_ingest/config/ingest.yaml`, fallback to `MD5(hostname) % 256`. Mirrors `ShardRouter.domain_to_shard`.
+- Shard resolution: goes through `libs.db.sharding.key.compute_shard` (single source of truth), which honors `domain_overrides` in `ingest.yaml` and `split_etld1` in `shard_split.yaml`; overrides for split eTLD+1s are stripped automatically.
 - Writes to `domain_state`, `url_state_current_{shard}`, `url_state_history_{shard}`.
 - Existing rows are flipped to `source = 1` so golden set membership is identifiable. New rows are also mirrored into history (matches `db_ops.process_link`).
 - Does not write to metricdb.
@@ -51,7 +51,20 @@ uv run scripts/migrate_merge_subdomain_rows.py --dry-run
 uv run scripts/migrate_merge_subdomain_rows.py --execute
 ```
 
-## 6.5 `constants.py`
+## 6.5 `migrate_shard_split.py`
+
+- Recurring / on-demand.
+- For each eTLD+1 listed in `containers/scheduler_ingest/config/shard_split.yaml`, moves `url_state_current_{old}`, `url_state_history_{old}`, and `url_event_counter_{old}` rows to new per-hostname shards (`md5(hostname) % 256`). `domain_state` is upserted per hostname with the new `shard_id`.
+- `content_feature_*` and `domain_stats_daily` are not migrated (feature rows regenerate on next fetch; daily stats restart per new host row).
+- Default is `--dry-run` (reports per-hostname row counts and projected new-shard distribution). Pass `--execute` to perform the move. Batches of 5000 per table, idempotent on conflict.
+- Pre-req for `--execute`: pause `scheduler_ingest` (router + ingestor) for the affected eTLD+1, or live writes race the migration.
+
+```bash
+uv run scripts/migrate_shard_split.py             # dry-run
+uv run scripts/migrate_shard_split.py --execute   # actually move rows
+```
+
+## 6.6 `constants.py`
 
 Shared constants:
 

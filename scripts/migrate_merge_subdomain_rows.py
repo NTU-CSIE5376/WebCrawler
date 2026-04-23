@@ -14,7 +14,6 @@ Usage:
 """
 
 import argparse
-import hashlib
 import logging
 import re
 from pathlib import Path
@@ -24,6 +23,7 @@ import tldextract
 
 from constants import NUM_SHARDS, CRAWLERDB
 from libs.config.loader import load_yaml
+from libs.db.sharding.key import compute_shard, load_sharding_config
 
 # Skip rows whose `domain` value is anchor-text leakage (contains spaces,
 # punctuation). Matches strict DNS label form.
@@ -33,24 +33,14 @@ INGEST_CONFIG = (
     Path(__file__).resolve().parents[1]
     / "containers/scheduler_ingest/config/ingest.yaml"
 )
+SPLIT_CONFIG = INGEST_CONFIG.parent / "shard_split.yaml"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 
-def load_domain_overrides() -> dict[str, int]:
-    try:
-        cfg = load_yaml(str(INGEST_CONFIG))
-    except FileNotFoundError:
-        return {}
-    return dict((cfg.get("router") or {}).get("domain_overrides") or {})
-
-
-def domain_to_shard(domain: str, overrides: dict[str, int]) -> int:
-    if domain in overrides:
-        return int(overrides[domain])
-    h = hashlib.md5((domain or "unknown").encode("utf-8")).hexdigest()
-    return int(h, 16) % NUM_SHARDS
+def domain_to_shard(domain: str, overrides: dict[str, int], split_etld1: set[str] | None = None) -> int:
+    return compute_shard(domain, NUM_SHARDS, overrides, split_etld1)
 
 
 def canonical_domain(domain: str) -> str | None:
@@ -224,7 +214,7 @@ def main():
                         "e.g. '%%.wikipedia.org' to limit scope")
     args = p.parse_args()
 
-    overrides = load_domain_overrides()
+    overrides, split_etld1 = load_sharding_config(INGEST_CONFIG, SPLIT_CONFIG)
     conn = psycopg2.connect(**CRAWLERDB)
     conn.autocommit = False
     cur = conn.cursor()
@@ -263,7 +253,7 @@ def main():
 
         totals = {"url_current": 0, "feat_current": 0, "stats_daily": 0, "domains": 0}
         for bad_domain, bad_shard, bad_did, canon in dirty:
-            canon_shard = domain_to_shard(canon, overrides)
+            canon_shard = domain_to_shard(canon, overrides, split_etld1)
             if args.dry_run:
                 cur.execute("SELECT domain_id FROM domain_state WHERE domain=%s", (canon,))
                 r = cur.fetchone()
