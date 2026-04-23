@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -9,6 +10,7 @@ from libs.obslog import configure as configure_logging
 
 from .service import OffererDerivation, OffererConfig, OffererService
 from .selection.example_strategy import ExampleStrategy
+from .selection.read_only_strategy import ReadOnlyStrategy
 
 
 def main() -> None:
@@ -47,9 +49,11 @@ def main() -> None:
     )
     Session = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
-    selector = ExampleStrategy(
-        Session=Session,
-    )
+    strategy_name = os.environ.get("OFFERER_STRATEGY", "").lower()
+    if strategy_name == "read_only":
+        selector = ReadOnlyStrategy(Session=Session)
+    else:
+        selector = ExampleStrategy(Session=Session)
 
     deriv = OffererDerivation(
         queue_dir_template=str(offerer.get("queue_dir_template", "/data/ipc/url_queue/crawler_{id:02d}")),

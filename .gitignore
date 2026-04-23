@@ -10,3 +10,7 @@ tmp/
 *.swp
 *.swo
 
+**logs**
+
+.test-data/
+
