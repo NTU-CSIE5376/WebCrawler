@@ -146,6 +146,7 @@ class RouterService:
                             "shard_id": shard_id,
                             "domain_id": domain_id,
                             "content_hash": content_hash,
+                            "title": rec.get("title"),
                         }
 
                         out_dir = self._out_dir(ingestor_id)

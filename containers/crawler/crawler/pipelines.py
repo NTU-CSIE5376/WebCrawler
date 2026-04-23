@@ -61,6 +61,7 @@ class JsonPipeline:
             "fail_reason": item.get("fail_reason"),
             "content": item.get("content"),
             "outlinks": item.get("outlinks", []),
+            "title": item.get("title"),
         }
 
         append_jsonl(path, rec)

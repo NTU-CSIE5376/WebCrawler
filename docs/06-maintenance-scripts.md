@@ -38,7 +38,19 @@ uv run scripts/golden_inject.py [--dry-run]
 uv run scripts/migrate_add_discovered_from.py [--dry-run]
 ```
 
-## 6.4 `migrate_merge_subdomain_rows.py`
+## 6.4 `migrate_add_title.py`
+
+- One-time migration.
+- Adds `title VARCHAR` (nullable, no default) to all 256 shards of `url_state_current_{shard}` and `url_state_history_{shard}` (512 ALTERs total).
+- Idempotent via `IF NOT EXISTS`.
+- PG 11+ treats this as metadata-only, no table rewrite.
+- Spider captures `<title>` trimmed to 500 chars on successful HTML fetches; ingestor upserts with `COALESCE(EXCLUDED.title, ...)` so failed re-fetches keep the previous value.
+
+```bash
+uv run scripts/migrate_add_title.py [--dry-run]
+```
+
+## 6.5 `migrate_merge_subdomain_rows.py`
 
 - One-time migration.
 - Cleans up legacy `domain_state` rows in subdomain form (e.g. `en.wikipedia.org`) left by an older `golden_inject` that used `urlparse().hostname` instead of eTLD+1.
@@ -51,7 +63,7 @@ uv run scripts/migrate_merge_subdomain_rows.py --dry-run
 uv run scripts/migrate_merge_subdomain_rows.py --execute
 ```
 
-## 6.5 `migrate_shard_split.py`
+## 6.6 `migrate_shard_split.py`
 
 - Recurring / on-demand.
 - For each eTLD+1 listed in `containers/scheduler_ingest/config/shard_split.yaml`, moves `url_state_current_{old}`, `url_state_history_{old}`, and `url_event_counter_{old}` rows to new per-hostname shards (`md5(hostname) % 256`). `domain_state` is upserted per hostname with the new `shard_id`.
@@ -64,7 +76,7 @@ uv run scripts/migrate_shard_split.py             # dry-run
 uv run scripts/migrate_shard_split.py --execute   # actually move rows
 ```
 
-## 6.6 `constants.py`
+## 6.7 `constants.py`
 
 Shared constants:
 

@@ -32,6 +32,7 @@ _CUR_INSERT_COLS = (
     "last_fail_reason",
     "content_hash",
     "should_crawl",
+    "title",
 )
 
 # snapshot_id / snapshot_at have DB defaults so they're omitted here.
@@ -54,6 +55,7 @@ _HIST_COLS = (
     "domain_score",
     "source",
     "discovered_from",
+    "title",
 )
 
 
@@ -135,6 +137,7 @@ class IngestDB:
                 "inc_ok": inc_ok,
                 "inc_fail": inc_fail,
                 "inc_upd": 0,
+                "title": rec.get("title") if is_ok else None,
             })
             if is_ok and content_hash is not None:
                 check_urls.append(url)
@@ -166,6 +169,7 @@ class IngestDB:
                 None if d["is_ok"] else d["fail_reason"],
                 d["content_hash"],
                 False,
+                d["title"],
             )
             for d in decoded
         ]
@@ -187,7 +191,8 @@ class IngestDB:
             WHEN EXCLUDED.num_content_update_90d = 1 THEN EXCLUDED.content_hash
             ELSE {tcur}.content_hash
           END,
-          should_crawl = FALSE
+          should_crawl = FALSE,
+          title = COALESCE(EXCLUDED.title, {tcur}.title)
         RETURNING {", ".join(_HIST_COLS)}, (xmax = 0) AS inserted
         """
         returned = execute_values(

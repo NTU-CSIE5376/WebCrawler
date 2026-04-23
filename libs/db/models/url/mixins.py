@@ -42,3 +42,6 @@ class UrlStateMixin:
     url_score = Column(Float, default=0.0)
     domain_score = Column(Float, default=0.0)
 
+    # Page metadata: <title> trimmed to 500 chars, NULL on fail / non-HTML.
+    title = Column(String)
+

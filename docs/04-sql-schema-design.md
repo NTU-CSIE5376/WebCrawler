@@ -125,6 +125,7 @@ Key columns:
 - scheduling flags/signals: `should_crawl`, `url_score`, `domain_score`
 - provenance: `source SMALLINT NOT NULL DEFAULT 0` (`0` = natural discovery, `1` = golden set membership; see `scripts/golden_inject.py`)
 - provenance: `discovered_from VARCHAR` (parent page URL on first discovery; NULL for golden-injected and seed URLs; first parent wins via `ON CONFLICT DO NOTHING`)
+- page metadata: `title VARCHAR` (`<title>` trimmed to 500 chars by the spider; NULL on fail / non-HTML; latest successful fetch wins, fails keep the previous value via `COALESCE`)
 
 Write patterns:
 
