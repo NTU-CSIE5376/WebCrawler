@@ -44,7 +44,7 @@
       "targets": [
         {
           "datasource": {"type": "loki", "uid": "loki"},
-          "expr": "sum by (worker_id) (rate({service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.end\"}[1m]))",
+          "expr": "sum by (worker_id) (rate({service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.dispatch\"}[1m]))",
           "legendFormat": "crawler_{{worker_id}}",
           "refId": "A"
         }
@@ -117,7 +117,7 @@
       "targets": [
         {
           "datasource": {"type": "loki", "uid": "loki"},
-          "expr": "sum(rate({service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.end\"} | json | status < 400 [5m])) / sum(rate({service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.scheduled\"}[5m]))",
+          "expr": "sum(rate({service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.end\"} | json | status < 400 [5m])) / (sum(rate({service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.end\"}[5m])) + sum(rate({service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.fail\"} | json | fail_reason !~ \"HttpError.*\" [5m])))",
           "legendFormat": "success rate",
           "refId": "A"
         }
@@ -149,20 +149,20 @@
       "targets": [
         {
           "datasource": {"type": "loki", "uid": "loki"},
-          "expr": "quantile_over_time(0.5, {service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.end\"} | json | unwrap latency_ms [1m])",
-          "legendFormat": "p50",
+          "expr": "quantile_over_time(0.5, {service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.end\"} | json | unwrap latency_ms [1m]) by (worker_id)",
+          "legendFormat": "p50 worker_{{worker_id}}",
           "refId": "A"
         },
         {
           "datasource": {"type": "loki", "uid": "loki"},
-          "expr": "quantile_over_time(0.95, {service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.end\"} | json | unwrap latency_ms [1m])",
-          "legendFormat": "p95",
+          "expr": "quantile_over_time(0.95, {service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.end\"} | json | unwrap latency_ms [1m]) by (worker_id)",
+          "legendFormat": "p95 worker_{{worker_id}}",
           "refId": "B"
         },
         {
           "datasource": {"type": "loki", "uid": "loki"},
-          "expr": "quantile_over_time(0.99, {service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.end\"} | json | unwrap latency_ms [1m])",
-          "legendFormat": "p99",
+          "expr": "quantile_over_time(0.99, {service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.end\"} | json | unwrap latency_ms [1m]) by (worker_id)",
+          "legendFormat": "p99 worker_{{worker_id}}",
           "refId": "C"
         }
       ],

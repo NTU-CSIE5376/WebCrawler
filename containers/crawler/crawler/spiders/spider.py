@@ -123,6 +123,14 @@ class HtmlSpider(scrapy.Spider):
 
     def _build_request(self, url: str, domain_id: int) -> scrapy.Request:
         self._domain_pending[domain_id] = self._domain_pending.get(domain_id, 0) + 1
+        logger.info(
+            "request.dispatch",
+            extra={
+                "event": "request.dispatch",
+                "url": url,
+                "domain": self._host(url),
+            },
+        )
         return scrapy.Request(
             url=url,
             callback=self.parse,
