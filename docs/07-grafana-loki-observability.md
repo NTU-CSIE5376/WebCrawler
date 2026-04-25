@@ -131,21 +131,23 @@ docker plugin install grafana/loki-docker-driver:3.0.0 \
 docker plugin ls | grep loki   # expect: loki:latest, ENABLED=true
 ```
 
-### 7.3.2 Run Loki and Grafana
+### 7.3.2 Loki and Grafana services
 
-Both services are referenced by `docker-compose.yml` only as the log
-*destination* (Loki) and the *viewer* (Grafana); they are not part of
-that compose file and must be brought up separately. Two options:
+Both are defined directly in `docker-compose.yml`. `docker compose up
+-d` brings them up alongside the application services.
 
-- Run them on the same host with a small standalone compose (mount
-  `ops/loki/loki-config.yml` to `/etc/loki/loki-config.yml`, mount
-  `ops/grafana/provisioning` and `ops/grafana/dashboards`, expose 3100
-  and 3000), or
-- Point `loki-url` at an existing managed Loki and import the dashboard
-  into an existing Grafana.
+- Loki listens on host port `3100` (matching the `loki-url` in the
+  `x-loki-logging` anchor).
+- Grafana listens on host port `3000` with default credentials
+  `admin / admin` — change on first login.
+- Provisioning files under `ops/grafana/provisioning` and
+  `ops/grafana/dashboards` are bind-mounted into Grafana, so the
+  *Crawler — Live (Loki)* dashboard appears automatically.
 
-Either way, the `loki-url` in `x-loki-logging` must be reachable from
-inside the application containers.
+If you instead want to point at an externally managed Loki / Grafana,
+remove the `loki` and `grafana` services from `docker-compose.yml` and
+update the `loki-url` in the `x-loki-logging` anchor to the external
+endpoint.
 
 ### 7.3.3 Bring up the application stack
 
