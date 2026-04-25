@@ -14,9 +14,9 @@ offerer:
 
   # Refill policy (per-domain)
   scan_interval_sec: 60
-  max_domain_files: 128
-  low_watermark_domains: 70
-  per_domain_url_cap: 200
+  max_domain_files: 200
+  low_watermark_domains: 120
+  per_domain_url_cap: 100
 
 
 postgres:
