@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -9,6 +10,9 @@ from libs.ipc.jsonio import atomic_write_json
 from libs.ipc.queue_scan import list_queued_domain_ids, count_domain_files
 from libs.stats.delta_writer import StatsDeltaWriter, now_iso
 from .selection.base import SelectionStrategy
+
+
+logger = logging.getLogger("offerer")
 
 
 @dataclass(frozen=True)
@@ -160,9 +164,22 @@ class OffererService:
         while True:
             try:
                 res = self._refill_once_if_needed()
-                print(f"[offerer {self.cfg.offerer_id:02d}] {res}", flush=True)
+                logger.info(
+                    "offer.refill",
+                    extra={
+                        "event": "offer.refill",
+                        "action": res.get("action"),
+                        "queue_dir": res.get("queue_dir"),
+                        "current_domains": res.get("current_domains"),
+                        "new_domains": res.get("new_domains", 0),
+                        "picked_urls": res.get("picked_urls", 0),
+                    },
+                )
             except Exception as e:
-                print(f"[offerer {self.cfg.offerer_id:02d}] ERROR: {e}", flush=True)
+                logger.error(
+                    "offer.error",
+                    extra={"event": "offer.error", "error": str(e)},
+                )
                 self.stats.write(
                     source="offerer",
                     counters={

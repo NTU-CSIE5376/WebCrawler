@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Set
+
+
+logger = logging.getLogger("router")
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -88,7 +92,10 @@ class RouterService:
         """
         Read all json files under folder; write transformed json to ingestor dirs.
         """
-        print(f"[router {self.cfg.router_id:02d}] start processing '{folder}'", flush=True)
+        logger.info(
+            "route.folder_start",
+            extra={"event": "route.folder_start", "folder": str(folder)},
+        )
         error = 0
         file_cnt = 0
 
@@ -157,7 +164,14 @@ class RouterService:
                     except (OperationalError, InterfaceError) as e:
                         # connection reset / server closed / broken pipe
                         if attempt == 2:
-                            print(f"[router {self.cfg.router_id:02d}] db error {domain}: {e}", flush=True)
+                            logger.error(
+                                "route.db_error",
+                                extra={
+                                    "event": "route.db_error",
+                                    "domain": domain,
+                                    "error": str(e),
+                                },
+                            )
                             error += 1
                             break
 
@@ -168,7 +182,14 @@ class RouterService:
                         time.sleep(0.2 * (2 ** attempt))
 
                     except Exception as e:
-                        print(f"[router {self.cfg.router_id:02d}] domain resolve error {domain}: {e}", flush=True)
+                        logger.error(
+                            "route.domain_error",
+                            extra={
+                                "event": "route.domain_error",
+                                "domain": domain,
+                                "error": str(e),
+                            },
+                        )
                         error += 1
                         break
 
@@ -180,7 +201,15 @@ class RouterService:
                     "route_error": error,
                 },
             )
-        print(f"[router {self.cfg.router_id:02d}] finish processing '{folder}', {file_cnt} files", flush=True)
+        logger.info(
+            "route.folder_done",
+            extra={
+                "event": "route.folder_done",
+                "folder": str(folder),
+                "file_cnt": file_cnt,
+                "errors": error,
+            },
+        )
 
     def _process_link(self, domain_resolver: DomainResolver, link: Dict[str, str], src_url: Optional[str]) -> Optional[Dict[str, Any]]:
         url = link.get("url")
@@ -215,7 +244,14 @@ class RouterService:
                 "anchor": anchor,
             }
         except Exception as e:
-            print(f"[router {self.cfg.router_id:02d}] process link error {link}: {e}", flush=True)
+            logger.error(
+                "route.link_error",
+                extra={
+                    "event": "route.link_error",
+                    "url": url,
+                    "error": str(e),
+                },
+            )
             raise
 
 

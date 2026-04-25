@@ -1,0 +1,418 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "panels": [
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 0},
+      "id": 1,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["mean", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "expr": "sum by (worker_id) (rate({service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.start\"}[1m]))",
+          "legendFormat": "crawler_{{worker_id}}",
+          "refId": "A"
+        }
+      ],
+      "title": "QPS per crawler worker",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 0},
+      "id": 2,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["mean", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "interval": "30s",
+      "maxDataPoints": 60,
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "expr": "topk(10, sum by (domain) (count_over_time({service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.start\"} | json domain=\"domain\" [1m])) / 60)",
+          "legendFormat": "{{domain}}",
+          "refId": "A"
+        }
+      ],
+      "title": "QPS per domain (top 10)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "orange", "value": 0.8},
+              {"color": "green", "value": 0.95}
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 9, "w": 6, "x": 0, "y": 9},
+      "id": 3,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "expr": "sum(rate({service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.end\"} | json | status < 400 [5m])) / (sum(rate({service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.end\"}[5m])) + sum(rate({service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.fail\"} | json | fail_reason !~ \"HttpError.*\" [5m])))",
+          "legendFormat": "success rate",
+          "refId": "A"
+        }
+      ],
+      "title": "Success rate (last 5m)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 9, "w": 18, "x": 6, "y": 9},
+      "id": 4,
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "expr": "quantile_over_time(0.5, {service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.end\"} | json | unwrap latency_ms [1m]) by (worker_id)",
+          "legendFormat": "p50 worker_{{worker_id}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "expr": "quantile_over_time(0.95, {service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.end\"} | json | unwrap latency_ms [1m]) by (worker_id)",
+          "legendFormat": "p95 worker_{{worker_id}}",
+          "refId": "B"
+        },
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "expr": "quantile_over_time(0.99, {service=\"crawler\", worker_id=~\"$worker_id\", event=\"request.end\"} | json | unwrap latency_ms [1m]) by (worker_id)",
+          "legendFormat": "p99 worker_{{worker_id}}",
+          "refId": "C"
+        }
+      ],
+      "title": "Download latency percentiles (ms)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 18},
+      "id": 100,
+      "title": "Crawler internals (tuning)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 19},
+      "id": 6,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["mean", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "expr": "avg by (worker_id) (avg_over_time({service=\"crawler\", worker_id=~\"$worker_id\", event=\"spider.heartbeat\"} | json | unwrap inflight [1m]))",
+          "legendFormat": "crawler_{{worker_id}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Inflight requests per worker",
+      "description": "How many requests are currently in the downloader. Tune: if this stays well below CONCURRENT_REQUESTS across all workers, you have headroom — raise IPC_DOMAIN_LOW_WATERMARK so spiders hold more domains concurrently.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 19},
+      "id": 7,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["mean", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "expr": "avg by (worker_id) (avg_over_time({service=\"crawler\", worker_id=~\"$worker_id\", event=\"spider.heartbeat\"} | json | unwrap pending [1m]))",
+          "legendFormat": "crawler_{{worker_id}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Pending requests per worker",
+      "description": "Requests reserved from IPC but not yet downloaded. Tune: if pending is always near 0, the offerer isn't keeping up — raise offerer.max_domain_files or lower offerer.low_watermark_domains so it refills more eagerly. If pending is huge and flat, you're over-reserving — lower per_domain_url_cap.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 19},
+      "id": 8,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["mean", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "expr": "avg by (worker_id) (avg_over_time({service=\"crawler\", worker_id=~\"$worker_id\", event=\"spider.heartbeat\"} | json | unwrap active_domains [1m]))",
+          "legendFormat": "crawler_{{worker_id}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Active domains per worker",
+      "description": "Distinct domains the spider is currently pulling from. Should track IPC_DOMAIN_LOW_WATERMARK closely; if it's always below, either the offerer isn't supplying enough domains (raise offerer.max_domain_files) or per-domain QPS limits are throttling you.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 27},
+      "id": 9,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["mean", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "expr": "avg by (worker_id) (avg_over_time({service=\"crawler\", worker_id=~\"$worker_id\", event=\"spider.heartbeat\"} | json | unwrap transferring [1m]))",
+          "legendFormat": "crawler_{{worker_id}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Transferring (active HTTP downloads) per worker",
+      "description": "Connections actually moving bytes right now. If inflight >> transferring, most requests are stuck in per-domain slot queues — the bottleneck is per-domain concurrency, not total throughput.",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 27},
+      "id": 10,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["mean", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "expr": "avg by (worker_id) (avg_over_time({service=\"crawler\", worker_id=~\"$worker_id\", event=\"spider.heartbeat\"} | json | unwrap slot_queue [1m]))",
+          "legendFormat": "crawler_{{worker_id}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Slot queue depth per worker",
+      "description": "Per-domain queue backup inside Scrapy. Tall slot_queue with flat transferring = too many URLs per domain are being reserved at once. Lower offerer.per_domain_url_cap.",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 35},
+      "id": 101,
+      "title": "Errors",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 36},
+      "id": 5,
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": false,
+        "showCommonLabels": false,
+        "showLabels": true,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      },
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "expr": "{service=~\".+\", level=~\"ERROR|WARNING\"}",
+          "refId": "A"
+        }
+      ],
+      "title": "Errors & warnings (live tail)",
+      "type": "logs"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["crawler", "loki"],
+  "templating": {
+    "list": [
+      {
+        "current": {"selected": false, "text": "All", "value": "$__all"},
+        "datasource": {"type": "loki", "uid": "loki"},
+        "definition": "label_values({service=\"crawler\"}, worker_id)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "worker_id",
+        "multi": true,
+        "name": "worker_id",
+        "options": [],
+        "query": {
+          "label": "worker_id",
+          "stream": "{service=\"crawler\"}",
+          "type": 1
+        },
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {"from": "now-15m", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Crawler — Live (Loki)",
+  "uid": "crawler-live",
+  "version": 1,
+  "weekStart": ""
+}

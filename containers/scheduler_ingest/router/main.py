@@ -5,6 +5,7 @@ from sqlalchemy.orm import sessionmaker
 
 from libs.config.loader import load_yaml, require
 from libs.ipc.folder_reader import Progress, FolderReader
+from libs.obslog import configure as configure_logging
 
 from .service import RouterService, load_router_config
 
@@ -15,6 +16,7 @@ def main():
     args = ap.parse_args()
 
     router_id = args.router_id
+    configure_logging(service="router", worker_id=router_id)
     cfg = load_router_config(args.config, router_id)
     svc = RouterService(cfg)
 

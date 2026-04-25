@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 from pathlib import Path
 from collections import defaultdict
 
@@ -6,6 +7,9 @@ from libs.ipc.jsonio import read_json, read_jsonl
 from libs.stats.delta_writer import StatsDeltaWriter
 
 from .db_ops import IngestDB, IngestResult, BATCH_SIZE
+
+
+logger = logging.getLogger("ingestor")
 
 
 class IngestService:
@@ -41,7 +45,10 @@ class IngestService:
             domains[result.domain_id].setdefault("fail_reasons", defaultdict(int))[result.fail_reason] += 1
 
     def process_folder(self, folder: Path):
-        print(f"[ingestor {self.ingestor_id:02d}] start processing '{folder}'", flush=True)
+        logger.info(
+            "ingest.folder_start",
+            extra={"event": "ingest.folder_start", "folder": str(folder)},
+        )
         file_cnt = 0
         counters = defaultdict(int)
         domains = {}
@@ -65,7 +72,14 @@ class IngestService:
                 for result in results:
                     self._accumulate_result(result, counters, domains)
             except Exception as e:
-                print(f"[ingestor {self.ingestor_id:02d}] ERROR in batch: {e}", flush=True)
+                logger.error(
+                    "ingest.batch_error",
+                    extra={
+                        "event": "ingest.batch_error",
+                        "error": str(e),
+                        "batch_size": len(batch),
+                    },
+                )
                 counters["error_count"] += len(batch)
                 counters["ingest_error"] += len(batch)
 
@@ -75,5 +89,16 @@ class IngestService:
             counters=counters,
             domains=domains,
         )
-        print(f"[ingestor {self.ingestor_id:02d}] finish processing '{folder}', {file_cnt} files", flush=True)
+        logger.info(
+            "ingest.folder_done",
+            extra={
+                "event": "ingest.folder_done",
+                "folder": str(folder),
+                "file_cnt": file_cnt,
+                "num_fetch_ok": counters.get("num_fetch_ok", 0),
+                "num_fetch_fail": counters.get("num_fetch_fail", 0),
+                "num_content_update": counters.get("num_content_update", 0),
+                "new_links": counters.get("new_links", 0),
+            },
+        )
 

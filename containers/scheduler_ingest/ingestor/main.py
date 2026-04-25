@@ -6,6 +6,7 @@ from sqlalchemy.orm import sessionmaker
 
 from libs.config.loader import load_yaml, require
 from libs.ipc.folder_reader import Progress, FolderReader
+from libs.obslog import configure as configure_logging
 from libs.stats.delta_writer import StatsDeltaWriter
 
 from .service import IngestService
@@ -20,6 +21,7 @@ def main():
 
     raw = load_yaml(args.config)
     ingestor_id = args.ingestor_id
+    configure_logging(service="ingestor", worker_id=ingestor_id)
 
     ingestor = require(raw, "ingestor")
     pg = require(raw, "postgres")

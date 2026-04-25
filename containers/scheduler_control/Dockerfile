@@ -13,7 +13,8 @@ WORKDIR /app
 RUN pip install --no-cache-dir \
     sqlalchemy==2.0.36 \
     psycopg2-binary==2.9.9 \
-    pyyaml==6.0.2
+    pyyaml==6.0.2 \
+    python-json-logger==2.0.7
 
 COPY containers/scheduler_control/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
