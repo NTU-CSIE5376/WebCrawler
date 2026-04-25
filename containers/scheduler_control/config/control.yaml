@@ -20,7 +20,7 @@ offerer:
 
 
 postgres:
-  dsn: "postgresql+psycopg2://crawler:crawler@host.docker.internal:5432/crawlerdb"
+  dsn: "postgresql+psycopg2://crawler:crawler@172.16.191.1:5432/crawlerdb"
 
 accounting:
   total_shards: 256

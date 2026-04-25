@@ -1,3 +1,30 @@
+x-loki-logging: &loki-logging
+  driver: loki
+  options:
+    loki-url: "http://localhost:3100/loki/api/v1/push"
+    loki-batch-size: "1048576"
+    loki-retries: "5"
+    mode: "non-blocking"
+    max-size: "50m"
+    max-file: "10"
+    keep-file: "true"
+    loki-pipeline-stages: |
+      - json:
+          expressions:
+            level: level
+            service: service
+            worker_id: worker_id
+            shard: shard
+            event: event
+            domain: domain
+            status: status
+            latency_ms: latency_ms
+      - labels:
+          level:
+          service:
+          worker_id:
+          event:
+
 services:
   postgres:
     image: postgres:16
@@ -36,11 +63,7 @@ services:
     volumes:
       - ./:/app
       - /data/ipc:/data/ipc
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "10"
+    logging: *loki-logging
 
   scheduler_ingest:
     build:
@@ -52,11 +75,7 @@ services:
     volumes:
       - ./:/app
       - /data/ipc:/data/ipc
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "10"
+    logging: *loki-logging
 
   crawler:
     build:
@@ -71,10 +90,6 @@ services:
     volumes:
       - ./:/app
       - /data/ipc:/data/ipc
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "10"
+    logging: *loki-logging
 
 

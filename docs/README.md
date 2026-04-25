@@ -15,3 +15,4 @@ This documentation set describes the architecture implemented in this repository
 4. [04-sql-schema-design.md](./04-sql-schema-design.md)
 5. [05-docker-settings-and-deployment.md](./05-docker-settings-and-deployment.md)
 6. [06-maintenance-scripts.md](./06-maintenance-scripts.md)
+7. [07-grafana-loki-observability.md](./07-grafana-loki-observability.md)
