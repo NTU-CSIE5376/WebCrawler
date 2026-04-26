@@ -19,6 +19,9 @@ class IngestResult:
 
 BATCH_SIZE = 500
 
+# Catches already-queued oversized urls that bypassed the spider-side filter.
+MAX_URL_LEN = 2500
+
 
 _CUR_INSERT_COLS = (
     "url",
@@ -310,6 +313,8 @@ class IngestDB:
         results_by_shard: dict[int, list[tuple[int, dict]]] = defaultdict(list)
         links_by_shard: dict[int, list[tuple[int, dict]]] = defaultdict(list)
         for i, rec in enumerate(recs):
+            if len(rec.get("url", "")) > MAX_URL_LEN:
+                continue
             sid = int(rec["shard_id"])
             if rec.get("status") == "new":
                 links_by_shard[sid].append((i, rec))

@@ -20,6 +20,7 @@ from libs.config.loader import load_yaml
 from libs.db.sharding.key import compute_shard, load_sharding_config
 
 INJECT_AFTER_WEEKS = 4
+MAX_URL_LEN = 2500
 INGEST_CONFIG = (
     Path(__file__).resolve().parents[1]
     / "containers/scheduler_ingest/config/ingest.yaml"
@@ -162,6 +163,9 @@ def main():
 
         for rec in urls:
             url = rec["url"]
+            if len(url) > MAX_URL_LEN:
+                failed += 1
+                continue
             domain = extract_domain(url)
             if not domain:
                 log.warning("Cannot parse domain from URL: %s", url)
