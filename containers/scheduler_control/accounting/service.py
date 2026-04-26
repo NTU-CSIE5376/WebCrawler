@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 
 from sqlalchemy import text
 from sqlalchemy.orm import sessionmaker
+
+
+logger = logging.getLogger("accounting")
 
 
 @dataclass(frozen=True)
@@ -220,9 +224,13 @@ class CounterRolloffService:
                     totals["stalled_batches"] += 1
                     break
 
-        print(
-            f"[accounting] done cutoff={cutoff_date.isoformat()} totals={totals}",
-            flush=True,
+        logger.info(
+            "accounting.rolloff_done",
+            extra={
+                "event": "accounting.rolloff_done",
+                "cutoff_date": cutoff_date.isoformat(),
+                **totals,
+            },
         )
 
     def run_forever(self) -> None:
@@ -242,6 +250,9 @@ class CounterRolloffService:
                     self.run_once()
                     self._last_run_for_day = now_utc.date()
                 except Exception as e:
-                    print(f"[accounting] ERROR: {e}", flush=True)
+                    logger.error(
+                        "accounting.run_error",
+                        extra={"event": "accounting.run_error", "error": str(e)},
+                    )
 
             time.sleep(self.cfg.check_interval_sec)

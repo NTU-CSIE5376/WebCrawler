@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 
 from libs.config.loader import load_yaml, require
+from libs.obslog import configure as configure_logging
 from .service import StatsAggregatorService
 
 
@@ -10,6 +11,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     args = ap.parse_args()
+
+    configure_logging(service="stats")
 
     raw = load_yaml(args.config)
     stats = require(raw, "stats")

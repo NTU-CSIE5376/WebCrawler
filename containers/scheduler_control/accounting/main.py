@@ -6,6 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from libs.config.loader import load_yaml, require
+from libs.obslog import configure as configure_logging
 
 from .service import CounterRolloffConfig, CounterRolloffService
 
@@ -15,6 +16,8 @@ def main() -> None:
     ap.add_argument("--config", required=True)
     ap.add_argument("--once", action="store_true")
     args = ap.parse_args()
+
+    configure_logging(service="accounting")
 
     raw = load_yaml(args.config)
     pg = require(raw, "postgres")

@@ -6,6 +6,7 @@ from sqlalchemy.orm import sessionmaker
 
 from libs.config.loader import load_yaml, require
 from libs.ipc.folder_reader import Progress, FolderReader
+from libs.obslog import configure as configure_logging
 from libs.stats.delta_writer import StatsDeltaWriter
 
 from .service import ExtractService
@@ -17,6 +18,8 @@ def main():
     ap.add_argument("--config", required=True)
     ap.add_argument("--extractor-id", type=int, required=True)
     args = ap.parse_args()
+
+    configure_logging(service="extractor", worker_id=args.extractor_id)
 
     raw = load_yaml(args.config)
 
