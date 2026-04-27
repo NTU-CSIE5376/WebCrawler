@@ -1,0 +1,166 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Ingest lag per worker (minutes)",
+      "description": "now - bucket_time from /data/ipc/progress/ingestor/NN.json. Steady state ~ 20m (downstream waits 20m). Climbing line = worker falling behind.",
+      "datasource": {"type": "loki", "uid": "loki"},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 0},
+      "id": 22,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "m",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 30},
+              {"color": "red", "value": 60}
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "expr": "avg by (worker_id) (avg_over_time({service=\"ingestor_lag\"} | json | unwrap lag_minutes [1m]))",
+          "legendFormat": "ingestor_{{worker_id}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Batch errors per worker (per 5m)",
+      "description": "Count of ingest.batch_error events per worker per 5m. 0 in steady state. Spikes here = DB writes failing for that worker; cross-reference the live error tail.",
+      "datasource": {"type": "loki", "uid": "loki"},
+      "gridPos": {"h": 12, "w": 12, "x": 0, "y": 10},
+      "id": 23,
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["sum", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "auto",
+            "spanNulls": true
+          },
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "expr": "sum by (worker_id) (count_over_time({service=\"ingestor\", event=\"ingest.batch_error\"}[5m]))",
+          "legendFormat": "ingestor_{{worker_id}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Batch errors by raw kind (time range)",
+      "description": "ingest.batch_error grouped by the raw error string with numbers normalized to N. Reads the actual error verbatim, no hand-coded categories. Counts are over the dashboard time range, sorted by count desc.",
+      "datasource": {"type": "loki", "uid": "loki"},
+      "gridPos": {"h": 12, "w": 12, "x": 12, "y": 10},
+      "id": 24,
+      "options": {
+        "showHeader": true,
+        "sortBy": [{"displayName": "total", "desc": true}]
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"align": "left", "cellOptions": {"type": "auto"}},
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          },
+          "noValue": "0"
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byRegexp", "options": "^(total|last 5m)$"},
+            "properties": [
+              {"id": "custom.cellOptions", "value": {"type": "color-text"}},
+              {"id": "custom.width", "value": 80},
+              {"id": "custom.align", "value": "right"}
+            ]
+          },
+          {
+            "matcher": {"id": "byName", "options": "err"},
+            "properties": [
+              {"id": "displayName", "value": "error"}
+            ]
+          }
+        ]
+      },
+      "transformations": [
+        {"id": "labelsToFields", "options": {"mode": "columns"}},
+        {"id": "joinByField", "options": {"byField": "err", "mode": "outer"}},
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {"Time 1": true, "Time 2": true, "Time": true},
+            "indexByName": {"err": 0, "Value #A": 1, "Value #B": 2},
+            "renameByName": {"Value #A": "total", "Value #B": "last 5m"}
+          }
+        }
+      ],
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "expr": "sum by (err) (count_over_time({service=\"ingestor\", event=\"ingest.batch_error\"} | json | label_format err=`{{ regexReplaceAll \"(?s)\\\\n.*\" .error \"\" }}` | label_format err=`{{ regexReplaceAll \"[0-9]+\" .err \"N\" }}` [$__range]))",
+          "refId": "A",
+          "instant": true
+        },
+        {
+          "datasource": {"type": "loki", "uid": "loki"},
+          "expr": "sum by (err) (count_over_time({service=\"ingestor\", event=\"ingest.batch_error\"} | json | label_format err=`{{ regexReplaceAll \"(?s)\\\\n.*\" .error \"\" }}` | label_format err=`{{ regexReplaceAll \"[0-9]+\" .err \"N\" }}` [5m]))",
+          "refId": "B",
+          "instant": true
+        }
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["ingestor", "loki"],
+  "templating": {"list": []},
+  "time": {"from": "now-3h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Ingestor — Live (Loki)",
+  "uid": "ingestor-live",
+  "version": 3,
+  "weekStart": ""
+}
