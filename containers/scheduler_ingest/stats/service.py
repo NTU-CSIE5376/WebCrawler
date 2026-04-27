@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import time
 from datetime import datetime, date
@@ -12,6 +13,9 @@ from libs.ipc.jsonio import read_json, atomic_write_json
 from libs.stats.delta_writer import StatsDeltaWriter
 
 from .db_ops import apply_stats_delta
+
+
+logger = logging.getLogger("stats")
 
 
 class StatsAggregatorService:
@@ -51,7 +55,14 @@ class StatsAggregatorService:
                     pass
             except Exception as e:
                 session.rollback()
-                print(f"[stats] ERROR processing {path}: {e}", flush=True)
+                logger.error(
+                    "stats.process_error",
+                    extra={
+                        "event": "stats.process_error",
+                        "path": str(path),
+                        "error": str(e),
+                    },
+                )
 
                 new_path = self.bad_dir / path.name
                 os.replace(path, new_path)
@@ -63,7 +74,13 @@ class StatsAggregatorService:
                         session2.commit()
                     except Exception as e:
                         session2.rollback()
-                        print(f"[stats] ERROR cannot write stats_error: {e}", flush=True)
+                        logger.error(
+                            "stats.write_error_counter_failed",
+                            extra={
+                                "event": "stats.write_error_counter_failed",
+                                "error": str(e),
+                            },
+                        )
 
     def run_forever(self):
         while True:
@@ -75,5 +92,8 @@ class StatsAggregatorService:
             for f in files:
                 self.process_file(f)
 
-            print(f"[stats] INFO processed {len(files)} files.")
+            logger.info(
+                "stats.batch_done",
+                extra={"event": "stats.batch_done", "file_cnt": len(files)},
+            )
 

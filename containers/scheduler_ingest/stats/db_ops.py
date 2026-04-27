@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, date
 from typing import Dict, Any
 
@@ -8,6 +9,9 @@ from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert
 
 from libs.db import SummaryDaily, DomainStatsDaily, DomainState
+
+
+logger = logging.getLogger("stats")
 
 
 def get_summary_daily(session: Session, event_date: date) -> SummaryDaily:
@@ -116,7 +120,10 @@ def apply_stats_delta(session: Session, delta: dict):
             day
         )
         if not row:
-            print(f"[stats] ERROR domain_id {domain_id} not exists", flush=True)
+            logger.error(
+                "stats.domain_not_found",
+                extra={"event": "stats.domain_not_found", "domain_id": domain_id},
+            )
             continue
 
         add_scalar_fields(row, stats)
