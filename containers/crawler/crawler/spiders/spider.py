@@ -22,6 +22,9 @@ logger = logging.getLogger("crawler")
 
 ACCEPTED_CONTENT_TYPES = ["text/html", "application/xhtml+xml"]
 
+# Cap below the PG btree row entry max (~2700 bytes).
+MAX_URL_LEN = 2500
+
 class HtmlSpider(scrapy.Spider):
     name = "html_spider"
 
@@ -259,13 +262,16 @@ class HtmlSpider(scrapy.Spider):
         outlinks = []
 
         for link in self.link_extractor.extract_links(response):
-            if not link.nofollow:
-                u = canonicalize_url(link.url)
-                outlinks.append({
-                    "url": u,
-                    "domain": self._extract_domain(u),
-                    "anchor": (link.text or "").strip()[:200]
-                })
+            if link.nofollow:
+                continue
+            u = canonicalize_url(link.url)
+            if len(u) > MAX_URL_LEN:
+                continue
+            outlinks.append({
+                "url": u,
+                "domain": self._extract_domain(u),
+                "anchor": (link.text or "").strip()[:200]
+            })
 
         title = (response.xpath("//title/text()").get() or "").strip()[:500] or None
 
