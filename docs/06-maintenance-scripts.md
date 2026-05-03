@@ -76,7 +76,18 @@ uv run scripts/migrate_shard_split.py             # dry-run
 uv run scripts/migrate_shard_split.py --execute   # actually move rows
 ```
 
-## 6.7 `constants.py`
+## 6.7 `migrate_add_domain_pause.py`
+
+- One-time migration.
+- Adds `crawl_paused_until TIMESTAMPTZ` and `domain_fail_count INT NOT NULL DEFAULT 0` to `domain_state`.
+- Idempotent via `IF NOT EXISTS`.
+- PG 11+ treats this as metadata-only, no table rewrite.
+
+```bash
+uv run scripts/migrate_add_domain_pause.py [--dry-run]
+```
+
+## 6.8 `constants.py`
 
 Shared constants:
 

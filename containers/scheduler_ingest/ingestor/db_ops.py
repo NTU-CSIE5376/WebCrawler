@@ -23,6 +23,30 @@ BATCH_SIZE = 500
 MAX_URL_LEN = 2500
 
 
+# Fail reasons that are highly concentrated on specific domains: once a
+# domain is failing for one of these, nearly all its URLs will too. Pause
+# the whole domain instead of wasting fetches one URL at a time.
+DOMAIN_PAUSE_BASE = {
+    "IgnoreRequest Forbidden by robots.txt": "1 day",
+    "ConnectionRefusedError":                "12 hours",
+    "HttpError 410":                         "1 day",
+    "NonHTML content-type":                  "6 hours",
+    "HttpError 403":                         "6 hours",
+    "HttpError 400":                         "6 hours",
+    "HttpError 429":                         "1 hour",
+    "TimeoutError":                          "1 hour",
+    "ResponseNeverReceived":                 "1 hour",
+}
+
+
+def _domain_pause_base(reason: str | None) -> str | None:
+    if reason in DOMAIN_PAUSE_BASE:
+        return DOMAIN_PAUSE_BASE[reason]
+    if reason and reason.startswith("HttpError 5"):
+        return "30 minutes"
+    return None
+
+
 _CUR_INSERT_COLS = (
     "url",
     "domain_id",
@@ -229,6 +253,39 @@ class IngestDB:
             template="(%s, CURRENT_DATE, %s, %s, %s, TRUE)",
             page_size=len(counter_rows),
         )
+
+        # Bump domain pause for fail records on concentrated reasons, reset
+        # for any ok record. `crawl_paused_until < NOW()` guard prevents
+        # repeated fails from pushing the deadline indefinitely forward.
+        pause_by_interval: dict[str, set[int]] = defaultdict(set)
+        ok_domain_ids: set[int] = set()
+        for d in decoded:
+            if d["is_ok"]:
+                ok_domain_ids.add(d["domain_id"])
+                continue
+            base = _domain_pause_base(d["fail_reason"])
+            if base:
+                pause_by_interval[base].add(d["domain_id"])
+        for interval, dids in pause_by_interval.items():
+            cur.execute(
+                f"""
+                UPDATE domain_state
+                SET domain_fail_count = domain_fail_count + 1,
+                    crawl_paused_until = NOW() + (INTERVAL '{interval}' * POWER(2, LEAST(domain_fail_count, 6)))
+                WHERE domain_id = ANY(%s)
+                  AND (crawl_paused_until IS NULL OR crawl_paused_until < NOW())
+                """,
+                (list(dids),),
+            )
+        if ok_domain_ids:
+            cur.execute(
+                """
+                UPDATE domain_state
+                SET domain_fail_count = 0, crawl_paused_until = NULL
+                WHERE domain_id = ANY(%s) AND domain_fail_count > 0
+                """,
+                (list(ok_domain_ids),),
+            )
 
         # xmax = 0 in RETURNING means the row was inserted, not updated.
         inserted_flags = {row[0]: row[-1] for row in returned}

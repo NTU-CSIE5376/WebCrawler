@@ -47,6 +47,11 @@ class ExampleStrategy(SelectionStrategy):
             FROM {table}
             WHERE should_crawl = TRUE
               {exclude_clause}
+              AND NOT EXISTS (
+                SELECT 1 FROM domain_state d
+                WHERE d.domain_id = {table}.domain_id
+                  AND d.crawl_paused_until > NOW()
+              )
             ORDER BY domain_id
             LIMIT :max_domains
         ),
