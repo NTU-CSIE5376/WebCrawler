@@ -349,7 +349,12 @@ class HtmlSpider(scrapy.Spider):
     def req_end(self, response, request):
         t = datetime.now()
         started = request.meta.get("t_down_start", t)
-        latency_ms = int((t - started).total_seconds() * 1000)
+        downloader_total_ms = int((t - started).total_seconds() * 1000)
+        
+        download_latency = response.meta.get("download_latency")
+        download_latency_ms = (
+            int(download_latency * 1000) if download_latency is not None else None
+        )
         logger.info(
             "request.end",
             extra={
@@ -357,7 +362,12 @@ class HtmlSpider(scrapy.Spider):
                 "url": request.url,
                 "domain": self._host(request.url),
                 "status": response.status,
-                "latency_ms": latency_ms,
+                "latency_ms": downloader_total_ms,
+                "download_latency_ms": download_latency_ms,
+                "pre_response_ms": (
+                    downloader_total_ms - download_latency_ms
+                    if download_latency_ms is not None else None
+                ),
             },
         )
 
