@@ -9,6 +9,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     Integer,
+    SmallInteger,
     String,
     text
 )
@@ -41,7 +42,22 @@ class UrlStateMixin:
     # Priority signals
     url_score = Column(Float, default=0.0)
     domain_score = Column(Float, default=0.0)
+    parent_page_score = Column(Float)
+    inlink_count_approx = Column(Integer, nullable=False, server_default=text("0"))
+    inlink_count_external = Column(Integer, nullable=False, server_default=text("0"))
+
+    # Discovery metadata.
+    discovery_source_type = Column(SmallInteger, nullable=False, server_default=text("0"))
+    anchor_text = Column(String)
+    robots_bits = Column(SmallInteger, nullable=False, server_default=text("0"))
 
     # Page metadata: <title> trimmed to 500 chars, NULL on fail / non-HTML.
     title = Column(String)
+    hreflang_count = Column(Integer)
 
+    # HTTP response metadata used by recrawl scheduling.
+    last_modified = Column(DateTime(timezone=True))
+    etag = Column(String)
+    cache_control = Column(String)
+    is_redirect = Column(Boolean)
+    redirect_hop_count = Column(SmallInteger)

@@ -62,8 +62,13 @@ class JsonPipeline:
             "content": item.get("content"),
             "outlinks": item.get("outlinks", []),
             "title": item.get("title"),
+            "hreflang_count": item.get("hreflang_count"),
+            "last_modified": item.get("last_modified"),
+            "etag": item.get("etag"),
+            "cache_control": item.get("cache_control"),
+            "is_redirect": item.get("is_redirect"),
+            "redirect_hop_count": item.get("redirect_hop_count"),
         }
 
         append_jsonl(path, rec)
         return item
-

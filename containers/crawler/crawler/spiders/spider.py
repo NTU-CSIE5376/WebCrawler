@@ -4,7 +4,8 @@ import logging
 
 import tldextract
 from w3lib.url import canonicalize_url
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 
 import scrapy
@@ -24,6 +25,7 @@ ACCEPTED_CONTENT_TYPES = ["text/html", "application/xhtml+xml"]
 
 # Cap below the PG btree row entry max (~2700 bytes).
 MAX_URL_LEN = 2500
+MAX_HEADER_VALUE_LEN = 500
 
 class HtmlSpider(scrapy.Spider):
     name = "html_spider"
@@ -132,6 +134,35 @@ class HtmlSpider(scrapy.Spider):
             errback=self.errback,
             meta={"source_url": url, "_track_domain_id": domain_id},
         )
+
+    def _response_metadata(self, response) -> dict:
+        def header_text(name: str) -> str | None:
+            raw = response.headers.get(name)
+            if raw is None:
+                return None
+            value = raw.decode("utf-8", errors="replace").strip()
+            return value[:MAX_HEADER_VALUE_LEN] or None
+
+        last_modified = None
+        raw_last_modified = header_text("Last-Modified")
+        if raw_last_modified:
+            try:
+                dt = parsedate_to_datetime(raw_last_modified)
+                if dt.tzinfo is None:
+                    last_modified = dt.replace(tzinfo=timezone.utc).isoformat()
+                else:
+                    last_modified = dt.astimezone(timezone.utc).isoformat()
+            except (TypeError, ValueError, IndexError, OverflowError):
+                last_modified = None
+
+        redirect_hop_count = int(response.meta.get("redirect_times") or 0)
+        return {
+            "last_modified": last_modified,
+            "etag": header_text("ETag"),
+            "cache_control": header_text("Cache-Control"),
+            "is_redirect": redirect_hop_count > 0,
+            "redirect_hop_count": redirect_hop_count,
+        }
 
 
     def _reserve_urls(self, reason: str, force: bool = False) -> list[tuple[int, str]]:
@@ -256,6 +287,8 @@ class HtmlSpider(scrapy.Spider):
                 content=None,
                 outlinks=[],
                 title=None,
+                hreflang_count=0,
+                **self._response_metadata(response),
             )
             return
 
@@ -274,6 +307,9 @@ class HtmlSpider(scrapy.Spider):
             })
 
         title = (response.xpath("//title/text()").get() or "").strip()[:500] or None
+        hreflang_count = len(response.xpath(
+            "//link[contains(concat(' ', normalize-space(@rel), ' '), ' alternate ') and @hreflang]"
+        ))
 
         self._finish_owned_request(reason="parse", domain_id=track_domain_id)
         yield PageItem(
@@ -283,6 +319,8 @@ class HtmlSpider(scrapy.Spider):
             content=response.text,
             outlinks=outlinks,
             title=title,
+            hreflang_count=hreflang_count,
+            **self._response_metadata(response),
         )
 
     def errback(self, failure):
@@ -299,6 +337,12 @@ class HtmlSpider(scrapy.Spider):
             content=None,
             outlinks=[],
             title=None,
+            hreflang_count=0,
+            last_modified=None,
+            etag=None,
+            cache_control=None,
+            is_redirect=bool(failure.request.meta.get("redirect_times")),
+            redirect_hop_count=int(failure.request.meta.get("redirect_times") or 0),
         )
 
         status = None
@@ -360,4 +404,3 @@ class HtmlSpider(scrapy.Spider):
                 "latency_ms": latency_ms,
             },
         )
-

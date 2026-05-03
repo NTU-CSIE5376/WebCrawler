@@ -103,19 +103,47 @@ def merge_one(cur, bad, good, dry_run: bool) -> dict:
         f"""
         INSERT INTO url_state_current_{good_shard:03d} AS g
           (url, domain_id, first_seen, last_scheduled, last_fetch_ok,
-           last_content_update, num_scheduled_90d, num_fetch_ok_90d,
+           last_content_update, last_modified,
+           num_scheduled_90d, num_fetch_ok_90d,
            num_fetch_fail_90d, num_content_update_90d, num_consecutive_fail,
            last_fail_reason, content_hash, should_crawl, url_score,
-           domain_score, source)
+           domain_score, source, discovered_from, title, hreflang_count,
+           etag, cache_control,
+           is_redirect, redirect_hop_count, discovery_source_type,
+           parent_page_score, inlink_count_approx, inlink_count_external,
+           anchor_text, robots_bits)
         SELECT url, %s, first_seen, last_scheduled, last_fetch_ok,
-               last_content_update, num_scheduled_90d, num_fetch_ok_90d,
+               last_content_update, last_modified,
+               num_scheduled_90d, num_fetch_ok_90d,
                num_fetch_fail_90d, num_content_update_90d, num_consecutive_fail,
                last_fail_reason, content_hash, should_crawl, url_score,
-               domain_score, source
+               domain_score, source, discovered_from, title, hreflang_count,
+               etag,
+               cache_control, is_redirect, redirect_hop_count,
+               discovery_source_type, parent_page_score,
+               inlink_count_approx, inlink_count_external, anchor_text,
+               robots_bits
         FROM url_state_current_{bad_shard:03d}
         WHERE domain_id = %s
         ON CONFLICT (url) DO UPDATE
-          SET source = GREATEST(g.source, EXCLUDED.source)
+          SET source = GREATEST(g.source, EXCLUDED.source),
+              discovered_from = COALESCE(g.discovered_from, EXCLUDED.discovered_from),
+              title = COALESCE(g.title, EXCLUDED.title),
+              hreflang_count = COALESCE(g.hreflang_count, EXCLUDED.hreflang_count),
+              last_modified = COALESCE(g.last_modified, EXCLUDED.last_modified),
+              etag = COALESCE(g.etag, EXCLUDED.etag),
+              cache_control = COALESCE(g.cache_control, EXCLUDED.cache_control),
+              is_redirect = COALESCE(g.is_redirect, EXCLUDED.is_redirect),
+              redirect_hop_count = COALESCE(g.redirect_hop_count, EXCLUDED.redirect_hop_count),
+              discovery_source_type = GREATEST(g.discovery_source_type, EXCLUDED.discovery_source_type),
+              parent_page_score = COALESCE(g.parent_page_score, EXCLUDED.parent_page_score),
+              inlink_count_approx = g.inlink_count_approx + EXCLUDED.inlink_count_approx,
+              inlink_count_external = g.inlink_count_external + EXCLUDED.inlink_count_external,
+              anchor_text = COALESCE(g.anchor_text, EXCLUDED.anchor_text),
+              robots_bits = CASE
+                WHEN EXCLUDED.robots_bits = 0 THEN g.robots_bits
+                ELSE EXCLUDED.robots_bits
+              END
         """,
         (good_did, bad_did),
     )

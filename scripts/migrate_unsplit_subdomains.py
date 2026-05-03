@@ -87,17 +87,40 @@ def move_one(cur, src: tuple[str, int, int], dst_shard: int, dst_did: int) -> di
             DELETE FROM {src_cur}
             WHERE domain_id = %s
             RETURNING url, first_seen, last_scheduled, last_fetch_ok,
-                      last_content_update, num_scheduled_90d, num_fetch_ok_90d,
+                      last_content_update, last_modified,
+                      num_scheduled_90d, num_fetch_ok_90d,
                       num_fetch_fail_90d, num_content_update_90d, num_consecutive_fail,
                       last_fail_reason, content_hash, should_crawl, url_score,
-                      domain_score, source, discovered_from
+                      domain_score, source, discovered_from, title,
+                      hreflang_count, etag,
+                      cache_control, is_redirect, redirect_hop_count,
+                      discovery_source_type, parent_page_score,
+                      inlink_count_approx, inlink_count_external, anchor_text,
+                      robots_bits
         )
         INSERT INTO {dst_cur}
-        SELECT url, %s AS domain_id, first_seen, last_scheduled, last_fetch_ok,
-               last_content_update, num_scheduled_90d, num_fetch_ok_90d,
+              (url, domain_id, first_seen, last_scheduled, last_fetch_ok,
+               last_content_update, last_modified,
+               num_scheduled_90d, num_fetch_ok_90d,
                num_fetch_fail_90d, num_content_update_90d, num_consecutive_fail,
                last_fail_reason, content_hash, should_crawl, url_score,
-               domain_score, source, discovered_from
+               domain_score, source, discovered_from, title,
+               hreflang_count, etag,
+               cache_control, is_redirect, redirect_hop_count,
+               discovery_source_type, parent_page_score,
+               inlink_count_approx, inlink_count_external, anchor_text,
+               robots_bits)
+        SELECT url, %s AS domain_id, first_seen, last_scheduled, last_fetch_ok,
+               last_content_update, last_modified,
+               num_scheduled_90d, num_fetch_ok_90d,
+               num_fetch_fail_90d, num_content_update_90d, num_consecutive_fail,
+               last_fail_reason, content_hash, should_crawl, url_score,
+               domain_score, source, discovered_from, title,
+               hreflang_count, etag,
+               cache_control, is_redirect, redirect_hop_count,
+               discovery_source_type, parent_page_score,
+               inlink_count_approx, inlink_count_external, anchor_text,
+               robots_bits
         FROM moved
         ON CONFLICT (url) DO NOTHING
         """,
@@ -111,22 +134,40 @@ def move_one(cur, src: tuple[str, int, int], dst_shard: int, dst_did: int) -> di
             DELETE FROM {src_hist}
             WHERE domain_id = %s
             RETURNING url, first_seen, last_scheduled, last_fetch_ok,
-                      last_content_update, num_scheduled_90d, num_fetch_ok_90d,
+                      last_content_update, last_modified,
+                      num_scheduled_90d, num_fetch_ok_90d,
                       num_fetch_fail_90d, num_content_update_90d, num_consecutive_fail,
                       last_fail_reason, content_hash, should_crawl, url_score,
-                      domain_score, source, discovered_from
+                      domain_score, source, discovered_from, title,
+                      hreflang_count, etag,
+                      cache_control, is_redirect, redirect_hop_count,
+                      discovery_source_type, parent_page_score,
+                      inlink_count_approx, inlink_count_external, anchor_text,
+                      robots_bits
         )
         INSERT INTO {dst_hist}
               (url, domain_id, first_seen, last_scheduled, last_fetch_ok,
-               last_content_update, num_scheduled_90d, num_fetch_ok_90d,
+               last_content_update, last_modified,
+               num_scheduled_90d, num_fetch_ok_90d,
                num_fetch_fail_90d, num_content_update_90d, num_consecutive_fail,
                last_fail_reason, content_hash, should_crawl, url_score,
-               domain_score, source, discovered_from)
+               domain_score, source, discovered_from, title,
+               hreflang_count, etag,
+               cache_control, is_redirect, redirect_hop_count,
+               discovery_source_type, parent_page_score,
+               inlink_count_approx, inlink_count_external, anchor_text,
+               robots_bits)
         SELECT url, %s, first_seen, last_scheduled, last_fetch_ok,
-               last_content_update, num_scheduled_90d, num_fetch_ok_90d,
+               last_content_update, last_modified,
+               num_scheduled_90d, num_fetch_ok_90d,
                num_fetch_fail_90d, num_content_update_90d, num_consecutive_fail,
                last_fail_reason, content_hash, should_crawl, url_score,
-               domain_score, source, discovered_from
+               domain_score, source, discovered_from, title,
+               hreflang_count, etag,
+               cache_control, is_redirect, redirect_hop_count,
+               discovery_source_type, parent_page_score,
+               inlink_count_approx, inlink_count_external, anchor_text,
+               robots_bits
         FROM moved
         """,
         (src_did, dst_did),

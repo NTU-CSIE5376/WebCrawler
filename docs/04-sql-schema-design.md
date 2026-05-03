@@ -123,9 +123,14 @@ Key columns:
 - rolling counters: `num_scheduled_90d`, `num_fetch_ok_90d`, `num_fetch_fail_90d`, `num_content_update_90d`
 - quality/failure: `num_consecutive_fail`, `last_fail_reason`, `content_hash`
 - scheduling flags/signals: `should_crawl`, `url_score`, `domain_score`
+- link signals: `inlink_count_approx INTEGER NOT NULL DEFAULT 0`, `inlink_count_external INTEGER NOT NULL DEFAULT 0` (non-deduplicated observed outlink counters from crawler discovery; no historical backfill)
 - provenance: `source SMALLINT NOT NULL DEFAULT 0` (`0` = natural discovery, `1` = golden set membership; see `scripts/golden_inject.py`)
 - provenance: `discovered_from VARCHAR` (parent page URL on first discovery; NULL for golden-injected and seed URLs; first parent wins via `ON CONFLICT DO NOTHING`)
+- discovery metadata: `discovery_source_type SMALLINT NOT NULL DEFAULT 0` (`0` = unknown/seed, `1` = page outlink), `parent_page_score DOUBLE PRECISION` (source page domain score at discovery time), `anchor_text VARCHAR` (first non-null outlink anchor observed for this URL)
+- robots metadata: `robots_bits SMALLINT NOT NULL DEFAULT 0` (`0` = unknown, `1` = crawl allowed, `2` = crawl disallowed by robots.txt)
 - page metadata: `title VARCHAR` (`<title>` trimmed to 500 chars by the spider; NULL on fail / non-HTML; latest successful fetch wins, fails keep the previous value via `COALESCE`)
+- page metadata: `hreflang_count INTEGER` (count of `<link rel="alternate" hreflang="...">` entries on successful HTML fetches)
+- response metadata: `last_modified TIMESTAMPTZ`, `etag VARCHAR`, `cache_control VARCHAR`, `is_redirect BOOLEAN`, `redirect_hop_count SMALLINT`
 
 Write patterns:
 

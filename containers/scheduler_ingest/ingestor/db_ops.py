@@ -22,12 +22,18 @@ BATCH_SIZE = 500
 # Catches already-queued oversized urls that bypassed the spider-side filter.
 MAX_URL_LEN = 2500
 
+ROBOTS_UNKNOWN = 0
+ROBOTS_ALLOWED = 1
+ROBOTS_DISALLOWED = 2
+ROBOTS_FAIL_PREFIX = "IgnoreRequest Forbidden by robots.txt"
+
 
 _CUR_INSERT_COLS = (
     "url",
     "domain_id",
     "last_fetch_ok",
     "last_content_update",
+    "last_modified",
     "num_fetch_ok_90d",
     "num_fetch_fail_90d",
     "num_content_update_90d",
@@ -36,6 +42,12 @@ _CUR_INSERT_COLS = (
     "content_hash",
     "should_crawl",
     "title",
+    "hreflang_count",
+    "etag",
+    "cache_control",
+    "is_redirect",
+    "redirect_hop_count",
+    "robots_bits",
 )
 
 # snapshot_id / snapshot_at have DB defaults so they're omitted here.
@@ -46,6 +58,7 @@ _HIST_COLS = (
     "last_scheduled",
     "last_fetch_ok",
     "last_content_update",
+    "last_modified",
     "num_scheduled_90d",
     "num_fetch_ok_90d",
     "num_fetch_fail_90d",
@@ -59,6 +72,17 @@ _HIST_COLS = (
     "source",
     "discovered_from",
     "title",
+    "hreflang_count",
+    "etag",
+    "cache_control",
+    "is_redirect",
+    "redirect_hop_count",
+    "discovery_source_type",
+    "parent_page_score",
+    "inlink_count_approx",
+    "inlink_count_external",
+    "anchor_text",
+    "robots_bits",
 )
 
 
@@ -74,6 +98,23 @@ class IngestDB:
 
     def _tevt(self, shard_id: int) -> str:
         return f"url_event_counter_{shard_id:03d}"
+
+    @staticmethod
+    def _parse_optional_datetime(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _robots_bits(is_ok: bool, fail_reason: str | None) -> int:
+        if fail_reason and fail_reason.startswith(ROBOTS_FAIL_PREFIX):
+            return ROBOTS_DISALLOWED
+        if is_ok or fail_reason == "NonHTML content-type" or (fail_reason or "").startswith("HttpError "):
+            return ROBOTS_ALLOWED
+        return ROBOTS_UNKNOWN
 
     @staticmethod
     def _split_unique_urls(items: list[tuple[int, dict]]) -> list[list[tuple[int, dict]]]:
@@ -133,6 +174,7 @@ class IngestDB:
                     if rec.get("fetched_at")
                     else datetime.now(timezone.utc)
                 ),
+                "last_modified": self._parse_optional_datetime(rec.get("last_modified")),
                 "fail_reason": rec.get("fail_reason"),
                 "content_hash": content_hash,
                 "is_ok": is_ok,
@@ -141,6 +183,12 @@ class IngestDB:
                 "inc_fail": inc_fail,
                 "inc_upd": 0,
                 "title": rec.get("title") if is_ok else None,
+                "hreflang_count": rec.get("hreflang_count") if is_ok else None,
+                "etag": rec.get("etag"),
+                "cache_control": rec.get("cache_control"),
+                "is_redirect": rec.get("is_redirect"),
+                "redirect_hop_count": rec.get("redirect_hop_count"),
+                "robots_bits": self._robots_bits(is_ok, rec.get("fail_reason")),
             })
             if is_ok and content_hash is not None:
                 check_urls.append(url)
@@ -165,6 +213,7 @@ class IngestDB:
                 d["domain_id"],
                 d["fetched_at"] if d["is_ok"] else None,
                 d["fetched_at"] if d["is_upd"] else None,
+                d["last_modified"],
                 d["inc_ok"],
                 d["inc_fail"],
                 d["inc_upd"],
@@ -173,6 +222,12 @@ class IngestDB:
                 d["content_hash"],
                 False,
                 d["title"],
+                d["hreflang_count"],
+                d["etag"],
+                d["cache_control"],
+                d["is_redirect"],
+                d["redirect_hop_count"],
+                d["robots_bits"],
             )
             for d in decoded
         ]
@@ -195,7 +250,17 @@ class IngestDB:
             ELSE {tcur}.content_hash
           END,
           should_crawl = FALSE,
-          title = COALESCE(EXCLUDED.title, {tcur}.title)
+          title = COALESCE(EXCLUDED.title, {tcur}.title),
+          hreflang_count = COALESCE(EXCLUDED.hreflang_count, {tcur}.hreflang_count),
+          last_modified = COALESCE(EXCLUDED.last_modified, {tcur}.last_modified),
+          etag = COALESCE(EXCLUDED.etag, {tcur}.etag),
+          cache_control = COALESCE(EXCLUDED.cache_control, {tcur}.cache_control),
+          is_redirect = COALESCE(EXCLUDED.is_redirect, {tcur}.is_redirect),
+          redirect_hop_count = COALESCE(EXCLUDED.redirect_hop_count, {tcur}.redirect_hop_count),
+          robots_bits = CASE
+            WHEN EXCLUDED.robots_bits = {ROBOTS_UNKNOWN} THEN {tcur}.robots_bits
+            ELSE EXCLUDED.robots_bits
+          END
         RETURNING {", ".join(_HIST_COLS)}, (xmax = 0) AS inserted
         """
         returned = execute_values(
@@ -260,40 +325,72 @@ class IngestDB:
         tcur = self._tcur(shard_id)
         this = self._this(shard_id)
 
-        seen: set[str] = set()
-        unique_items: list[tuple[int, dict]] = []
+        by_url: dict[str, dict] = {}
+        first_idx_by_url: dict[str, int] = {}
         dup_results: list[tuple[int, bool]] = []
         for idx, rec in items:
             url = rec["url"]
-            if url in seen:
+            inc_approx = int(rec.get("inlink_count_approx", 1))
+            inc_external = int(rec.get("inlink_count_external", 0))
+            if url in by_url:
+                by_url[url]["inlink_count_approx"] += inc_approx
+                by_url[url]["inlink_count_external"] += inc_external
                 dup_results.append((idx, False))
             else:
-                seen.add(url)
-                unique_items.append((idx, rec))
+                first_idx_by_url[url] = idx
+                by_url[url] = {
+                    **rec,
+                    "inlink_count_approx": inc_approx,
+                    "inlink_count_external": inc_external,
+                }
+
+        unique_items = [(first_idx_by_url[url], rec) for url, rec in by_url.items()]
 
         link_rows = [
-            (rec["url"], int(rec["domain_id"]), float(rec.get("domain_score", 0.0)), rec.get("discovered_from"))
+            (
+                rec["url"],
+                int(rec["domain_id"]),
+                float(rec.get("domain_score", 0.0)),
+                rec.get("discovered_from"),
+                int(rec.get("discovery_source_type", 0)),
+                rec.get("parent_page_score"),
+                int(rec.get("inlink_count_approx", 0)),
+                int(rec.get("inlink_count_external", 0)),
+                (rec.get("anchor_text") or None),
+            )
             for _, rec in unique_items
         ]
         inserted_rows = execute_values(
             cur,
             f"""
-            INSERT INTO {tcur} (url, domain_id, domain_score, discovered_from)
+            INSERT INTO {tcur}
+              (url, domain_id, domain_score, discovered_from,
+               discovery_source_type, parent_page_score,
+               inlink_count_approx, inlink_count_external, anchor_text)
             VALUES %s
-            ON CONFLICT (url) DO NOTHING
-            RETURNING url
+            ON CONFLICT (url) DO UPDATE SET
+              inlink_count_approx = {tcur}.inlink_count_approx + EXCLUDED.inlink_count_approx,
+              inlink_count_external = {tcur}.inlink_count_external + EXCLUDED.inlink_count_external,
+              anchor_text = COALESCE({tcur}.anchor_text, EXCLUDED.anchor_text)
+            RETURNING url, (xmax = 0) AS inserted
             """,
             link_rows,
             page_size=len(link_rows),
             fetch=True,
         )
-        inserted_set = {row[0] for row in inserted_rows}
+        inserted_set = {row[0] for row in inserted_rows if row[1]}
 
         history_rows = [r for r in link_rows if r[0] in inserted_set]
         if history_rows:
             execute_values(
                 cur,
-                f"INSERT INTO {this} (url, domain_id, domain_score, discovered_from) VALUES %s",
+                f"""
+                INSERT INTO {this}
+                  (url, domain_id, domain_score, discovered_from,
+                   discovery_source_type, parent_page_score,
+                   inlink_count_approx, inlink_count_external, anchor_text)
+                VALUES %s
+                """,
                 history_rows,
                 page_size=len(history_rows),
             )
