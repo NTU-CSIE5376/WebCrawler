@@ -188,3 +188,27 @@ Recommended scheduling: host crontab, daily.
 ```
 
 The job is cheap (~5–10 s end-to-end on production scale: ~14k hosts collapsed to ~13k domain keys, plus an `UPDATE ... WHERE domain = ANY(...)` against the unique `domain_state_domain_key` index), so a daily cadence is conservative.
+
+## 6.13 `request_success_rate_daily.py`
+
+- Recurring job (intended daily).
+- Computes the crawler request success rate for one day from Loki and writes it to `metricdb.crawler_stat_total.request_success_rate`.
+- Same definition as the Grafana "Success rate" panel (`ops/grafana/dashboards/crawler.json`), over a full day instead of 5 minutes:
+  - `request_success_rate = end(status < 400) / (end(all) + fail(fail_reason !~ "HttpError.*"))`
+  - Source events: `request.end` (carries `status`), `request.fail` (carries `fail_reason`).
+- A single 24h Loki instant query times out at this volume (~28M `request.end`/day), so the day is summed over 24 hourly `count_over_time[1h]` windows client-side (~150 s/day).
+- `ADD COLUMN IF NOT EXISTS request_success_rate DOUBLE PRECISION` on `crawler_stat_total`, then `UPDATE` the row the daily stats job already creates for that `stat_date`. Total-only, no new table. If no row exists yet for the date, it warns and rolls back rather than inserting one.
+- Dates are interpreted in UTC+8 to match `crawler_stat_total.stat_date`; `--date` defaults to yesterday.
+- Reads Loki (`http://localhost:3100`), writes metricdb (`crawler_stat_total` only).
+
+```bash
+uv run scripts/request_success_rate_daily.py [--date YYYY-MM-DD] [--dry-run]
+```
+
+Recommended scheduling: host crontab, daily after midnight (UTC+8) so the previous full day is complete.
+
+```cron
+30 0 * * * cd /app && uv run scripts/request_success_rate_daily.py >> /var/log/request_success_rate.log 2>&1
+```
+
+Loki retention is 720h (30 days), so a backfill of any recent day is available via `--date`.
