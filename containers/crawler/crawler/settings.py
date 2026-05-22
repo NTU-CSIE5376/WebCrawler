@@ -21,7 +21,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 CONCURRENT_REQUESTS = int(os.getenv("CRAWLER_CONCURRENT_REQUESTS", "256"))
 SCRAPER_SLOT_MAX_ACTIVE_SIZE = int(
-    os.getenv("CRAWLER_SCRAPER_SLOT_MAX_ACTIVE_SIZE", "50000000")
+    os.getenv("CRAWLER_SCRAPER_SLOT_MAX_ACTIVE_SIZE", "100000000")
 )
 USE_AUTOTHROTTLE = _env_bool("CRAWLER_USE_AUTOTHROTTLE", False)
 

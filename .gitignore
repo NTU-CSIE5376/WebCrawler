@@ -15,3 +15,5 @@ tmp/
 .test-data/
 
 artifacts/
+
+Not_push/
