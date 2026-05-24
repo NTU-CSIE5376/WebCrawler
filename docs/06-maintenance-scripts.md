@@ -188,3 +188,29 @@ Recommended scheduling: host crontab, daily.
 ```
 
 The job is cheap (~5–10 s end-to-end on production scale: ~14k hosts collapsed to ~13k domain keys, plus an `UPDATE ... WHERE domain = ANY(...)` against the unique `domain_state_domain_key` index), so a daily cadence is conservative.
+
+## 6.13 `migrate_add_discovery_frozen.py`
+
+- One-time migration.
+- Adds `discovery_frozen BOOLEAN NOT NULL DEFAULT FALSE` to `domain_state`.
+- Idempotent via `IF NOT EXISTS`. PG 11+ treats this as metadata-only, no table rewrite.
+- Frontier budget flag: maintained by the `frontier_gc` program (see 2.2), read by ingestor `_bulk_links` to stop inserting new links for frozen domains. Run before deploying code that reads the column.
+
+```bash
+uv run scripts/migrate_add_discovery_frozen.py [--dry-run]
+```
+
+## 6.14 `oneoff_drop_trap_frontier.py`
+
+- One-off cleanup for the pre-existing frontier backlog (what `frontier_gc` does going forward, applied immediately to the current pile-up).
+- Finds trap domains (estimated `pending > --cap` AND fetch yield `< --yield-floor`, via per-shard sampling so it stays off full table scans), then per target: sets `discovery_frozen=TRUE`, pushes `crawl_paused_until` far out, and deletes `should_crawl=TRUE` rows in batches by `domain_id`, committing per batch (resumable, no long lock).
+- Fetched rows are kept. `url_state_history` is only touched with `--include-history`.
+- Tuning defaults: `--cap 1000000`, `--yield-floor 0.01`, `--sample-pct 0.5`, `--batch 20000`. Production traps sit at <0.1% yield with tens of millions pending while healthy domains clear ~2%+, so the 1% floor separates them with margin.
+- Deletes release space to the table free list only; the script prints the `pg_repack` / `VACUUM FULL` command per affected shard to return it to the OS. On a disk-constrained host, run frontier-only first to free space before `--include-history`.
+- Pre-req: run `migrate_add_discovery_frozen.py` first (the `--execute` path writes `discovery_frozen`).
+
+```bash
+uv run scripts/oneoff_drop_trap_frontier.py                      # dry-run, list targets
+uv run scripts/oneoff_drop_trap_frontier.py --execute            # freeze + drain frontier
+uv run scripts/oneoff_drop_trap_frontier.py --execute --include-history
+```

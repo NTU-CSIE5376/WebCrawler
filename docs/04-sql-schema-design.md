@@ -33,6 +33,7 @@ Columns:
 - `domain_score FLOAT DEFAULT 0.0`
 - `crawl_paused_until TIMESTAMPTZ` (NULL = not paused; set by ingestor on concentrated fail reasons, checked by offerer selection)
 - `domain_fail_count INT NOT NULL DEFAULT 0` (consecutive failure counter; used as exponent for pause backoff, reset on any ok fetch)
+- `discovery_frozen BOOLEAN NOT NULL DEFAULT FALSE` (frontier budget; set by `frontier_gc` for oversized low-yield domains, read by ingestor `_bulk_links` to stop inserting their new links)
 
 Usage:
 

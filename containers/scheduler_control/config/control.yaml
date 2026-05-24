@@ -22,6 +22,31 @@ offerer:
 postgres:
   dsn: "postgresql+psycopg2://crawler:crawler@172.16.191.1:5432/crawlerdb"
 
+gc:
+  total_shards: 256
+
+  # Frontier budget. Freeze a domain (stop inserting its newly discovered
+  # links) once it holds more than frontier_cap pending URLs AND its lifetime
+  # fetch-success rate is below yield_floor. Tuned from production: trap
+  # domains sit at <0.1% yield with tens of millions pending, healthy domains
+  # clear ~2%+, so a 1% floor separates them with margin.
+  frontier_cap: 1000000
+  yield_floor: 0.01
+  sample_percent: 0.5
+
+  # Eviction. should_crawl=TRUE means never scheduled (so never fetched); a
+  # URL the offerer has had this many days to schedule and never did is dead
+  # frontier weight. Frozen-domain frontier drains faster.
+  stale_pending_days: 60
+  frozen_pending_days: 7
+  batch_size: 5000
+
+  # Daily UTC schedule, offset from accounting (03:00) to avoid overlap.
+  run_hour_utc: 4
+  run_minute_utc: 0
+  check_interval_sec: 3600
+  catch_up_on_start: true
+
 accounting:
   total_shards: 256
   event_retention_days: 90
