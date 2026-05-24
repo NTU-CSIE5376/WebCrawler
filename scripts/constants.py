@@ -8,3 +8,4 @@ METRICDB = dict(host="172.16.191.1", port=5433, user="metric", password="metric"
 # url_state_current.source values
 SOURCE_NATURAL = 0
 SOURCE_GOLDEN = 1
+SOURCE_PAGEVIEW = 2
