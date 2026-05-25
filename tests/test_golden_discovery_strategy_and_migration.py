@@ -15,6 +15,7 @@ from containers.scheduler_control.scorer.service import (
 from containers.scheduler_ingest.ingestor import db_ops as ingest_db_ops
 from containers.scheduler_ingest.ingestor.db_ops import IngestDB
 from scripts import migrate_add_url_score_updated_at as migration
+from scripts import migrate_add_golden_rescore_index as rescore_migration
 
 
 class GoldenDiscoveryMigrationSqlTest(unittest.TestCase):
@@ -73,6 +74,24 @@ class GoldenDiscoveryMigrationSqlTest(unittest.TestCase):
             "ALTER TABLE url_state_current_000 "
             "ADD COLUMN IF NOT EXISTS url_score_updated_at TIMESTAMPTZ",
         )
+
+    def test_rescore_index_is_partial_composite_current_shard_index(self):
+        sql = rescore_migration.create_golden_rescore_index_sql(7)
+
+        self.assertIn(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+            "idx_url_state_current_007_golden_discovery_v2_rescore",
+            sql,
+        )
+        # Composite (domain_id, url_score_updated_at) with NULLS FIRST so the
+        # planner can nested-loop over golden domains and walk each domain's
+        # rows in the scorer's ORDER BY order without a full sort.
+        self.assertIn(
+            "ON url_state_current_007 (domain_id, url_score_updated_at ASC NULLS FIRST)",
+            sql,
+        )
+        self.assertIn("WHERE should_crawl = TRUE", sql)
+        self.assertNotIn("url_state_history", sql)
 
 
 class _FakeResult:
@@ -450,6 +469,7 @@ class GoldenDiscoveryRankerSteeringTest(unittest.TestCase):
 
     def test_steering_enabled_joins_domain_state_and_filters_by_score(self):
         cursor = _FakeCursor()
+        # Defaults: min_age_days=3, rescore_ttl_days=5 (see config dataclass).
         service = _make_steering_service(cursor, steering=True, batch_size=1000)
 
         with patch.object(scorer_service, "execute_values", lambda *a, **kw: None):
@@ -459,10 +479,90 @@ class GoldenDiscoveryRankerSteeringTest(unittest.TestCase):
         self.assertIn("FROM url_state_current_007 u", select_sql)
         self.assertIn("JOIN domain_state d ON d.domain_id = u.domain_id", select_sql)
         self.assertIn("d.domain_score > 0", select_sql)
-        self.assertIn("ORDER BY d.domain_score DESC NULLS LAST", select_sql)
-        self.assertIn("u.first_seen ASC NULLS LAST", select_sql)
         self.assertIn("FOR UPDATE OF u SKIP LOCKED", select_sql)
-        self.assertEqual(select_params, (1000,))
+
+        # min_age gate: don't score URLs younger than min_age_days.
+        self.assertIn("u.first_seen < NOW() - make_interval(days => %s)", select_sql)
+        # TTL refresh: re-pick never-scored OR stale-scored rows (v2 features
+        # drift, so url_score is no longer write-once).
+        self.assertIn("u.url_score_updated_at IS NULL", select_sql)
+        self.assertIn(
+            "u.url_score_updated_at < NOW() - make_interval(days => %s)",
+            select_sql,
+        )
+        # LRU ordering: golden tier first, then never-scored, then stalest.
+        self.assertIn("ORDER BY d.domain_score DESC", select_sql)
+        self.assertIn("u.url_score_updated_at ASC NULLS FIRST", select_sql)
+        # Params are (min_age_days, rescore_ttl_days, batch_size) in that order.
+        self.assertEqual(select_params, (3, 5, 1000))
+
+    def test_steering_query_uses_no_write_once_only_filter(self):
+        # Guard against regressing to the v1 write-once behavior: the steering
+        # query must NOT gate solely on `url_score_updated_at IS NULL` — that
+        # would score each URL once and never refresh as inlinks accumulate.
+        cursor = _FakeCursor()
+        service = _make_steering_service(cursor, steering=True, batch_size=500)
+
+        with patch.object(scorer_service, "execute_values", lambda *a, **kw: None):
+            service._score_batch(3)
+
+        select_sql, _ = cursor.executed[0]
+        self.assertIn("OR u.url_score_updated_at <", select_sql)
+
+    def test_steering_gate_days_are_configurable(self):
+        cursor = _FakeCursor()
+        service = GoldenDiscoveryRankerService(
+            cfg=GoldenDiscoveryRankerConfig(
+                total_shards=256,
+                num_workers=1,
+                worker_id=0,
+                batch_size=250,
+                scan_interval_sec=60,
+                max_batches_per_shard=1,
+                domain_priority_steering_enabled=True,
+                rescore_ttl_days=30,
+                min_age_days=7,
+            ),
+            Session=_FakeScorerSessionFactory(cursor),
+            scorer=_FakeScorer(),
+        )
+
+        with patch.object(scorer_service, "execute_values", lambda *a, **kw: None):
+            service._score_batch(1)
+
+        _, select_params = cursor.executed[0]
+        self.assertEqual(select_params, (7, 30, 250))
+
+    def test_steering_ttl_zero_is_write_once(self):
+        # rescore_ttl_days<=0 must be true write-once: only never-scored rows,
+        # with the TTL OR-branch (and its interval param) dropped entirely.
+        # Emitting `< NOW() - interval '0'` instead would match every
+        # already-scored row and re-score the whole pool on every pass.
+        cursor = _FakeCursor()
+        service = GoldenDiscoveryRankerService(
+            cfg=GoldenDiscoveryRankerConfig(
+                total_shards=256,
+                num_workers=1,
+                worker_id=0,
+                batch_size=100,
+                scan_interval_sec=60,
+                max_batches_per_shard=1,
+                domain_priority_steering_enabled=True,
+                rescore_ttl_days=0,
+                min_age_days=3,
+            ),
+            Session=_FakeScorerSessionFactory(cursor),
+            scorer=_FakeScorer(),
+        )
+
+        with patch.object(scorer_service, "execute_values", lambda *a, **kw: None):
+            service._score_batch(2)
+
+        select_sql, select_params = cursor.executed[0]
+        self.assertIn("u.url_score_updated_at IS NULL", select_sql)
+        self.assertNotIn("OR u.url_score_updated_at <", select_sql)
+        # Only (min_age_days, batch_size) — the TTL interval param is gone.
+        self.assertEqual(select_params, (3, 100))
 
 
 class _FakeInlineRanker:
@@ -534,7 +634,11 @@ class GoldenDiscoveryIngestInlineScoringTest(unittest.TestCase):
 
         self.assertEqual(result, [(0, True), (1, False)])
         self.assertEqual(ranker.calls, [["https://example.com/a"]])
-        self.assertIn("FROM url_state_current_003", cursor.executed[0][0])
+        # _bulk_links first checks for frozen domains, then (because inline
+        # scoring is active) looks up which URLs already exist before scoring
+        # only the new ones.
+        self.assertIn("discovery_frozen = TRUE", cursor.executed[0][0])
+        self.assertIn("FROM url_state_current_003", cursor.executed[1][0])
 
         current_sql, current_rows, _, current_fetch = execute_values_calls[0]
         self.assertTrue(current_fetch)
@@ -581,7 +685,10 @@ class GoldenDiscoveryIngestInlineScoringTest(unittest.TestCase):
 
         self.assertEqual(result, [(0, True)])
         self.assertEqual(ranker.calls, [])
-        self.assertEqual(cursor.executed, [])
+        # The frozen-domain guard still runs; but with the inline timeout at 0
+        # the scoring path is skipped, so there is no existing-URL lookup.
+        self.assertEqual(len(cursor.executed), 1)
+        self.assertIn("discovery_frozen = TRUE", cursor.executed[0][0])
         current_rows = execute_values_calls[0][1]
         self.assertEqual(current_rows[0][3], 0.0)
         self.assertIsNone(current_rows[0][4])
@@ -612,7 +719,10 @@ class GoldenDiscoveryIngestInlineScoringTest(unittest.TestCase):
             result = db._bulk_links(cur=cursor, shard_id=3, items=records)
 
         self.assertEqual(result, [(0, True)])
-        self.assertEqual(cursor.executed, [])
+        # No inline ranker, so scoring is skipped and no existing-URL lookup
+        # runs — only the frozen-domain guard touches the cursor.
+        self.assertEqual(len(cursor.executed), 1)
+        self.assertIn("discovery_frozen = TRUE", cursor.executed[0][0])
         current_rows = execute_values_calls[0][1]
         self.assertEqual(current_rows[0][3], 0.0)
         self.assertIsNone(current_rows[0][4])
