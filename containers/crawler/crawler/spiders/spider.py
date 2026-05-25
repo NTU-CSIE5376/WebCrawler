@@ -378,9 +378,9 @@ class HtmlSpider(scrapy.Spider):
             })
 
         parsed_response_url = urlparse(response.url)
+        host = parsed_response_url.hostname or ""
         if (
-            parsed_response_url.hostname
-            and parsed_response_url.hostname.endswith("youtube.com")
+            (host == "youtube.com" or host.endswith(".youtube.com"))
             and parsed_response_url.path == "/watch"
             and parse_qs(parsed_response_url.query).get("v")
         ):
