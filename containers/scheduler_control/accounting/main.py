@@ -44,6 +44,8 @@ def main() -> None:
         total_shards=int(accounting.get("total_shards", 256)),
         event_retention_days=int(accounting.get("event_retention_days", 90)),
         batch_size=int(accounting.get("batch_size", 1000)),
+        history_retention_days=int(accounting.get("history_retention_days", 30)),
+        history_batch_size=int(accounting.get("history_batch_size", 5000)),
         run_hour_utc=int(accounting.get("run_hour_utc", 3)),
         run_minute_utc=int(accounting.get("run_minute_utc", 0)),
         check_interval_sec=int(accounting.get("check_interval_sec", 30)),

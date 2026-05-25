@@ -55,6 +55,7 @@ Runtime behavior of `accounting_rolloff`:
    - append snapshots into `url_state_history_{shard}`,
    - set processed (and missing-current-row) event rows to `accounted=FALSE`.
 4. Commit each batch independently to reduce lock duration and avoid long transactions.
+5. History retention: the same daily pass also trickle-deletes `url_state_history_{shard}` and `content_feature_history_{shard}` snapshots older than `history_retention_days` (default 30, `0` disables). These are append-only audit logs with no pipeline read path; each batch is ordered by `snapshot_id` (the PK, monotonic with time) so it reads the oldest rows first. The current-table 90-day rolling counters are unaffected. Deletes release space to the table free list; repack/vacuum returns it to the OS.
 
 Runtime behavior of `frontier_gc`:
 
