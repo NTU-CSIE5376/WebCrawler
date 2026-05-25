@@ -17,6 +17,10 @@ class CounterRolloffConfig:
     total_shards: int
     event_retention_days: int
     batch_size: int
+    # Prune append-only *_history snapshots older than this in the same daily
+    # pass (0 disables). These tables have no pipeline read path.
+    history_retention_days: int
+    history_batch_size: int
     run_hour_utc: int
     run_minute_utc: int
     check_interval_sec: int
@@ -44,6 +48,29 @@ class CounterRolloffService:
     def _scheduled_today_utc(self, now_utc: datetime) -> datetime:
         run_t = dt_time(hour=self.cfg.run_hour_utc, minute=self.cfg.run_minute_utc)
         return datetime.combine(now_utc.date(), run_t, tzinfo=timezone.utc)
+
+    def _prune_history(self, table: str, shard_id: int) -> int:
+        """Delete one batch of aged snapshots, ordered by snapshot_id (the PK,
+        monotonic with time) so it reads the oldest rows first."""
+        name = f"{table}_{shard_id:03d}"
+        sql = text(
+            f"""
+            WITH picked AS (
+                SELECT ctid FROM {name}
+                WHERE snapshot_at < now() - make_interval(days => :days)
+                ORDER BY snapshot_id
+                LIMIT :batch
+            )
+            DELETE FROM {name} WHERE ctid IN (SELECT ctid FROM picked)
+            """
+        )
+        with self.Session() as sess:
+            n = sess.execute(
+                sql,
+                {"days": self.cfg.history_retention_days, "batch": self.cfg.history_batch_size},
+            ).rowcount
+            sess.commit()
+        return n
 
     def _process_batch(self, shard_id: int, cutoff_date: date) -> dict[str, int]:
         tcur = self._tcur(shard_id)
@@ -206,6 +233,7 @@ class CounterRolloffService:
             "history_count": 0,
             "marked_count": 0,
             "stalled_batches": 0,
+            "history_pruned": 0,
         }
 
         for shard_id in range(self.cfg.total_shards):
@@ -226,6 +254,15 @@ class CounterRolloffService:
                 if stats["marked_count"] == 0:
                     totals["stalled_batches"] += 1
                     break
+
+        if self.cfg.history_retention_days > 0:
+            for table in ("url_state_history", "content_feature_history"):
+                for shard_id in range(self.cfg.total_shards):
+                    while True:
+                        n = self._prune_history(table, shard_id)
+                        totals["history_pruned"] += n
+                        if n == 0:
+                            break
 
         logger.info(
             "accounting.rolloff_done",

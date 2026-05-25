@@ -20,10 +20,11 @@ Primary role:
 
 ## 2.2 `scheduler_control` Container
 
-Runs `supervisord` with three program types:
+Runs `supervisord` with four program types:
 
 - `offerer` with `numprocs=16` (`offerer_00..offerer_15`)
 - `accounting_rolloff` with `numprocs=1`
+- `frontier_gc` with `numprocs=1`
 - `golden_discovery_ranker_v1` with `numprocs=4` (disabled unless `GOLDEN_DISCOVERY_RANKER_V1_ENABLED=true`)
 
 Runtime behavior per offerer:
@@ -54,6 +55,17 @@ Runtime behavior of `accounting_rolloff`:
    - append snapshots into `url_state_history_{shard}`,
    - set processed (and missing-current-row) event rows to `accounted=FALSE`.
 4. Commit each batch independently to reduce lock duration and avoid long transactions.
+5. History retention: the same daily pass also trickle-deletes `url_state_history_{shard}` and `content_feature_history_{shard}` snapshots older than `history_retention_days` (default 30, `0` disables). These are append-only audit logs with no pipeline read path; each batch is ordered by `snapshot_id` (the PK, monotonic with time) so it reads the oldest rows first. The current-table 90-day rolling counters are unaffected. Deletes release space to the table free list; repack/vacuum returns it to the OS.
+
+Runtime behavior of `frontier_gc`:
+
+The crawl frontier (`should_crawl=TRUE` rows) is never evicted by the pipeline, so low-yield domains accumulate an unbounded never-fetched backlog. Each daily pass, per shard:
+
+1. Wake up by polling interval and check daily UTC schedule (same pattern as `accounting_rolloff`).
+2. Refresh the frontier budget: sample to find oversized domains, exact-verify by `domain_id`, set `domain_state.discovery_frozen` when `pending > frontier_cap` AND fetch yield `< yield_floor`, and unfreeze domains that no longer qualify.
+3. Evict never-scheduled frontier rows in `batch_size` trickle deletes (`FOR UPDATE SKIP LOCKED`): frozen-domain rows older than `frozen_pending_days`, plus general unscored rows older than `stale_pending_days`. Does not touch `url_state_history`.
+
+Parallel query is disabled on its connection (the DB host is disk-constrained; parallel workers' shared-memory segments can fail to allocate).
 
 Runtime behavior of `golden_discovery_ranker_v1`:
 
@@ -114,6 +126,7 @@ Input: router output folders `ingestor_{id}`.
 Responsibilities:
 
 - `status="new"` records: insert new URL candidates into `url_state_current_{shard}` and history.
+  - Links whose domain has `domain_state.discovery_frozen=TRUE` are skipped (frontier budget; see `frontier_gc` in 2.2), so frozen domains stop accumulating new frontier rows.
   - If `GOLDEN_DISCOVERY_RANKER_V1_INGEST_INLINE_ENABLED=true`, check which URLs are truly new, score those with the mounted ranker artifact before writing them to DB, and fall back to unscored insert when the inline scoring time budget is exhausted.
   - If inline scoring is disabled, new URLs keep `url_score_updated_at=NULL` and the background ranker can score them later.
 - Fetch result records:

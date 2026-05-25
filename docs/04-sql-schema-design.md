@@ -33,6 +33,7 @@ Columns:
 - `domain_score FLOAT DEFAULT 0.0`
 - `crawl_paused_until TIMESTAMPTZ` (NULL = not paused; set by ingestor on concentrated fail reasons, checked by offerer selection)
 - `domain_fail_count INT NOT NULL DEFAULT 0` (consecutive failure counter; used as exponent for pause backoff, reset on any ok fetch)
+- `discovery_frozen BOOLEAN NOT NULL DEFAULT FALSE` (frontier budget; set by `frontier_gc` for oversized low-yield domains, read by ingestor `_bulk_links` to stop inserting their new links)
 
 Usage:
 
@@ -159,6 +160,7 @@ Write pattern:
 - Ingestor inserts a row after each current-table upsert (full snapshot copy).
 - Accounting rolloff appends snapshots after each maintenance update batch.
 - Golden set injection (`scripts/golden_inject.py`): inserts a snapshot only when a new row is added to `url_state_current_{shard}`. Source-only updates on existing URLs do not generate a history entry.
+- Retention: the `accounting_rolloff` daily pass deletes snapshots older than `history_retention_days` (default 30); no pipeline path reads this table.
 
 ### `url_event_counter_{shard}`
 
@@ -224,6 +226,7 @@ PK and metadata:
 Write pattern:
 
 - Feature extractor inserts one history row per processed successful fetch.
+- Retention: pruned by the `accounting_rolloff` daily pass alongside `url_state_history` (default 30 days).
 
 ## 4.5 Consistency and Transaction Boundaries
 

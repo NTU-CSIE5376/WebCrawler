@@ -159,6 +159,18 @@ class IngestDB:
             existing.update(row[0] for row in cur.fetchall())
         return existing
 
+    def _frozen_domains(self, cur, domain_ids: set[int]) -> set[int]:
+        """Domains whose frontier the GC service has frozen: stop inserting
+        their newly discovered links so the backlog cannot keep growing."""
+        if not domain_ids:
+            return set()
+        cur.execute(
+            "SELECT domain_id FROM domain_state "
+            "WHERE domain_id = ANY(%s) AND discovery_frozen = TRUE",
+            (list(domain_ids),),
+        )
+        return {row[0] for row in cur.fetchall()}
+
     def _score_new_links(self, urls: list[str]) -> tuple[dict[str, float], datetime | None]:
         if not urls:
             return {}, None
@@ -494,6 +506,23 @@ class IngestDB:
 
         unique_items = [(first_idx_by_url[url], rec) for url, rec in by_url.items()]
 
+        # Frontier budget: drop links for domains the GC service has frozen
+        # (oversized, near-zero fetch yield). Reported as not-inserted.
+        frozen = self._frozen_domains(
+            cur, {int(rec["domain_id"]) for _, rec in unique_items}
+        )
+        frozen_results: list[tuple[int, bool]] = []
+        if frozen:
+            kept = []
+            for idx, rec in unique_items:
+                if int(rec["domain_id"]) in frozen:
+                    frozen_results.append((idx, False))
+                else:
+                    kept.append((idx, rec))
+            unique_items = kept
+        if not unique_items:
+            return dup_results + frozen_results
+
         score_by_url: dict[str, float] = {}
         score_updated_at = None
         if self.inline_ranker is not None:
@@ -561,6 +590,7 @@ class IngestDB:
 
         results = [(idx, rec["url"] in inserted_set) for idx, rec in unique_items]
         results.extend(dup_results)
+        results.extend(frozen_results)
         return results
 
     @staticmethod
