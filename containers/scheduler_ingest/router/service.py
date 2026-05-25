@@ -5,7 +5,6 @@ import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Set
 
@@ -19,22 +18,20 @@ from sqlalchemy.exc import OperationalError, InterfaceError
 
 from libs.config.loader import load_yaml, require
 from libs.db.sharding.key import load_sharding_config
+from libs.db.sharding.router import ShardRouter, host_of
 from libs.ipc.jsonio import read_json, read_jsonl, append_jsonl
+from libs.ipc.new_link_record import (
+    DISCOVERY_SOURCE_PAGE_OUTLINK,
+    build_new_link_record,
+)
 from libs.stats.delta_writer import StatsDeltaWriter
 from libs.ipc.folder_reader import current_interval
 
-from .routing import ShardRouter
 from .domain_resolver import DomainResolver
 
 
 def sha1_hex(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8", errors="replace")).hexdigest()
-
-
-def host_of(url: Optional[str]) -> str:
-    if not url:
-        return ""
-    return (urlparse(url).hostname or "").lower()
 
 @dataclass(frozen=True)
 class RouterConfig:
@@ -242,19 +239,17 @@ class RouterService:
 
         try:
             domain_id, domain_score = domain_resolver.ensure_and_get(domain, shard_id)
-            out = {
-                "url": url,
-                "status": "new",
-                "shard_id": shard_id,
-                "domain_id": domain_id,
-                "domain_score": domain_score,
-                "discovered_from": src_url,
-                "discovery_source_type": 1,
-                "parent_page_score": parent_page_score,
-                "inlink_count_approx": 1,
-                "inlink_count_external": int(src_domain != domain),
-                "anchor_text": anchor,
-            }
+            out = build_new_link_record(
+                url=url,
+                shard_id=shard_id,
+                domain_id=domain_id,
+                domain_score=domain_score,
+                discovered_from=src_url,
+                discovery_source_type=DISCOVERY_SOURCE_PAGE_OUTLINK,
+                parent_page_score=parent_page_score,
+                inlink_count_external=int(src_domain != domain),
+                anchor_text=anchor,
+            )
 
             out_dir = self._out_dir(ingestor_id)
             out_dir.mkdir(parents=True, exist_ok=True)

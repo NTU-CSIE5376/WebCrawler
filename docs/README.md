@@ -16,3 +16,4 @@ This documentation set describes the architecture implemented in this repository
 5. [05-docker-settings-and-deployment.md](./05-docker-settings-and-deployment.md)
 6. [06-maintenance-scripts.md](./06-maintenance-scripts.md)
 7. [07-grafana-loki-observability.md](./07-grafana-loki-observability.md)
+8. [08-sitemap-patroller.md](./08-sitemap-patroller.md)

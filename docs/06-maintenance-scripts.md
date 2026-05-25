@@ -163,6 +163,12 @@ Shared constants:
 - `CRAWLERDB`, `METRICDB`: psycopg2 connection kwargs
 - `SOURCE_NATURAL = 0`, `SOURCE_GOLDEN = 1`: values for `url_state_current.source`
 
+The `DISCOVERY_SOURCE_*` constants for the "new outlink candidate" IPC
+record live in `libs/ipc/new_link_record.py` (`DISCOVERY_SOURCE_UNKNOWN = 0`,
+`DISCOVERY_SOURCE_PAGE_OUTLINK = 1`, `DISCOVERY_SOURCE_SITEMAP = 2`). Both
+the router and the sitemap patroller import from there. Sitemap-specific
+`SITEMAP_USER_AGENT` stays in `containers/sitemap_patroller/__init__.py`.
+
 ## 6.12 `update_golden_domain_scores.py`
 
 - Recurring job (intended daily; new metric batches land roughly every two weeks so daily is comfortably more frequent than needed).
@@ -189,7 +195,110 @@ Recommended scheduling: host crontab, daily.
 
 The job is cheap (~5–10 s end-to-end on production scale: ~14k hosts collapsed to ~13k domain keys, plus an `UPDATE ... WHERE domain = ANY(...)` against the unique `domain_state_domain_key` index), so a daily cadence is conservative.
 
-## 6.13 `migrate_add_discovery_frozen.py`
+## 6.13 `migrate_add_domain_sitemap.py`
+
+- One-time migration for the sitemap patroller (NTU-CSIE5376/WebCrawler#30).
+- Creates `domain_sitemap` (non-sharded), plus two indexes: `idx_domain_sitemap_due` on `(last_patrolled_at NULLS FIRST)` for the patrol's due-row selection, and `idx_domain_sitemap_domain_id`.
+- Schema:
+  - `id BIGSERIAL PRIMARY KEY`
+  - `domain_id BIGINT NOT NULL REFERENCES domain_state(domain_id)`
+  - `sitemap_url TEXT NOT NULL UNIQUE`
+  - `last_patrolled_at TIMESTAMPTZ`, `last_url_count INTEGER`, `last_new_count INTEGER`
+  - `etag TEXT`, `last_modified TEXT` (verbatim from the previous response, used as `If-None-Match` / `If-Modified-Since` next time)
+  - `status TEXT` (`ok`, `not_modified`, `parse_error`, `http_<code>`, `err_<exc>`, `timeout`)
+  - `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`
+- Idempotent via `IF NOT EXISTS` on table and indexes.
+- Non-sharded — total rows bounded by `golden_domains × few sitemaps each` (low thousands).
+
+```bash
+uv run scripts/migrate_add_domain_sitemap.py [--dry-run]
+```
+
+## 6.14 `sitemap_patroller` container
+
+The recurring sitemap workload runs as a dedicated `sitemap_patroller`
+service (see `docker-compose.yml` and `containers/sitemap_patroller/`),
+not as host crons. The container runs supervisord with two worker
+processes; both emit JSON via `libs.obslog`, so Loki labels (`service`,
+`level`, `event`) work the same as the other containers.
+
+### Workers
+
+| Worker | Loop period (config: `loop_interval_sec`) | Role |
+|--------|-------------------------------------------|------|
+| `sitemap_discover` (`containers/sitemap_patroller/discover/main.py`) | `86400` (24 h) | Selects domains from `domain_state` where `domain_score >= score_min` (default `0.95` = T0+T1, per NTU-CSIE5376/WebCrawler#30). Fetches `robots.txt` for `Sitemap:` directives (case-insensitive, absolute URLs only); falls back to `https://{domain}/sitemap.xml`. Upserts each candidate into `domain_sitemap` with `ON CONFLICT (sitemap_url) DO NOTHING`, so reruns preserve patrol state. |
+| `sitemap_patrol` (`containers/sitemap_patroller/patrol/main.py`) | `600` (10 min) | Selects rows where `last_patrolled_at IS NULL` or older than `due_interval_hours` (default `24`), capped at `batch_limit` (default `500`). Conditional GET (`If-None-Match` + `If-Modified-Since` from stored `etag` / `last_modified`). On `<urlset>`: routes each `<loc>` via `libs.db.sharding.key.compute_shard`, ensures `domain_state`, appends a "new outlink candidate" record to `/data/ipc/crawl_result/ingestor_{NN}/{YYYYMMDD}/{HHMM}/{HHMM}_sitemap_{pid}_{ts}.jsonl`. On `<sitemapindex>`: registers each child sitemap URL into `domain_sitemap` for the next pass (bounds bursts). On error or 304: updates `status` (`http_404`, `parse_error`, `timeout`, `not_modified`, ...) and bumps `last_patrolled_at`. |
+
+IPC record schema matches `docs/03-data-flow-and-ipc.md` §3.3 "Router
+Output Record (new outlink candidate)" plus `discovery_source_type = 2`
+(sitemap) and `discovered_from = <sitemap URL>`. The existing
+`scheduler_ingest/ingestor` consumes these files unchanged — discovered
+URLs land in `url_state_current_*` through the same upsert path as
+natural discovery, so the offerer, scorer, and crawler need no changes.
+
+### Config
+
+`containers/sitemap_patroller/config/sitemap.yaml`:
+
+- `postgres.dsn` — psycopg2 DSN for crawlerdb.
+- `ingest_config_path` — pointer to `scheduler_ingest/config/ingest.yaml`
+  so the patrol worker uses the same `num_shards`, `shards_per_ingestor`,
+  `domain_overrides`, `ingestor_dir_template`, and `interval_minutes` the
+  router does. Routing must agree, otherwise emitted records land in the
+  wrong ingestor's directory.
+- `discover.{score_min, domain_limit, global_delay_sec, loop_interval_sec}`
+- `patrol.{due_interval_hours, batch_limit, global_delay_sec, per_domain_cooldown_sec, loop_interval_sec}`
+
+Politeness: default global delay `0.5 s` for discover (robots.txt fetches)
+and `2.0 s` for patrol (sitemap fetches → ≤0.5 req/s). Per-run per-domain
+cooldown `60 s` for patrol. Steady-state load at ~5k T0+T1 domains and
+24 h cadence is well under 0.1 req/s globally.
+
+### Dependency on existing jobs
+
+`sitemap_discover` reads `domain_state.domain_score`, which is populated
+by `update_golden_domain_scores.py` (§6.12). On a fresh deploy the
+recommended order is:
+
+1. Apply this migration and start the container.
+2. Run `update_golden_domain_scores.py` so T0/T1 domains are scored.
+3. The discover worker's first sweep then populates `domain_sitemap`,
+   and the patrol worker picks rows up on its next pass.
+
+### Build + run
+
+```bash
+docker compose build sitemap_patroller
+docker compose up -d sitemap_patroller
+docker exec sitemap_patroller supervisorctl status
+```
+
+### Ad-hoc single run (debugging)
+
+```bash
+docker exec sitemap_patroller \
+  python -m containers.sitemap_patroller.discover.main \
+    --config /app/containers/sitemap_patroller/config/sitemap.yaml --run-once
+
+docker exec sitemap_patroller \
+  python -m containers.sitemap_patroller.patrol.main \
+    --config /app/containers/sitemap_patroller/config/sitemap.yaml --run-once
+```
+
+### Loki / Grafana
+
+Both workers emit structured events that the Loki driver labels by
+`service`, `level`, `event`. Useful queries:
+
+- `{service="sitemap_patrol", event="patrol.done"}` — counters per run
+  (`rows_due`, `ok`, `urls_emitted`, `nested_registered`, `elapsed_sec`).
+- `{service="sitemap_discover", event="discover.done"}` — discovery
+  sweep totals (`domain_count`, `new_sitemaps`, `elapsed_sec`).
+- `{service="sitemap_discover", event="discover.robots_fetch_fail"}` —
+  per-domain robots.txt failures (group by `domain`).
+- `{service="sitemap_patrol", event=~"patrol.xml_parse_error|patrol.run_error"}` — parsing / loop errors.
+
+## 6.15 `migrate_add_discovery_frozen.py`
 
 - One-time migration.
 - Adds `discovery_frozen BOOLEAN NOT NULL DEFAULT FALSE` to `domain_state`.
@@ -200,7 +309,7 @@ The job is cheap (~5–10 s end-to-end on production scale: ~14k hosts collapsed
 uv run scripts/migrate_add_discovery_frozen.py [--dry-run]
 ```
 
-## 6.14 `oneoff_drop_trap_frontier.py`
+## 6.16 `oneoff_drop_trap_frontier.py`
 
 - One-off cleanup for the pre-existing frontier backlog (what `frontier_gc` does going forward, applied immediately to the current pile-up).
 - Finds trap domains (estimated `pending > --cap` AND fetch yield `< --yield-floor`, via per-shard sampling so it stays off full table scans), then per target: sets `discovery_frozen=TRUE`, pushes `crawl_paused_until` far out, and deletes `should_crawl=TRUE` rows in batches by `domain_id`, committing per batch (resumable, no long lock).

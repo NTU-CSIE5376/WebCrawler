@@ -105,6 +105,21 @@ services:
       - /data/ipc:/data/ipc
     logging: *loki-logging
 
+  sitemap_patroller:
+    build:
+      context: .
+      dockerfile: containers/sitemap_patroller/Dockerfile
+    container_name: sitemap_patroller
+    init: true
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    restart: unless-stopped
+    volumes:
+      - ./:/app
+      - /data/ipc:/data/ipc
+    logging: *loki-logging
+
   loki:
     image: grafana/loki:3.0.0
     container_name: loki

@@ -88,9 +88,24 @@ Notes:
   "status": "new",
   "shard_id": 98,
   "domain_id": 123,
-  "domain_score": 0.0
+  "domain_score": 0.0,
+  "discovered_from": "https://example.com/parent",
+  "discovery_source_type": 1,
+  "parent_page_score": 0.5,
+  "inlink_count_approx": 1,
+  "inlink_count_external": 0,
+  "anchor_text": "click here"
 }
 ```
+
+The single canonical builder for this record lives at
+`libs/ipc/new_link_record.py:build_new_link_record(...)`. Both the
+`router` (`discovery_source_type = 1`) and the `sitemap_patroller`
+(`discovery_source_type = 2`) call it. Adding a writer to this IPC dir
+in the future SHOULD reuse the builder rather than hand-roll the dict,
+so the schema stays in sync with the ingestor's `_bulk_links` reader.
+`URL → (shard_id, ingestor_id)` routing is shared the same way through
+`libs/db/sharding/router.py:ShardRouter`.
 
 ### Stats Delta (`*.json`)
 

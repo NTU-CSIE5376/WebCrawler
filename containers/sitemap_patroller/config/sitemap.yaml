@@ -1,0 +1,35 @@
+# Sitemap patroller config. Two workers run from a single container under
+# supervisord (see ../supervisord.conf). Both load this file.
+
+postgres:
+  # psycopg2 DSN. Sitemap workers use psycopg2 directly, no SQLAlchemy.
+  dsn: "postgresql://crawler:crawler@172.16.191.1:5432/crawlerdb"
+
+# Path to scheduler_ingest's config — patrol needs `router.num_shards`,
+# `router.shards_per_ingestor`, `router.ingestor_dir_template`,
+# `router.interval_minutes`, and `router.domain_overrides` to route
+# discovered URLs the same way the router does for natural discovery.
+ingest_config_path: "/app/containers/scheduler_ingest/config/ingest.yaml"
+
+discover:
+  # Threshold on domain_state.domain_score: 0.95 = T0+T1 (last-two-batches
+  # consecutive), per the strategy in NTU-CSIE5376/WebCrawler#30.
+  score_min: 0.95
+  # Cap domains per sweep. null = no cap.
+  domain_limit: null
+  # Sleep between robots.txt fetches.
+  global_delay_sec: 0.5
+  # Sleep between full discovery sweeps. Default: 24h.
+  loop_interval_sec: 86400
+
+patrol:
+  # Rows older than this are due for re-fetch.
+  due_interval_hours: 24
+  # Max rows per patrol pass.
+  batch_limit: 500
+  # Sleep between sitemap fetches (global rate limit).
+  global_delay_sec: 2.0
+  # Skip a row if its domain was fetched within this window in the same pass.
+  per_domain_cooldown_sec: 60
+  # Sleep between patrol passes. Default: 10 min.
+  loop_interval_sec: 600
