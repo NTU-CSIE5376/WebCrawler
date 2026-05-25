@@ -127,7 +127,7 @@ Key columns:
 - quality/failure: `num_consecutive_fail`, `last_fail_reason`, `content_hash`
 - scheduling flags/signals: `should_crawl`, `url_score`, `url_score_updated_at`, `domain_score`
 - link signals: `inlink_count_approx INTEGER NOT NULL DEFAULT 0`, `inlink_count_external INTEGER NOT NULL DEFAULT 0` (non-deduplicated observed outlink counters from crawler discovery; no historical backfill)
-- provenance: `source SMALLINT NOT NULL DEFAULT 0` (`0` = natural discovery, `1` = golden set membership; see `scripts/golden_inject.py`)
+- provenance: `source SMALLINT NOT NULL DEFAULT 0` (`0` = natural discovery, `1` = golden set membership, `2` = weekly pageview injection)
 - provenance: `discovered_from VARCHAR` (parent page URL on first discovery; NULL for golden-injected and seed URLs; first parent wins via `ON CONFLICT DO NOTHING`)
 - discovery metadata: `discovery_source_type SMALLINT NOT NULL DEFAULT 0` (`0` = unknown/seed, `1` = page outlink), `parent_page_score DOUBLE PRECISION` (source page domain score at discovery time), `anchor_text VARCHAR` (first non-null outlink anchor observed for this URL)
 - robots metadata: `robots_bits SMALLINT NOT NULL DEFAULT 0` (`0` = unknown, `1` = crawl allowed, `2` = crawl disallowed by robots.txt)
@@ -141,6 +141,7 @@ Write patterns:
 - Ingestor: upserts fetch outcomes and resets/extends failure counters.
 - Router-discovered links: inserted with initial `domain_score`.
 - Golden set injection (`scripts/golden_inject.py`): inserts new URLs with `source=1`, or upserts `source=1` onto existing rows so that golden set membership is identifiable even when the crawler discovered the URL naturally first.
+- Weekly pageview injection (`scripts/wiki_pageview_inject.py`): inserts new URLs with `source=2` and `url_score = 1 + pageview / max_pageview`; existing golden rows keep `source=1`, while other existing rows are marked `source=2`. Existing rows get the refreshed pageview `url_score` without a history snapshot.
 
 ### `url_state_history_{shard}`
 

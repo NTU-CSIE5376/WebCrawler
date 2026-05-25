@@ -5,6 +5,7 @@ and url_state_history_{shard} tables.
   source SMALLINT NOT NULL DEFAULT 0
     0 = natural discovery
     1 = golden set injection
+    2 = weekly pageview injection
 
 PG 11+ handles ADD COLUMN with a non-volatile DEFAULT as metadata-only,
 so this does not rewrite any table data.

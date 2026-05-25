@@ -5,8 +5,9 @@ urlparse().hostname path (e.g. `en.wikipedia.org` -> `wikipedia.org`).
 
 For each dirty row, moves per-shard url_state_current, url_event_counter,
 content_feature_current, and domain_stats_daily to the canonical
-(shard, domain_id); on URL conflicts keeps the canonical row and bumps
-`source` to GREATEST. History tables are left untouched (append-only).
+(shard, domain_id); on URL conflicts keeps the canonical row and preserves
+golden source membership over pageview source membership. History tables are
+left untouched (append-only).
 
 Usage:
     uv run scripts/migrate_merge_subdomain_rows.py --dry-run
@@ -21,7 +22,7 @@ from pathlib import Path
 import psycopg2
 import tldextract
 
-from constants import NUM_SHARDS, CRAWLERDB
+from constants import NUM_SHARDS, CRAWLERDB, SOURCE_GOLDEN, SOURCE_PAGEVIEW
 from libs.config.loader import load_yaml
 from libs.db.sharding.key import compute_shard, load_sharding_config
 
@@ -127,7 +128,13 @@ def merge_one(cur, bad, good, dry_run: bool) -> dict:
         FROM url_state_current_{bad_shard:03d}
         WHERE domain_id = %s
         ON CONFLICT (url) DO UPDATE
-          SET source = GREATEST(g.source, EXCLUDED.source),
+          SET source = CASE
+                WHEN g.source = {SOURCE_GOLDEN} OR EXCLUDED.source = {SOURCE_GOLDEN}
+                  THEN {SOURCE_GOLDEN}
+                WHEN g.source = {SOURCE_PAGEVIEW} OR EXCLUDED.source = {SOURCE_PAGEVIEW}
+                  THEN {SOURCE_PAGEVIEW}
+                ELSE GREATEST(g.source, EXCLUDED.source)
+              END,
               discovered_from = COALESCE(g.discovered_from, EXCLUDED.discovered_from),
               title = COALESCE(g.title, EXCLUDED.title),
               hreflang_count = COALESCE(g.hreflang_count, EXCLUDED.hreflang_count),
