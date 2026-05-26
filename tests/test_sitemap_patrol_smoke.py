@@ -68,6 +68,21 @@ def test_parse_returns_unknown_for_non_sitemap_xml():
     assert patrol_service.parse_sitemap(b"")[0] == "unknown"
 
 
+def test_parse_skips_loc_with_embedded_whitespace():
+    # <loc> text with an embedded tab/newline would slip past .strip() and
+    # later trip http.client.InvalidURL when the patrol worker fetched it.
+    xml = b"""<?xml version="1.0"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://pittsburghpanthers.com\t/sitemap.xml</loc></url>
+  <url><loc>https://example.com/\nbroken</loc></url>
+  <url><loc>https://example.com/clean</loc></url>
+</urlset>
+"""
+    kind, urls = patrol_service.parse_sitemap(xml)
+    assert kind == "urlset"
+    assert urls == ["https://example.com/clean"]
+
+
 # ----- discover.parse_sitemap_directives -----
 
 def test_parse_robots_sitemap_directives_case_insensitive():
@@ -94,6 +109,16 @@ def test_parse_robots_skips_relative_and_comments():
     )
     assert discover_service.parse_sitemap_directives(robots) == [
         "https://example.com/absolute.xml",
+    ]
+
+
+def test_parse_robots_skips_urls_with_embedded_whitespace():
+    robots = (
+        "Sitemap: https://example.com/\twith-tab.xml\n"
+        "Sitemap: https://example.com/clean.xml\n"
+    )
+    assert discover_service.parse_sitemap_directives(robots) == [
+        "https://example.com/clean.xml",
     ]
 
 
