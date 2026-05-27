@@ -52,11 +52,12 @@ accounting:
   event_retention_days: 90
   batch_size: 1000
 
-  # Same daily pass also prunes the append-only *_history tables (no pipeline
-  # read path) older than this. 0 disables. The 90-day rolling counters live
-  # in the current table and are unaffected.
+  # Same daily pass drops partitions of the append-only *_history tables (no
+  # pipeline read path) older than this. 0 disables. The 90-day rolling counters
+  # live in the current table and are unaffected. Requires the tables to be
+  # partitioned first (scripts/migrate_partition_history.py); un-migrated tables
+  # are skipped.
   history_retention_days: 30
-  history_batch_size: 5000
 
   # Daily UTC schedule for rolling out aged counters.
   run_hour_utc: 3

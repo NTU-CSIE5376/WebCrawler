@@ -161,7 +161,7 @@ Write pattern:
 - Ingestor inserts a row after each current-table upsert (full snapshot copy).
 - Accounting rolloff appends snapshots after each maintenance update batch.
 - Golden set injection (`scripts/golden_inject.py`): inserts a snapshot only when a new row is added to `url_state_current_{shard}`. Source-only updates on existing URLs do not generate a history entry.
-- Retention: the `accounting_rolloff` daily pass deletes snapshots older than `history_retention_days` (default 30); no pipeline path reads this table.
+- Retention: RANGE-partitioned on `snapshot_at` (monthly); the `accounting_rolloff` daily pass DROPs partitions older than `history_retention_days` (default 30). No pipeline path reads this table.
 
 ### `url_event_counter_{shard}`
 
@@ -227,7 +227,7 @@ PK and metadata:
 Write pattern:
 
 - Feature extractor inserts one history row per processed successful fetch.
-- Retention: pruned by the `accounting_rolloff` daily pass alongside `url_state_history` (default 30 days).
+- Retention: RANGE-partitioned on `snapshot_at` (monthly); the `accounting_rolloff` daily pass DROPs partitions older than `history_retention_days` alongside `url_state_history` (default 30 days).
 
 ## 4.5 Consistency and Transaction Boundaries
 
