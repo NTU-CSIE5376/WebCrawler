@@ -67,7 +67,10 @@ def parse_sitemap_directives(robots_text: str) -> list[str]:
             continue
         if s[:8].lower().startswith("sitemap:"):
             url = s.split(":", 1)[1].strip()
-            if url.startswith("http://") or url.startswith("https://"):
+            # Embedded whitespace would slip past .strip() and trip
+            # http.client.InvalidURL when the patrol worker later fetches it.
+            if (url.startswith("http://") or url.startswith("https://")) \
+                    and not any(c.isspace() for c in url):
                 out.append(url)
     return out
 

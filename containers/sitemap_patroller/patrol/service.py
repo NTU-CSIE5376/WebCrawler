@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from http.client import InvalidURL
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree as ET
@@ -106,7 +107,12 @@ def parse_sitemap(body: bytes) -> tuple[str, list[str]]:
             if _localname(sub.tag) != "loc":
                 continue
             txt = (sub.text or "").strip()
-            if (txt.startswith("http://") or txt.startswith("https://")) and len(txt) <= MAX_URL_LEN:
+            # Reject URLs with embedded whitespace/control chars — urlopen would
+            # raise http.client.InvalidURL on these, and they're almost always
+            # line-wrapped or otherwise malformed <loc> text.
+            if (txt.startswith("http://") or txt.startswith("https://")) \
+                    and len(txt) <= MAX_URL_LEN \
+                    and not any(c.isspace() for c in txt):
                 urls.append(txt)
             break
     return kind, urls
@@ -241,7 +247,9 @@ def process_row(
         update_row(cur, row["id"], status=counters["status"],
                    url_count=None, new_count=None, etag=None, last_modified=None)
         return counters
-    except (URLError, TimeoutError, ConnectionError) as e:
+    except (URLError, TimeoutError, ConnectionError, InvalidURL, ValueError) as e:
+        # InvalidURL/ValueError: malformed URL persisted in domain_sitemap (e.g.
+        # whitespace in host). Don't let one bad row crash the whole batch.
         counters["status"] = "timeout" if isinstance(e, TimeoutError) else f"err_{type(e).__name__}"
         update_row(cur, row["id"], status=counters["status"],
                    url_count=None, new_count=None, etag=None, last_modified=None)
