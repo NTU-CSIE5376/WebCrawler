@@ -21,6 +21,12 @@ from libs.db.sharding.key import compute_shard, load_sharding_config
 
 INJECT_AFTER_WEEKS = 4
 MAX_URL_LEN = 2500
+# Sentinel url_score that lifts golden URLs above every other source in the
+# offerer's per-domain LATERAL pick (ORDER BY url_score DESC). Must stay above
+# the pageview injection ceiling of 2.0 (1 + pageview/max_pageview, see
+# scripts/wiki_pageview_inject.compute_url_score) so the weekly pageview pass
+# cannot overtake a golden when it re-writes the row's url_score.
+GOLDEN_URL_SCORE = 3.0
 INGEST_CONFIG = (
     Path(__file__).resolve().parents[1]
     / "containers/scheduler_ingest/config/ingest.yaml"
@@ -95,15 +101,24 @@ def inject_url(
     # Existing URL: update source so the row is identifiable as golden set membership,
     # even if the crawler discovered it naturally first. No history snapshot is written
     # for source-only updates. Returns True iff a new row was inserted.
+    #
+    # url_score/url_score_updated_at are stamped on both new and existing rows so the
+    # offerer lifts goldens to the top of their domain's pick order: the ranker prefers
+    # url_score_updated_at IS NOT NULL first, then url_score DESC, so goldens were being
+    # buried under freshly inline-scored natural URLs on busy domains.
     tcur = f"url_state_current_{shard_id:03d}"
     crawler_cur.execute(
         f"""
-        INSERT INTO {tcur} (url, domain_id, domain_score, source)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (url) DO UPDATE SET source = EXCLUDED.source
+        INSERT INTO {tcur}
+            (url, domain_id, domain_score, source, url_score, url_score_updated_at)
+        VALUES (%s, %s, %s, %s, %s, NOW())
+        ON CONFLICT (url) DO UPDATE SET
+            source = EXCLUDED.source,
+            url_score = EXCLUDED.url_score,
+            url_score_updated_at = EXCLUDED.url_score_updated_at
         RETURNING (xmax = 0) AS inserted  -- xmax=0 iff freshly inserted (vs UPDATE path)
         """,
-        (url, domain_id, domain_score, SOURCE_GOLDEN),
+        (url, domain_id, domain_score, SOURCE_GOLDEN, GOLDEN_URL_SCORE),
     )
     inserted = bool(crawler_cur.fetchone()[0])
     if not inserted:
