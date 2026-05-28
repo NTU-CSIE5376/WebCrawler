@@ -21,12 +21,24 @@ class GoldenDiscoveryRankerConfig:
     batch_size: int
     scan_interval_sec: int
     max_batches_per_shard: int
-    # Domain-priority steering: when enabled, each batch only picks unscored
-    # URLs from domains with `domain_state.domain_score > 0` (i.e. domains
-    # that have appeared in a golden batch). Ordered by domain_score DESC so
-    # higher-tier golden domains are scored first. When disabled, the scorer
-    # keeps the legacy first_seen-ASC behavior.
+    # Domain-priority steering: when enabled, each batch only picks URLs from
+    # domains with `domain_state.domain_score > 0` (i.e. domains that have
+    # appeared in a golden batch). Ordered by domain_score DESC so higher-tier
+    # golden domains are scored first. When disabled, the scorer keeps the
+    # legacy first_seen-ASC behavior.
     domain_priority_steering_enabled: bool = False
+    # v2 continuous re-scoring (steering path only). The v2 ranker's features
+    # (inlink_count_*, anchor_text) change over time, so url_score is no longer
+    # a write-once value — it must be refreshed.
+    #   rescore_ttl_days: re-pick a URL once its score is older than this many
+    #     days (in addition to never-scored rows). Sized so one full pass over
+    #     the steering-eligible pool finishes well inside the TTL; see deploy
+    #     notes. 0 disables TTL refresh (write-once, never re-score).
+    #   min_age_days: do NOT score a URL until it has been in the DB this long,
+    #     letting inlinks/anchors accumulate first. Younger rows keep their v1
+    #     inline score until they age in. 0 disables the gate.
+    rescore_ttl_days: int = 5
+    min_age_days: int = 3
 
 
 class GoldenDiscoveryRankerService:
@@ -77,29 +89,57 @@ class GoldenDiscoveryRankerService:
         with self.Session.begin() as sess:
             with sess.connection().connection.cursor() as cur:
                 if self.cfg.domain_priority_steering_enabled:
-                    # Score only URLs whose domain has a golden-tier score.
+                    # Score URLs whose domain has a golden-tier score.
                     # `d.domain_score > 0` is the gate — domain_state default
                     # is 0.0, so this picks up exactly the rows that the
                     # tier-write cron has tagged.
+                    #
+                    # Two extra gates vs the legacy write-once query, both for
+                    # the v2 ranker whose features drift over time:
+                    #   * min_age: skip URLs younger than min_age_days so their
+                    #     inlinks/anchors settle before we score them (they keep
+                    #     the v1 inline score in the meantime). min_age_days=0
+                    #     makes the interval empty -> a no-op gate.
+                    #   * TTL refresh: re-pick a URL once its score is older
+                    #     than rescore_ttl_days, not just when never scored.
+                    #     rescore_ttl_days<=0 disables refresh (write-once: only
+                    #     never-scored rows), so we drop the OR branch entirely
+                    #     rather than emit `< NOW() - interval '0'`, which would
+                    #     match *every* already-scored row (re-score every pass).
+                    # ORDER BY url_score_updated_at ASC NULLS FIRST makes this
+                    # an LRU: never-scored rows first, then the stalest scores —
+                    # so continuous re-scoring can't starve unscored URLs.
+                    params: list = [self.cfg.min_age_days]
+                    if self.cfg.rescore_ttl_days > 0:
+                        ttl_clause = (
+                            "(u.url_score_updated_at IS NULL\n"
+                            "                               OR u.url_score_updated_at"
+                            " < NOW() - make_interval(days => %s))"
+                        )
+                        params.append(self.cfg.rescore_ttl_days)
+                    else:
+                        ttl_clause = "u.url_score_updated_at IS NULL"
+                    params.append(self.cfg.batch_size)
                     cur.execute(
                         f"""
-                        SELECT u.url
+                        SELECT u.url, u.inlink_count_approx, u.inlink_count_external, u.anchor_text
                         FROM {table} u
                         JOIN domain_state d ON d.domain_id = u.domain_id
                         WHERE u.should_crawl = TRUE
-                          AND u.url_score_updated_at IS NULL
                           AND d.domain_score > 0
-                        ORDER BY d.domain_score DESC NULLS LAST,
-                                 u.first_seen ASC NULLS LAST
+                          AND u.first_seen < NOW() - make_interval(days => %s)
+                          AND {ttl_clause}
+                        ORDER BY d.domain_score DESC,
+                                 u.url_score_updated_at ASC NULLS FIRST
                         FOR UPDATE OF u SKIP LOCKED
                         LIMIT %s
                         """,
-                        (self.cfg.batch_size,),
+                        tuple(params),
                     )
                 else:
                     cur.execute(
                         f"""
-                        SELECT url
+                        SELECT url, inlink_count_approx, inlink_count_external, anchor_text
                         FROM {table}
                         WHERE should_crawl = TRUE
                           AND url_score_updated_at IS NULL
@@ -109,11 +149,27 @@ class GoldenDiscoveryRankerService:
                         """,
                         (self.cfg.batch_size,),
                     )
-                urls = [row[0] for row in cur.fetchall()]
-                if not urls:
+                fetched = cur.fetchall()
+                if not fetched:
                     return 0
+                urls = [row[0] for row in fetched]
 
-                scores = self.scorer.score_many(urls)
+                # v2 ranker consumes prefetch features (inlink/anchor) via
+                # score_many_rows; v1 only needs the URL string. Detect by
+                # capability so this path stays drop-in for both.
+                if hasattr(self.scorer, "score_many_rows"):
+                    recs = [
+                        {
+                            "url": row[0],
+                            "inlink_count_approx": row[1],
+                            "inlink_count_external": row[2],
+                            "anchor_text": row[3],
+                        }
+                        for row in fetched
+                    ]
+                    scores = self.scorer.score_many_rows(recs)
+                else:
+                    scores = self.scorer.score_many(urls)
                 rows = list(zip(urls, scores))
 
                 # Keep score history compact: the ranker refreshes

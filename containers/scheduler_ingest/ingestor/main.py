@@ -57,8 +57,14 @@ def _load_inline_ranker(raw: dict[str, Any]) -> GoldenDiscoveryRuntimeScorer | N
     if not enabled:
         return None
 
+    # Ingest inline scoring stays on the v1 model and loads it with the v1
+    # loader (GoldenDiscoveryRuntimeScorer) below. Its artifact env is namespaced
+    # `_INGEST_INLINE_ARTIFACT` — distinct from the background scorer's
+    # `_ARTIFACT`, which may point at the v2 joblib. Sharing the bare `_ARTIFACT`
+    # name would crash the ingestor (v1 loader on a v2 artifact) if that env is
+    # set at a shared scope. Matches the existing `_INGEST_INLINE_*` knobs.
     artifact_path = _env_str(
-        f"{RANKER_ENV_PREFIX}_ARTIFACT",
+        f"{RANKER_ENV_PREFIX}_INGEST_INLINE_ARTIFACT",
         str(ranker_raw.get("artifact_path", "")),
     )
     if not artifact_path or not Path(artifact_path).exists():

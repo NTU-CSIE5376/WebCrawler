@@ -73,8 +73,21 @@ golden_discovery_ranker_v1:
   # the ranker artifact is mounted. Enable with GOLDEN_DISCOVERY_RANKER_V1_ENABLED=true.
   enabled: false
   artifact_path: "/app/artifacts/golden_discovery_ranker_v1.joblib"
+  # model_kind: "v1" (default, legacy SGD 4-head) or "v2" (prefetch hybrid:
+  # per-domain LightGBM + general head). For v2, point artifact_path at the v2
+  # joblib and (optionally) set v1_fallback_artifact so domains the hybrid does
+  # not cover fall back to v1 instead of the v2 general head. Override per-env
+  # with GOLDEN_DISCOVERY_RANKER_V1_MODEL_KIND=v2 /
+  # GOLDEN_DISCOVERY_RANKER_V1_V1_FALLBACK_ARTIFACT=/app/artifacts/...v1.joblib
+  model_kind: "v1"
+  v1_fallback_artifact: ""
   total_shards: 256
-  num_workers: 16
+  # 32 single-threaded workers (see supervisord numprocs). Sized so one full
+  # pass over the ~787M steering-eligible URLs finishes inside rescore_ttl_days:
+  # 16 workers measured ~150M/day (pass ~5.2 days); 32 ~doubles throughput
+  # (pass ~2.6 days), leaving headroom under the 5-day TTL even if SKIP-LOCKED
+  # write contention makes scaling sublinear.
+  num_workers: 32
   batch_size: 1000
   scan_interval_sec: 60
   max_batches_per_shard: 4
@@ -86,3 +99,17 @@ golden_discovery_ranker_v1:
   # tier-write cron. Override per-env with
   # GOLDEN_DISCOVERY_RANKER_V1_DOMAIN_PRIORITY_STEERING_ENABLED=true.
   domain_priority_steering_enabled: false
+  # v2 continuous re-scoring (only takes effect on the steering path). The v2
+  # ranker's features (inlink_count_*, anchor_text) drift over time, so url_score
+  # is no longer write-once.
+  #   rescore_ttl_days: re-pick a URL once its score is older than this many days
+  #     (plus all never-scored rows). Must be >= one-full-pass time or scores
+  #     fall behind. At 32 workers one pass over the ~787M steering-eligible URLs
+  #     is ~2.6 days, so 5 leaves ~1.9x headroom. If you drop back to 16 workers,
+  #     raise this to >= ~10 (pass becomes ~5.2 days).
+  #     Override with GOLDEN_DISCOVERY_RANKER_V1_RESCORE_TTL_DAYS. 0 = write-once.
+  #   min_age_days: don't score a URL until it has aged this long in the DB, so
+  #     its inlinks/anchors settle first; it keeps the v1 inline score until then.
+  #     Override with GOLDEN_DISCOVERY_RANKER_V1_MIN_AGE_DAYS. 0 = no gate.
+  rescore_ttl_days: 5
+  min_age_days: 3

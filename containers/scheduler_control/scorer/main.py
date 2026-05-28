@@ -12,6 +12,7 @@ from sqlalchemy.orm import sessionmaker
 from libs.config.loader import load_yaml, require
 from libs.obslog import configure as configure_logging
 from libs.scoring.golden_discovery_runtime import GoldenDiscoveryRuntimeScorer
+from libs.scoring.golden_discovery_runtime_v2 import GoldenDiscoveryRuntimeScorerV2
 
 from .service import GoldenDiscoveryRankerConfig, GoldenDiscoveryRankerService
 
@@ -85,7 +86,21 @@ def main() -> None:
     )
     Session = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
-    scorer = GoldenDiscoveryRuntimeScorer.load(artifact_path)
+    # model_kind selects v1 (default) or the v2 prefetch-hybrid ranker. v2
+    # optionally takes a v1 artifact as the fallback scorer for domains it does
+    # not cover (unknown / non-top-30); without it the v2 general head scores them.
+    model_kind = _env_str(f"{ENV_PREFIX}_MODEL_KIND", str(scorer_raw.get("model_kind", "v1"))).lower()
+    if model_kind == "v2":
+        v1_fb_path = _env_str(
+            f"{ENV_PREFIX}_V1_FALLBACK_ARTIFACT",
+            str(scorer_raw.get("v1_fallback_artifact", "")),
+        )
+        v1_fallback = None
+        if v1_fb_path and Path(v1_fb_path).exists():
+            v1_fallback = GoldenDiscoveryRuntimeScorer.load(v1_fb_path).score_many
+        scorer = GoldenDiscoveryRuntimeScorerV2.load(artifact_path, v1_scorer=v1_fallback)
+    else:
+        scorer = GoldenDiscoveryRuntimeScorer.load(artifact_path)
     logger.info(
         f"{SERVICE_NAME}.loaded",
         extra={
@@ -114,6 +129,14 @@ def main() -> None:
         domain_priority_steering_enabled=_env_bool(
             f"{ENV_PREFIX}_DOMAIN_PRIORITY_STEERING_ENABLED",
             bool(scorer_raw.get("domain_priority_steering_enabled", False)),
+        ),
+        rescore_ttl_days=_env_int(
+            f"{ENV_PREFIX}_RESCORE_TTL_DAYS",
+            int(scorer_raw.get("rescore_ttl_days", 5)),
+        ),
+        min_age_days=_env_int(
+            f"{ENV_PREFIX}_MIN_AGE_DAYS",
+            int(scorer_raw.get("min_age_days", 3)),
         ),
     )
 
