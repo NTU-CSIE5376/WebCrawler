@@ -26,16 +26,24 @@ sequential scan of the (up to ~256M-row) shard, run by all scorer workers at
 once.
 
 The primary sort key `domain_score DESC` lives on the joined `domain_state`
-table, so it cannot go into a single-table index. The plan we want is a nested
-loop: outer = golden domains in domain_score DESC order (a small set), inner =
-this shard's rows for that domain_id walked in `url_score_updated_at` order,
-stopping at LIMIT. The composite `(domain_id, url_score_updated_at ASC NULLS
-FIRST)` index is what lets that inner scan be index-ordered (matching the
-ORDER BY's NULLS FIRST) and bounded. The `should_crawl = TRUE` partial predicate
-keeps the index small (already-crawled rows are excluded).
+table and has only ~3 distinct values, so it cannot anchor a single-table index
+ordering. IMPORTANT: a *flat* `JOIN domain_state ... ORDER BY d.domain_score
+DESC, u.url_score_updated_at` does NOT use this index — the planner inserts a
+blocking Sort (url_score_updated_at must be merged across all same-tier domains)
+and seq-scans the whole shard. Verified on a 64M-row shard: flat plan cost
+~11.5M, index ignored.
 
-Confirm with EXPLAIN (ANALYZE, BUFFERS) on a large golden shard that the planner
-actually uses this index (nested loop, no full sort) before scaling up workers.
+This index is used by the LATERAL top-N-per-domain query the scorer issues
+(see scheduler_control/scorer/service.py): drive from domain_state golden
+domains for the shard (ordered domain_score DESC via idx_domain_state_shard_score,
+which requires `d.shard_id = <shard>`), and for each domain do a plain ordered
+index scan on THIS index (domain_id equality, url_score_updated_at order, NULLS
+FIRST) to take its stalest due URLs. The `should_crawl = TRUE` partial predicate
+keeps the index small.
+
+Verified with EXPLAIN (ANALYZE, BUFFERS) on shards 0/1/2: the LATERAL plan uses
+idx_domain_state_shard_score (outer) + this index (inner ordered scan), no full
+sort, early LIMIT; warm batches stay in the buffer cache.
 
 Indexes are created concurrently (outside a transaction block), idempotently.
 
