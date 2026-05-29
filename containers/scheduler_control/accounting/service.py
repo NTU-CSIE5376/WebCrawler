@@ -8,6 +8,14 @@ from datetime import date, datetime, time as dt_time, timedelta, timezone
 from sqlalchemy import text
 from sqlalchemy.orm import sessionmaker
 
+from libs.db.sharding.history_partition import (
+    month_start,
+    next_month,
+    partition_month,
+    partition_of_sql,
+    list_partitions_sql,
+)
+
 
 logger = logging.getLogger("accounting")
 
@@ -17,10 +25,9 @@ class CounterRolloffConfig:
     total_shards: int
     event_retention_days: int
     batch_size: int
-    # Prune append-only *_history snapshots older than this in the same daily
+    # Drop partitioned *_history snapshots older than this in the same daily
     # pass (0 disables). These tables have no pipeline read path.
     history_retention_days: int
-    history_batch_size: int
     run_hour_utc: int
     run_minute_utc: int
     check_interval_sec: int
@@ -50,27 +57,38 @@ class CounterRolloffService:
         return datetime.combine(now_utc.date(), run_t, tzinfo=timezone.utc)
 
     def _prune_history(self, table: str, shard_id: int) -> int:
-        """Delete one batch of aged snapshots, ordered by snapshot_id (the PK,
-        monotonic with time) so it reads the oldest rows first."""
+        """Retention for the partitioned ``*_history`` tables: provision the
+        current/next month partitions, then DROP whole partitions that are
+        entirely older than the retention window.
+
+        This is an O(1) metadata operation per partition: no row scan, no dead
+        tuples, space returned to the OS immediately. Tables not yet migrated to
+        partitioning (``scripts/migrate_partition_history.py``) are skipped.
+        Returns the number of partitions dropped.
+        """
         name = f"{table}_{shard_id:03d}"
-        sql = text(
-            f"""
-            WITH picked AS (
-                SELECT ctid FROM {name}
-                WHERE snapshot_at < now() - make_interval(days => :days)
-                ORDER BY snapshot_id
-                LIMIT :batch
-            )
-            DELETE FROM {name} WHERE ctid IN (SELECT ctid FROM picked)
-            """
-        )
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=self.cfg.history_retention_days)
+
         with self.Session() as sess:
-            n = sess.execute(
-                sql,
-                {"days": self.cfg.history_retention_days, "batch": self.cfg.history_batch_size},
-            ).rowcount
+            kind = sess.execute(
+                text("SELECT relkind FROM pg_class WHERE relname = :n"), {"n": name}
+            ).scalar()
+            if kind != "p":  # not partitioned yet -> nothing to do
+                return 0
+
+            # Keep the write target ahead of the clock.
+            for m in (month_start(now), next_month(now)):
+                sess.execute(text(partition_of_sql(name, name, m)))
+
+            dropped = 0
+            for (child,) in sess.execute(text(list_partitions_sql(name))):
+                month = partition_month(child)
+                if month is not None and next_month(month) <= cutoff:  # fully aged out
+                    sess.execute(text(f"DROP TABLE {child}"))
+                    dropped += 1
             sess.commit()
-        return n
+        return dropped
 
     def _process_batch(self, shard_id: int, cutoff_date: date) -> dict[str, int]:
         tcur = self._tcur(shard_id)
@@ -258,11 +276,16 @@ class CounterRolloffService:
         if self.cfg.history_retention_days > 0:
             for table in ("url_state_history", "content_feature_history"):
                 for shard_id in range(self.cfg.total_shards):
-                    while True:
-                        n = self._prune_history(table, shard_id)
-                        totals["history_pruned"] += n
-                        if n == 0:
-                            break
+                    # Isolate per shard: a single failed DROP must not abort the
+                    # whole daily pass (which would re-run rolloff from scratch).
+                    try:
+                        totals["history_pruned"] += self._prune_history(table, shard_id)
+                    except Exception as e:
+                        logger.error(
+                            "accounting.history_prune_error",
+                            extra={"event": "accounting.history_prune_error",
+                                   "table": f"{table}_{shard_id:03d}", "error": str(e)},
+                        )
 
         logger.info(
             "accounting.rolloff_done",

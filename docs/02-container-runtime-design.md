@@ -55,7 +55,7 @@ Runtime behavior of `accounting_rolloff`:
    - append snapshots into `url_state_history_{shard}`,
    - set processed (and missing-current-row) event rows to `accounted=FALSE`.
 4. Commit each batch independently to reduce lock duration and avoid long transactions.
-5. History retention: the same daily pass also trickle-deletes `url_state_history_{shard}` and `content_feature_history_{shard}` snapshots older than `history_retention_days` (default 30, `0` disables). These are append-only audit logs with no pipeline read path; each batch is ordered by `snapshot_id` (the PK, monotonic with time) so it reads the oldest rows first. The current-table 90-day rolling counters are unaffected. Deletes release space to the table free list; repack/vacuum returns it to the OS.
+5. History retention: the same daily pass provisions the current/next month partition of `url_state_history_{shard}` and `content_feature_history_{shard}` (RANGE-partitioned on `snapshot_at`, monthly) and DROPs whole partitions older than `history_retention_days` (default 30, `0` disables). These are append-only audit logs with no pipeline read path. DROP is an O(1) metadata operation that returns space to the OS immediately, with no row scan or bloat. The current-table 90-day rolling counters are unaffected. Requires the tables to be partitioned first (`scripts/migrate_partition_history.py`); un-migrated tables are skipped.
 
 Runtime behavior of `frontier_gc`:
 
