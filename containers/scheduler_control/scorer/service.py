@@ -89,49 +89,70 @@ class GoldenDiscoveryRankerService:
         with self.Session.begin() as sess:
             with sess.connection().connection.cursor() as cur:
                 if self.cfg.domain_priority_steering_enabled:
-                    # Score URLs whose domain has a golden-tier score.
-                    # `d.domain_score > 0` is the gate — domain_state default
-                    # is 0.0, so this picks up exactly the rows that the
-                    # tier-write cron has tagged.
+                    # Pick due URLs from golden-tier domains, as a LATERAL
+                    # top-N-per-domain.  WHY this shape and not a flat
+                    # `JOIN domain_state ... ORDER BY d.domain_score DESC,
+                    # u.url_score_updated_at`: the flat form forces a blocking
+                    # Sort, because the lead ORDER BY key (domain_score) lives
+                    # on domain_state and has only ~3 distinct values, so within
+                    # a tier url_score_updated_at must be merged ACROSS all
+                    # domains — no index can produce that.  The Sort blocks the
+                    # LIMIT, so the planner materialises every matching row (in
+                    # the backlog regime ~all rows) via a Seq Scan.  Measured on
+                    # a 64M-row shard the flat plan cost ~11.5M and ignored the
+                    # rescore index entirely.
                     #
-                    # Two extra gates vs the legacy write-once query, both for
-                    # the v2 ranker whose features drift over time:
-                    #   * min_age: skip URLs younger than min_age_days so their
-                    #     inlinks/anchors settle before we score them (they keep
-                    #     the v1 inline score in the meantime). min_age_days=0
-                    #     makes the interval empty -> a no-op gate.
-                    #   * TTL refresh: re-pick a URL once its score is older
-                    #     than rescore_ttl_days, not just when never scored.
-                    #     rescore_ttl_days<=0 disables refresh (write-once: only
-                    #     never-scored rows), so we drop the OR branch entirely
-                    #     rather than emit `< NOW() - interval '0'`, which would
-                    #     match *every* already-scored row (re-score every pass).
-                    # ORDER BY url_score_updated_at ASC NULLS FIRST makes this
-                    # an LRU: never-scored rows first, then the stalest scores —
-                    # so continuous re-scoring can't starve unscored URLs.
+                    # The LATERAL drives from domain_state (golden domains for
+                    # this shard, via idx_domain_state_shard_score, ordered
+                    # domain_score DESC) and for each domain does a plain ordered
+                    # index scan on idx_..._golden_discovery_v2_rescore
+                    # (domain_id, url_score_updated_at) to take its stalest due
+                    # URLs.  No big scan; the only Sort is a top-N heapsort over
+                    # the few-thousand rows actually pulled.
+                    #
+                    # `d.shard_id = %s` is required AND correct: every domain in
+                    # url_state_current_{shard} has domain_state.shard_id=shard,
+                    # and the equality lets the shard_score index yield
+                    # domain_score DESC order (its lead column is shard_id).
+                    #
+                    # Gates (unchanged): min_age skips URLs younger than
+                    # min_age_days (they keep the v1 inline score; 0 = no-op);
+                    # TTL re-picks never-scored OR rows older than
+                    # rescore_ttl_days. rescore_ttl_days<=0 = write-once (drop
+                    # the OR branch, not `< NOW() - interval '0'` which would
+                    # match every already-scored row).
                     params: list = [self.cfg.min_age_days]
                     if self.cfg.rescore_ttl_days > 0:
                         ttl_clause = (
-                            "(u.url_score_updated_at IS NULL\n"
-                            "                               OR u.url_score_updated_at"
-                            " < NOW() - make_interval(days => %s))"
+                            "(u.url_score_updated_at IS NULL "
+                            "OR u.url_score_updated_at < NOW() - make_interval(days => %s))"
                         )
                         params.append(self.cfg.rescore_ttl_days)
                     else:
                         ttl_clause = "u.url_score_updated_at IS NULL"
-                    params.append(self.cfg.batch_size)
+                    # %s order matches text order: min_age, [ttl], inner LIMIT,
+                    # shard_id, outer LIMIT.
+                    params.extend([self.cfg.batch_size, shard_id, self.cfg.batch_size])
                     cur.execute(
                         f"""
                         SELECT u.url, u.inlink_count_approx, u.inlink_count_external, u.anchor_text
-                        FROM {table} u
-                        JOIN domain_state d ON d.domain_id = u.domain_id
-                        WHERE u.should_crawl = TRUE
+                        FROM domain_state d
+                        CROSS JOIN LATERAL (
+                            SELECT url, inlink_count_approx, inlink_count_external,
+                                   anchor_text, url_score_updated_at
+                            FROM {table} u
+                            WHERE u.domain_id = d.domain_id
+                              AND u.should_crawl = TRUE
+                              AND u.first_seen < NOW() - make_interval(days => %s)
+                              AND {ttl_clause}
+                            ORDER BY u.url_score_updated_at ASC NULLS FIRST
+                            LIMIT %s
+                            FOR UPDATE OF u SKIP LOCKED
+                        ) u
+                        WHERE d.shard_id = %s
                           AND d.domain_score > 0
-                          AND u.first_seen < NOW() - make_interval(days => %s)
-                          AND {ttl_clause}
                         ORDER BY d.domain_score DESC,
                                  u.url_score_updated_at ASC NULLS FIRST
-                        FOR UPDATE OF u SKIP LOCKED
                         LIMIT %s
                         """,
                         tuple(params),

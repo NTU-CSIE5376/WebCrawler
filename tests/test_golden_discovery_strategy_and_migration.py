@@ -467,7 +467,7 @@ class GoldenDiscoveryRankerSteeringTest(unittest.TestCase):
         self.assertNotIn("domain_score", select_sql)
         self.assertEqual(select_params, (1000,))
 
-    def test_steering_enabled_joins_domain_state_and_filters_by_score(self):
+    def test_steering_uses_lateral_per_domain_against_golden_tiers(self):
         cursor = _FakeCursor()
         # Defaults: min_age_days=3, rescore_ttl_days=5 (see config dataclass).
         service = _make_steering_service(cursor, steering=True, batch_size=1000)
@@ -476,25 +476,34 @@ class GoldenDiscoveryRankerSteeringTest(unittest.TestCase):
             service._score_batch(7)
 
         select_sql, select_params = cursor.executed[0]
+        # LATERAL top-N per golden domain: drive from domain_state, scan each
+        # domain's due URLs via the per-domain rescore index. A flat
+        # `JOIN domain_state ... ORDER BY d.domain_score, u.url_score_updated_at`
+        # forces a blocking Sort and ignores the index (see service.py / PR).
+        self.assertIn("FROM domain_state d", select_sql)
+        self.assertIn("CROSS JOIN LATERAL", select_sql)
         self.assertIn("FROM url_state_current_007 u", select_sql)
-        self.assertIn("JOIN domain_state d ON d.domain_id = u.domain_id", select_sql)
+        self.assertIn("u.domain_id = d.domain_id", select_sql)
         self.assertIn("d.domain_score > 0", select_sql)
+        # shard_id equality: required for the shard_score index to yield
+        # domain_score DESC order, and correct (domains here all have shard_id=7).
+        self.assertIn("d.shard_id = %s", select_sql)
+        # Locking lives inside the LATERAL so concurrent workers skip each other.
         self.assertIn("FOR UPDATE OF u SKIP LOCKED", select_sql)
 
-        # min_age gate: don't score URLs younger than min_age_days.
+        # min_age gate.
         self.assertIn("u.first_seen < NOW() - make_interval(days => %s)", select_sql)
-        # TTL refresh: re-pick never-scored OR stale-scored rows (v2 features
-        # drift, so url_score is no longer write-once).
+        # TTL refresh: re-pick never-scored OR stale-scored rows.
         self.assertIn("u.url_score_updated_at IS NULL", select_sql)
         self.assertIn(
             "u.url_score_updated_at < NOW() - make_interval(days => %s)",
             select_sql,
         )
-        # LRU ordering: golden tier first, then never-scored, then stalest.
+        # Per-domain oldest-first inner order; tier-priority outer order.
+        self.assertIn("ORDER BY u.url_score_updated_at ASC NULLS FIRST", select_sql)
         self.assertIn("ORDER BY d.domain_score DESC", select_sql)
-        self.assertIn("u.url_score_updated_at ASC NULLS FIRST", select_sql)
-        # Params are (min_age_days, rescore_ttl_days, batch_size) in that order.
-        self.assertEqual(select_params, (3, 5, 1000))
+        # Params in text order: min_age, ttl, inner LIMIT, shard_id, outer LIMIT.
+        self.assertEqual(select_params, (3, 5, 1000, 7, 1000))
 
     def test_steering_query_uses_no_write_once_only_filter(self):
         # Guard against regressing to the v1 write-once behavior: the steering
@@ -531,7 +540,8 @@ class GoldenDiscoveryRankerSteeringTest(unittest.TestCase):
             service._score_batch(1)
 
         _, select_params = cursor.executed[0]
-        self.assertEqual(select_params, (7, 30, 250))
+        # (min_age, ttl, inner LIMIT, shard_id, outer LIMIT).
+        self.assertEqual(select_params, (7, 30, 250, 1, 250))
 
     def test_steering_ttl_zero_is_write_once(self):
         # rescore_ttl_days<=0 must be true write-once: only never-scored rows,
@@ -561,8 +571,8 @@ class GoldenDiscoveryRankerSteeringTest(unittest.TestCase):
         select_sql, select_params = cursor.executed[0]
         self.assertIn("u.url_score_updated_at IS NULL", select_sql)
         self.assertNotIn("OR u.url_score_updated_at <", select_sql)
-        # Only (min_age_days, batch_size) — the TTL interval param is gone.
-        self.assertEqual(select_params, (3, 100))
+        # TTL param dropped: (min_age, inner LIMIT, shard_id, outer LIMIT).
+        self.assertEqual(select_params, (3, 100, 2, 100))
 
 
 class _FakeInlineRanker:
