@@ -6,7 +6,7 @@ import tldextract
 from w3lib.url import canonicalize_url
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 import scrapy
 from scrapy import signals
@@ -17,6 +17,7 @@ from twisted.internet import task as twisted_task
 
 from crawler.items import PageItem
 from crawler.queue_consumer import QueueConsumer
+from crawler.youtube_extractor import extract_youtube_outlinks
 from libs.obslog import configure as configure_logging
 
 logger = logging.getLogger("crawler")
@@ -377,48 +378,9 @@ class HtmlSpider(scrapy.Spider):
                 "anchor": (link.text or "").strip()[:200]
             })
 
-        parsed_response_url = urlparse(response.url)
-        host = parsed_response_url.hostname or ""
-        if (
-            (host == "youtube.com" or host.endswith(".youtube.com"))
-            and parsed_response_url.path == "/watch"
-            and parse_qs(parsed_response_url.query).get("v")
-        ):
-            try:
-                import json, re
-
-                match = re.search(
-                    r"(?:var\s+)?ytInitialData\s*=\s*({.*?})\s*;\s*</script>",
-                    response.text,
-                    re.DOTALL,
-                )
-                if match:
-                    data = json.loads(match.group(1))
-                    results = (
-                        data.get("contents", {})
-                        .get("twoColumnWatchNextResults", {})
-                        .get("secondaryResults", {})
-                        .get("secondaryResults", {})
-                        .get("results", [])
-                    )
-                    for result in results:
-                        contents = result.get("itemSectionRenderer", {}).get("contents", [])
-                        for content in contents:
-                            lockup = content.get("lockupViewModel")
-                            if not lockup:
-                                continue
-                            if lockup.get("contentType") != "LOCKUP_CONTENT_TYPE_VIDEO":
-                                continue
-                            content_id = lockup.get("contentId")
-                            if not content_id:
-                                continue
-                            outlinks.append({
-                                "url": f"https://www.youtube.com/watch?v={content_id}",
-                                "domain": "youtube.com",
-                                "anchor": "",
-                            })
-            except Exception:
-                logger.debug("youtube.yt_initial_data_extract_failed", exc_info=True)
+        host = urlparse(response.url).hostname or ""
+        if host == "youtube.com" or host.endswith(".youtube.com"):
+            extract_youtube_outlinks(response, outlinks)
 
         title = (response.xpath("//title/text()").get() or "").strip()[:500] or None
         hreflang_count = len(response.xpath(
