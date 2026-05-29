@@ -7,6 +7,7 @@ from libs.stats.delta_writer import StatsDeltaWriter
 
 from .db_ops import FeatureDB
 from .extract_basic import extract_basic
+from .extract_youtube import extract_youtube
 
 
 logger = logging.getLogger("extractor")
@@ -44,6 +45,9 @@ class ExtractService:
                     if rec.get("status") == "ok":
                         feat = extract_basic(rec)
                         self.db.process(feat)
+                        yt = extract_youtube(rec)
+                        if yt:
+                            self.db.process_youtube(yt)
                 except Exception as e:
                     logger.error(
                         "extract.record_error",
