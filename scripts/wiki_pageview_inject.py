@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import bz2
 import heapq
+import http.client
 import os
 import re
 import sys
@@ -27,6 +28,7 @@ DEFAULT_DOWNLOAD_RETRIES = 3
 DEFAULT_RETRY_BACKOFF_SECONDS = 5.0
 DEFAULT_RETENTION_DAYS = 45
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+DOWNLOAD_TIMEOUT_SECONDS = 120
 PARTIAL_RETENTION_SECONDS = 24 * 60 * 60
 
 WEBCRAWLER_SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -38,6 +40,7 @@ INGEST_CONFIG = (
 
 DUMP_ARTIFACT_RE = re.compile(r"^pageviews-(\d{8})-automated\.bz2(?:\.part)?$")
 TOP_ARTIFACT_RE = re.compile(r"^top\d+_pageviews_(\d{8})\.txt(?:\.part)?$")
+CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+|\*)$")
 
 
 @dataclass(frozen=True)
@@ -78,14 +81,33 @@ class DumpValidationStats:
     max_views: int
 
 
+@dataclass(frozen=True)
+class ContentRange:
+    start: int
+    end: int
+    total: int | None
+
+
 class DownloadValidationError(RuntimeError):
+    pass
+
+
+class IncompleteDownloadError(DownloadValidationError):
     pass
 
 
 def is_retryable_error(exc: BaseException) -> bool:
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code in {408, 429} or exc.code >= 500
-    return isinstance(exc, (urllib.error.URLError, TimeoutError))
+    return isinstance(
+        exc,
+        (
+            urllib.error.URLError,
+            TimeoutError,
+            ConnectionError,
+            http.client.HTTPException,
+        ),
+    )
 
 
 def retry_sleep_seconds(backoff_seconds: float, attempt: int) -> float:
@@ -228,6 +250,105 @@ def expected_content_length(resp) -> int | None:
         return None
 
 
+def response_content_range(resp) -> ContentRange | None:
+    value = resp.info().get("Content-Range")
+    if value is None:
+        return None
+    match = CONTENT_RANGE_RE.match(value.strip())
+    if match is None:
+        return None
+    total_raw = match.group(3)
+    return ContentRange(
+        start=int(match.group(1)),
+        end=int(match.group(2)),
+        total=None if total_raw == "*" else int(total_raw),
+    )
+
+
+def download_request(url: str, resume_from: int) -> urllib.request.Request:
+    headers = {}
+    if resume_from > 0:
+        headers["Range"] = f"bytes={resume_from}-"
+    return urllib.request.Request(url, headers=headers)
+
+
+def response_download_plan(resp, resume_from: int) -> tuple[bool, int | None]:
+    status = resp.getcode()
+    content_length = expected_content_length(resp)
+
+    if resume_from > 0 and status == 206:
+        content_range = response_content_range(resp)
+        if content_range is not None:
+            if content_range.start != resume_from:
+                raise DownloadValidationError(
+                    f"server resumed at byte {content_range.start:,}, "
+                    f"expected {resume_from:,}"
+                )
+            if content_range.end < content_range.start:
+                raise DownloadValidationError(
+                    f"invalid Content-Range: end {content_range.end:,} "
+                    f"is before start {content_range.start:,}"
+                )
+            if (
+                content_range.total is not None
+                and content_range.end >= content_range.total
+            ):
+                raise DownloadValidationError(
+                    f"invalid Content-Range: end {content_range.end:,} "
+                    f"is outside total {content_range.total:,}"
+                )
+            range_length = content_range.end - content_range.start + 1
+            if content_length is not None and content_length != range_length:
+                raise DownloadValidationError(
+                    f"Content-Length {content_length:,} does not match "
+                    f"Content-Range length {range_length:,}"
+                )
+            expected_total = content_range.total
+            if expected_total is None and content_length is not None:
+                expected_total = resume_from + content_length
+            return True, expected_total
+
+        if content_length is not None:
+            return True, resume_from + content_length
+        return True, None
+
+    if resume_from > 0 and status == 200:
+        print("  server ignored Range request; restarting download", file=sys.stderr)
+
+    return False, content_length
+
+
+def promote_valid_partial(part_path: Path, dest_path: Path) -> bool:
+    try:
+        stats = validate_pageview_dump(part_path)
+    except DownloadValidationError:
+        return False
+
+    part_path.replace(dest_path)
+    print(
+        f"  saved {dest_path} "
+        f"({stats.compressed_size:,} bytes, {stats.valid_rows:,} valid rows)",
+        file=sys.stderr,
+    )
+    return True
+
+
+def should_keep_partial(exc: BaseException) -> bool:
+    if isinstance(exc, IncompleteDownloadError):
+        return True
+    if isinstance(exc, urllib.error.HTTPError):
+        return is_retryable_error(exc)
+    return isinstance(
+        exc,
+        (
+            urllib.error.URLError,
+            TimeoutError,
+            ConnectionError,
+            http.client.HTTPException,
+        ),
+    )
+
+
 def download(
     url: str,
     dest: str | Path,
@@ -244,29 +365,45 @@ def download(
 
     for attempt in range(1, retries + 1):
         try:
-            if part_path.exists():
-                part_path.unlink()
-
+            resume_from = part_path.stat().st_size if part_path.exists() else 0
+            action = "Resuming" if resume_from > 0 else "Downloading"
             print(
-                f"Downloading {url} to {part_path} "
+                f"{action} {url} to {part_path} "
                 f"(attempt {attempt}/{retries}) ...",
                 file=sys.stderr,
             )
-            with urllib.request.urlopen(url, timeout=30) as resp:
-                content_length = expected_content_length(resp)
-                bytes_written = 0
-                with open(part_path, "wb") as out:
+            if resume_from > 0:
+                print(f"  starting at byte {resume_from:,}", file=sys.stderr)
+
+            request = download_request(url, resume_from)
+            with urllib.request.urlopen(
+                request, timeout=DOWNLOAD_TIMEOUT_SECONDS
+            ) as resp:
+                append, expected_total = response_download_plan(resp, resume_from)
+                if not append:
+                    resume_from = 0
+
+                bytes_written = resume_from
+                mode = "ab" if append else "wb"
+                with open(part_path, mode) as out:
                     while True:
-                        chunk = resp.read(DOWNLOAD_CHUNK_SIZE)
+                        try:
+                            chunk = resp.read(DOWNLOAD_CHUNK_SIZE)
+                        except http.client.IncompleteRead as exc:
+                            if exc.partial:
+                                out.write(exc.partial)
+                                bytes_written += len(exc.partial)
+                            raise
                         if not chunk:
                             break
                         out.write(chunk)
                         bytes_written += len(chunk)
 
-            if content_length is not None and bytes_written != content_length:
-                raise DownloadValidationError(
-                    f"expected {content_length:,} bytes, got {bytes_written:,}"
-                )
+            if expected_total is not None and bytes_written != expected_total:
+                message = f"expected {expected_total:,} bytes, got {bytes_written:,}"
+                if bytes_written < expected_total:
+                    raise IncompleteDownloadError(message)
+                raise DownloadValidationError(message)
 
             stats = validate_pageview_dump(part_path)
             part_path.replace(dest_path)
@@ -280,22 +417,44 @@ def download(
             DownloadValidationError,
             urllib.error.HTTPError,
             urllib.error.URLError,
+            http.client.HTTPException,
             TimeoutError,
+            ConnectionError,
             OSError,
         ) as exc:
-            try:
-                part_path.unlink()
-            except FileNotFoundError:
-                pass
+            reset_partial = False
+            if isinstance(exc, urllib.error.HTTPError) and exc.code == 416:
+                if part_path.exists() and promote_valid_partial(part_path, dest_path):
+                    return
+                reset_partial = True
 
-            if attempt >= retries or not (
-                isinstance(exc, DownloadValidationError) or is_retryable_error(exc)
-            ):
+            keep_partial = should_keep_partial(exc) and not reset_partial
+            if not keep_partial:
+                try:
+                    part_path.unlink()
+                except FileNotFoundError:
+                    pass
+
+            retryable = (
+                reset_partial
+                or isinstance(exc, DownloadValidationError)
+                or is_retryable_error(exc)
+            )
+            if attempt >= retries or not retryable:
                 raise
 
             sleep_for = retry_sleep_seconds(backoff_seconds, attempt)
+            partial_note = ""
+            if keep_partial and part_path.exists():
+                try:
+                    partial_note = (
+                        f"; keeping partial ({part_path.stat().st_size:,} bytes)"
+                    )
+                except OSError:
+                    partial_note = "; keeping partial"
             print(
-                f"Download failed ({exc}); retrying in {sleep_for:.1f}s "
+                f"Download failed ({exc}){partial_note}; "
+                f"retrying in {sleep_for:.1f}s "
                 f"({attempt}/{retries})",
                 file=sys.stderr,
             )
