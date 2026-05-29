@@ -47,6 +47,7 @@ DOMAIN_PAUSE_BASE = {
     "HttpError 403":                         "6 hours",
     "HttpError 400":                         "6 hours",
     "HttpError 429":                         "1 hour",
+    "HttpError 420":                         "1 hour",
     "TimeoutError":                          "1 hour",
     "DownloadTimeoutError":                  "1 hour",
     "ResponseNeverReceived":                 "1 hour",
