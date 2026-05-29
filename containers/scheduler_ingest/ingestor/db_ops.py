@@ -122,6 +122,21 @@ _HIST_COLS = (
 )
 
 
+def _prefer_higher_parent(dst: dict, src: dict) -> None:
+    """Adopt src's parent provenance into dst when src's parent_page_score is
+    higher. A NULL (missing) score ranks lowest, so a real-scored parent always
+    beats an unknown one; ties keep dst (first wins). discovered_from,
+    parent_page_score and discovery_source_type describe one parent, so they
+    move together. anchor_text is handled separately (first non-null wins).
+    """
+    new_s = src.get("parent_page_score")
+    cur_s = dst.get("parent_page_score")
+    if new_s is not None and (cur_s is None or new_s > cur_s):
+        dst["discovered_from"] = src.get("discovered_from")
+        dst["parent_page_score"] = new_s
+        dst["discovery_source_type"] = src.get("discovery_source_type")
+
+
 class IngestDB:
     def __init__(
         self,
@@ -495,6 +510,7 @@ class IngestDB:
             if url in by_url:
                 by_url[url]["inlink_count_approx"] += inc_approx
                 by_url[url]["inlink_count_external"] += inc_external
+                _prefer_higher_parent(by_url[url], rec)
                 dup_results.append((idx, False))
             else:
                 first_idx_by_url[url] = idx
@@ -553,6 +569,13 @@ class IngestDB:
                     (rec.get("anchor_text") or None),
                 )
             )
+        # New parent wins only when it has a strictly higher score; a NULL
+        # (unknown) score ranks below any real score.
+        pref = (
+            f"EXCLUDED.parent_page_score IS NOT NULL AND "
+            f"({tcur}.parent_page_score IS NULL OR "
+            f"EXCLUDED.parent_page_score > {tcur}.parent_page_score)"
+        )
         inserted_rows = execute_values(
             cur,
             f"""
@@ -564,7 +587,16 @@ class IngestDB:
             ON CONFLICT (url) DO UPDATE SET
               inlink_count_approx = {tcur}.inlink_count_approx + EXCLUDED.inlink_count_approx,
               inlink_count_external = {tcur}.inlink_count_external + EXCLUDED.inlink_count_external,
-              anchor_text = COALESCE({tcur}.anchor_text, EXCLUDED.anchor_text)
+              anchor_text = COALESCE({tcur}.anchor_text, EXCLUDED.anchor_text),
+              -- Keep the parent with the higher score (NULL ranks lowest, ties
+              -- keep the existing parent). The three provenance columns describe
+              -- one parent, so they switch together.
+              discovered_from = CASE WHEN {pref}
+                THEN EXCLUDED.discovered_from ELSE {tcur}.discovered_from END,
+              discovery_source_type = CASE WHEN {pref}
+                THEN EXCLUDED.discovery_source_type ELSE {tcur}.discovery_source_type END,
+              parent_page_score = CASE WHEN {pref}
+                THEN EXCLUDED.parent_page_score ELSE {tcur}.parent_page_score END
             RETURNING url, (xmax = 0) AS inserted
             """,
             link_rows,
@@ -596,8 +628,9 @@ class IngestDB:
     @staticmethod
     def aggregate_links(recs: list[dict]) -> list[dict]:
         """Collapse discovery records by url: sum inlink counters, keep first
-        non-null anchor. _bulk_links only dedups within one BATCH_SIZE chunk;
-        folder-level dedup is what actually cuts the ~12x hot-url contention.
+        non-null anchor, keep the highest-scoring parent. _bulk_links only
+        dedups within one BATCH_SIZE chunk; folder-level dedup is what actually
+        cuts the ~12x hot-url contention.
         """
         by_url: dict[str, dict] = {}
         for rec in recs:
@@ -614,6 +647,7 @@ class IngestDB:
                 existing["inlink_count_external"] += inc_e
                 if not existing.get("anchor_text") and rec.get("anchor_text"):
                     existing["anchor_text"] = rec["anchor_text"]
+                _prefer_higher_parent(existing, rec)
         return list(by_url.values())
 
     def process_batch(self, recs: list[dict]) -> list[IngestResult | bool | None]:

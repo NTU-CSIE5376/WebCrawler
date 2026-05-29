@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional, Set
 logger = logging.getLogger("router")
 
 import psycopg2
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import OperationalError, InterfaceError
 
@@ -132,13 +132,20 @@ class RouterService:
                             domain_resolver = DomainResolver(sess, domain_cache)
                             with sess.begin():
                                 # resolve domain_id from DB (insert if missing)
-                                domain_id, domain_score = domain_resolver.ensure_and_get(domain, shard_id)
+                                domain_id, _ = domain_resolver.ensure_and_get(domain, shard_id)
 
                                 src_url = rec.get("url")
+                                # Score of the page these outlinks were found on,
+                                # recorded as each link's parent_page_score. Skip
+                                # the lookup when there are no links to score.
+                                parent_page_score = (
+                                    self._parent_url_score(sess, shard_id, src_url)
+                                    if outlinks else None
+                                )
                                 new_outlinks = []
                                 for link in outlinks:
                                     l = self._process_link(
-                                        domain_resolver, link, src_url, domain, domain_score
+                                        domain_resolver, link, src_url, domain, parent_page_score
                                     )
                                     if l:
                                         new_outlinks.append(l)
@@ -219,13 +226,27 @@ class RouterService:
             },
         )
 
+    def _parent_url_score(self, sess, shard_id: int, src_url: Optional[str]) -> Optional[float]:
+        """url_score of the parent page (the crawled page that emitted these
+        outlinks). Stored as each link's parent_page_score so the ingestor keeps
+        the highest-scoring parent. None when the page is not in
+        url_state_current yet, which the ingestor ranks lowest.
+        """
+        if not src_url:
+            return None
+        row = sess.execute(
+            text(f"SELECT url_score FROM url_state_current_{shard_id:03d} WHERE url = :url"),
+            {"url": src_url},
+        ).first()
+        return float(row.url_score) if row and row.url_score is not None else None
+
     def _process_link(
         self,
         domain_resolver: DomainResolver,
         link: Dict[str, str],
         src_url: Optional[str],
         src_domain: str,
-        parent_page_score: float,
+        parent_page_score: Optional[float],
     ) -> Optional[Dict[str, Any]]:
         url = link.get("url")
         anchor = link.get("anchor")
