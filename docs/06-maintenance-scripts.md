@@ -324,3 +324,17 @@ uv run scripts/oneoff_drop_trap_frontier.py                      # dry-run, list
 uv run scripts/oneoff_drop_trap_frontier.py --execute            # freeze + drain frontier
 uv run scripts/oneoff_drop_trap_frontier.py --execute --include-history
 ```
+
+## 6.17 `wiki_pageview_inject.py`
+
+- Recurring job (intended weekly).
+- Downloads the latest available Wikimedia `pageview_complete` automated dump, extracts the top pageview URLs, and injects them into crawlerdb with pageview-derived `url_score`.
+- Stores dump and extracted artifacts under `/data/wiki_pageviews/` by default instead of the process working directory. `docker-compose.yml` mounts the same host path into `scheduler_ingest` for compose-run maintenance jobs.
+- Downloads to `*.part`, resumes incomplete dumps with HTTP `Range` requests, validates the compressed bzip2 dump, then atomically renames it into place. Transient Wikimedia/network failures keep resumable partial files and retry with exponential backoff.
+- Writes extracted top files through `*.part` and atomically renames them after validating the extracted rows.
+- Applies retention cleanup to old `pageviews-*-automated.bz2`, `top*_pageviews_*.txt`, and stale `*.part` artifacts. Default retention is 45 days; use `--retention-days` or `--no-cleanup` to adjust.
+
+```bash
+uv run scripts/wiki_pageview_inject.py [--dry-run] [--skip-inject]
+docker compose exec scheduler_ingest python scripts/wiki_pageview_inject.py --retention-days 30
+```
