@@ -129,7 +129,7 @@ Key columns:
 - link signals: `inlink_count_approx INTEGER NOT NULL DEFAULT 0`, `inlink_count_external INTEGER NOT NULL DEFAULT 0` (non-deduplicated observed outlink counters from crawler discovery; no historical backfill)
 - provenance: `source SMALLINT NOT NULL DEFAULT 0` (`0` = natural discovery, `1` = golden set membership, `2` = weekly pageview injection)
 - provenance: `discovered_from VARCHAR` (URL of the highest-scoring parent observed for this URL; NULL for golden-injected and seed URLs; on conflict the parent with the higher `parent_page_score` wins, NULL score ranks lowest, ties keep the existing parent)
-- discovery metadata: `discovery_source_type SMALLINT NOT NULL DEFAULT 0` (`0` = unknown/seed, `1` = page outlink), `parent_page_score DOUBLE PRECISION` (source page domain score of the winning parent), `anchor_text VARCHAR` (first non-null outlink anchor observed for this URL)
+- discovery metadata: `discovery_source_type SMALLINT NOT NULL DEFAULT 0` (`0` = unknown/seed, `1` = page outlink), `parent_page_score DOUBLE PRECISION` (url_score of the winning parent page; NULL when the parent page was not yet in url_state_current), `anchor_text VARCHAR` (first non-null outlink anchor observed for this URL)
 - robots metadata: `robots_bits SMALLINT NOT NULL DEFAULT 0` (`0` = unknown, `1` = crawl allowed, `2` = crawl disallowed by robots.txt)
 - page metadata: `title VARCHAR` (`<title>` trimmed to 500 chars by the spider; NULL on fail / non-HTML; latest successful fetch wins, fails keep the previous value via `COALESCE`)
 - page metadata: `hreflang_count INTEGER` (count of `<link rel="alternate" hreflang="...">` entries on successful HTML fetches)

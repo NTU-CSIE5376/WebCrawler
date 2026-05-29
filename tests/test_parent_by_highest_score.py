@@ -4,6 +4,7 @@ first one. A NULL score ranks lowest; ties keep the existing parent."""
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from containers.scheduler_ingest.ingestor import db_ops as ingest_db_ops
@@ -110,6 +111,53 @@ class BulkLinksUpsertSqlTest(unittest.TestCase):
         for col in ("discovered_from =", "discovery_source_type =", "parent_page_score ="):
             self.assertIn(col, sql)
         self.assertIn("EXCLUDED.parent_page_score > url_state_current_003.parent_page_score", sql)
+
+
+class _FakeResult:
+    def __init__(self, row):
+        self._row = row
+
+    def first(self):
+        return self._row
+
+
+class _FakeSess:
+    def __init__(self, row):
+        self.row = row
+        self.captured = None
+
+    def execute(self, stmt, params=None):
+        self.captured = (str(stmt), params)
+        return _FakeResult(self.row)
+
+
+class RouterParentUrlScoreTest(unittest.TestCase):
+    """The router records the parent page's own url_score (page-level), not the
+    parent domain's score."""
+
+    @staticmethod
+    def _call(sess, shard_id, src_url):
+        from containers.scheduler_ingest.router.service import RouterService
+        return RouterService._parent_url_score(None, sess, shard_id, src_url)
+
+    def test_returns_parent_page_url_score_from_its_shard(self):
+        sess = _FakeSess(SimpleNamespace(url_score=0.7))
+        score = self._call(sess, 7, "https://example.com/parent")
+        self.assertEqual(score, 0.7)
+        sql, params = sess.captured
+        self.assertIn("FROM url_state_current_007", sql)  # zero-padded parent shard
+        self.assertEqual(params, {"url": "https://example.com/parent"})
+
+    def test_no_src_url_skips_query(self):
+        sess = _FakeSess(SimpleNamespace(url_score=0.7))
+        self.assertIsNone(self._call(sess, 7, None))
+        self.assertIsNone(sess.captured)
+
+    def test_missing_parent_row_returns_none(self):
+        self.assertIsNone(self._call(_FakeSess(None), 7, "u"))
+
+    def test_null_url_score_returns_none(self):
+        self.assertIsNone(self._call(_FakeSess(SimpleNamespace(url_score=None)), 7, "u"))
 
 
 if __name__ == "__main__":
