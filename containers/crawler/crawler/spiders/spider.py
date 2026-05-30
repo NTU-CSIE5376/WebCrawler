@@ -121,6 +121,42 @@ class HtmlSpider(scrapy.Spider):
 
         return at_limit
 
+    def _scraper_runtime(self) -> dict[str, int | float]:
+        scraper = getattr(getattr(self.crawler, "engine", None), "scraper", None)
+        slot = getattr(scraper, "slot", None)
+
+        active_size = int(getattr(slot, "active_size", 0) or 0)
+        max_active_size = int(
+            getattr(
+                slot,
+                "max_active_size",
+                self.crawler.settings.getint("SCRAPER_SLOT_MAX_ACTIVE_SIZE"),
+            )
+            or 0
+        )
+        active_size_ratio = (
+            round(active_size / max_active_size, 4) if max_active_size > 0 else 0.0
+        )
+
+        return {
+            "itemproc_size": int(getattr(slot, "itemproc_size", 0) or 0),
+            "active_size_ratio": active_size_ratio,
+        }
+
+    def _scheduler_runtime(self) -> dict[str, int]:
+        engine = getattr(self.crawler, "engine", None)
+        slot = getattr(engine, "_slot", None) or getattr(engine, "slot", None)
+        scheduler = getattr(slot, "scheduler", None)
+        try:
+            scheduler_size = len(scheduler or ())
+        except TypeError:
+            scheduler_size = 0
+
+        return {
+            "engine_slot_inprogress": len(getattr(slot, "inprogress", ()) or ()),
+            "scheduler_size": scheduler_size,
+        }
+
     def _log(self, message: str):
         runtime = self._downloader_runtime()
         logger.info(
@@ -279,6 +315,8 @@ class HtmlSpider(scrapy.Spider):
 
     def _emit_heartbeat(self):
         runtime = self._downloader_runtime()
+        scraper_runtime = self._scraper_runtime()
+        scheduler_runtime = self._scheduler_runtime()
         domains_at_limit = self._count_domains_at_limit()
 
         logger.info(
@@ -296,6 +334,10 @@ class HtmlSpider(scrapy.Spider):
                 "slot_queue_max": self._max_slot_queue,
                 "slot_active": runtime["slot_active"],
                 "slots": runtime["slots"],
+                "scraper_active_size_ratio": scraper_runtime["active_size_ratio"],
+                "scraper_itemproc_size": scraper_runtime["itemproc_size"],
+                "engine_slot_inprogress": scheduler_runtime["engine_slot_inprogress"],
+                "scheduler_size": scheduler_runtime["scheduler_size"],
                 "domains_at_limit": domains_at_limit,
             },
         )
