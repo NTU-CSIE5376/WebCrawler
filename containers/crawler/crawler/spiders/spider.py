@@ -106,42 +106,20 @@ class HtmlSpider(scrapy.Spider):
             "slots": len(slots),
         }
     
-    @staticmethod
-    def _nearest_rank(values: list[int], percentile: float) -> int:
-        if not values:
-            return 0
-        rank = int((len(values) * percentile) + 0.999999)
-        index = max(0, min(len(values) - 1, rank - 1))
-        return values[index]
-
-    def _get_domain_distribution_stats(self) -> dict:
+    def _count_domains_at_limit(self) -> int:
         downloader = getattr(getattr(self.crawler, "engine", None), "downloader", None)
         slots = getattr(downloader, "slots", {}) or {}
-        
-        active_counts = []
+
         at_limit = 0
-        default_limit = self.crawler.settings.getint("CONCURRENT_REQUESTS_PER_DOMAIN", 8)
+        default_limit = self.crawler.settings.getint("CONCURRENT_REQUESTS_PER_DOMAIN", 16)
         for s in slots.values():
             count = len(getattr(s, "active", ()) or ())
             if count > 0:
-                active_counts.append(count)
                 limit = int(getattr(s, "concurrency", default_limit) or default_limit)
                 if count >= limit:
                     at_limit += 1
-        
-        if not active_counts:
-            return {"mean": 0.0, "p50": 0, "p90": 0, "max": 0, "at_limit": 0}
-            
-        active_counts.sort()
-        num_domains = len(active_counts)
-        
-        return {
-            "mean": round(sum(active_counts) / num_domains, 2),
-            "p50": self._nearest_rank(active_counts, 0.5),
-            "p90": self._nearest_rank(active_counts, 0.9),
-            "max": active_counts[-1],
-            "at_limit": at_limit,
-        }
+
+        return at_limit
 
     def _log(self, message: str):
         runtime = self._downloader_runtime()
@@ -301,7 +279,7 @@ class HtmlSpider(scrapy.Spider):
 
     def _emit_heartbeat(self):
         runtime = self._downloader_runtime()
-        dist_stats = self._get_domain_distribution_stats()
+        domains_at_limit = self._count_domains_at_limit()
 
         logger.info(
             "spider.heartbeat",
@@ -318,11 +296,7 @@ class HtmlSpider(scrapy.Spider):
                 "slot_queue_max": self._max_slot_queue,
                 "slot_active": runtime["slot_active"],
                 "slots": runtime["slots"],
-                "domain_active_p50": dist_stats["p50"],
-                "domain_active_p90": dist_stats["p90"],
-                "domain_active_mean": dist_stats["mean"],
-                "domain_active_max": dist_stats["max"],
-                "domains_at_limit": dist_stats["at_limit"],
+                "domains_at_limit": domains_at_limit,
             },
         )
 
