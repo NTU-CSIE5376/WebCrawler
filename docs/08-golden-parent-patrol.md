@@ -22,20 +22,24 @@ identify parent pages with a track record of producing new golden URLs and
 re-fetch them on a learned cadence so new golden URLs are discovered
 *before* the 4-week inject window.
 
-If patrol works, the URL count `golden_inject` has to backfill should
-trend down — that is one of the KPIs.
+**KPI**: per-batch **discovery coverage** of golden URLs against the SERP-
+defined ground truth (`metric_url.is_discovered` joined to `metric_queries
+.batch_id`). Patrol is effective iff this number rises batch over batch for
+domains in scope. We do NOT use "fewer URLs for `golden_inject` to backfill"
+as the primary KPI — that indirection hides which lever moved coverage.
 
 ## Scope of this design
 
-The patrol watchlist consists of parents in three source categories:
+The patrol watchlist enrolls one source category for the MVP:
 
 - `live_observed` — production crawler organically discovered the parent
   and one of its outlinks landed in the golden set
   (`url_state_current_*.discovered_from = parent` AND `source = 1`).
-- `wat_exact` — Common Crawl WAT scan shows the parent linked to a known
-  golden URL at some historical point. Lower confidence: the page may no
-  longer exist or may no longer link to that URL.
-- `manual` — human-supplied seeds. Off by default; on by config.
+
+`source_type` is kept as a column for future-proofing (WAT-style historical
+seeds, manual seeds, sitemap-derived parents) but the MVP only emits and
+reads `'live_observed'`. Adding a new source later does not require a
+schema migration — only loader code + an optional cadence-bias config.
 
 Each cycle the patrol writes `should_crawl = TRUE` on the parent's
 `url_state_current_*` row so the existing offerer / crawler / ingestor
@@ -50,16 +54,30 @@ The headline trade-offs grilled in design:
 
 When a parent is due, the cron writes
 `url_score = 1.0`, `url_score_updated_at = NOW()`, `should_crawl = TRUE`,
-`source = 2` (`SOURCE_GOLDEN_PARENT_PATROL`).
+`source = 3` (`SOURCE_GOLDEN_PARENT_PATROL`). Value `3` because `2` is
+already taken by `SOURCE_PAGEVIEW` (`scripts/wiki_pageview_inject.py`,
+landed on main after this design was drafted).
 
 No new column. Aligned with the production ranker's design ("the ranker
 writes operational priority into url_score" — see
-`golden_discovery_ranker_v1_strategy.py`). The background scorer will not
-overwrite patrol writes because it only scores rows where
+`golden_discovery_ranker_v1_strategy.py`). The v1 background scorer did not
+overwrite patrol writes because it only scored rows where
 `url_score_updated_at IS NULL`.
 
+⚠️ **Stale-invariant warning (v2 scorer)**: after the v2 continuous
+re-scorer landed (LATERAL query with `url_score_updated_at < NOW() -
+rescore_ttl_days`), patrol writes are no longer durable — v2 will pick the
+row back up after `rescore_ttl_days` (currently 5 d) and overwrite
+`url_score` with its own [0,1] score. Mitigation options:
+- (a) add `AND u.source <> 3` to the v2 steering query so v2 skips patrol-
+  written rows; cleanest but couples v2 to patrol.
+- (b) accept v2 will eventually overwrite; patrol re-asserts on next cron
+  tick (≤ 6 h), so the score only stays "wrong" for up to one cadence.
+Decision deferred to the cron-service PR review; current MVP behaviour is
+(b).
+
 **Implication**: `url_score` becomes shared between the ranker and patrol;
-to attribute by writer, filter on `source = 2`.
+to attribute by writer, filter on `source = 3`.
 
 ### D2. Identity = normalized URL, fetch URL = raw URL
 
@@ -98,24 +116,25 @@ currently-unused `url_link` edge table; out of scope for the patrol MVP.
 
 ### D4. Cadence — short-loop signal drives re-pacing, long-loop drives retire
 
-Five cadence buckets; intervals are config-driven defaults:
+Four cadence buckets; intervals are config-driven defaults. The `fast`
+bucket (1 h) was dropped in design review to avoid hammering anti-bot
+WAFs on the productive parent pages — `medium` (6 h) is the fastest
+cadence.
 
 | bucket   | interval |
 |----------|----------|
-| `fast`   | 1 h      |
 | `medium` | 6 h      |
 | `slow`   | 1 d      |
 | `trial`  | 2 d      |
 | `cold`   | 7 d      |
 
-Initial bucket is set per `(source_type, lifetime_golden_child_count)`
-mapping in config; live parents start more aggressive than WAT parents
-because the live signal is fresher.
+Initial bucket is set per `lifetime_golden_child_count` in config; all
+parents start in `trial` and earn faster cadence by producing.
 
 **Short loop (every patrol cycle):**
 
 - New URL count from this fetch ≥ promote threshold → bucket up one step
-  (capped at `fast`).
+  (capped at `medium`).
 - `consecutive_no_new_url ≥` demote threshold → bucket down one step.
 - Otherwise unchanged.
 
@@ -135,10 +154,10 @@ and pushes `next_patrol_at` out by a short grace period.
 `scripts/constants.py` adds:
 
 ```python
-SOURCE_GOLDEN_PARENT_PATROL = 2
+SOURCE_GOLDEN_PARENT_PATROL = 3
 ```
 
-Parent rows are tagged `source = 2` whenever the patrol cron writes them
+Parent rows are tagged `source = 3` whenever the patrol cron writes them
 (force overwrite, matching `golden_inject`'s precedent). Children of
 patrolled parents inherit `source = 0` via the natural ingest path;
 provenance is reconstructed via `discovered_from`.
@@ -164,22 +183,22 @@ threshold's job is signal collection, not budget protection.
 
 ### D8. Patrol priority is a constant `1.0`
 
-All sources write the same `url_score = 1.0`. Differences between
-`live_observed`, `wat_exact`, and `manual` are expressed entirely through
-the cadence policy (how often) and the lifecycle policy (when to retire),
-not through the `url_score` value (where in the queue).
+Patrol writes a constant `url_score = 1.0`. Per-row differentiation
+(productive parents vs cold ones) is expressed entirely through the
+cadence policy (how often to re-fetch) and the lifecycle policy (when to
+retire), not through the `url_score` value (where in the offerer queue).
+When future source types land, they will follow the same convention.
 
 ### D9. INSERT-or-UPDATE on enqueue
 
 When the cron makes a parent due, the enqueue write is
 `INSERT … ON CONFLICT (url) DO UPDATE` against `url_state_current_*`,
-mirroring `golden_inject`'s pattern. This handles both:
-
-- `live_observed` parents — already present in `url_state_current_*` from
-  the original crawl, so the path takes the UPDATE branch.
-- `wat_exact` and `manual` parents — frequently absent from
-  `url_state_current_*`, so the path takes the INSERT branch and creates
-  the row on demand.
+mirroring `golden_inject`'s pattern. For the MVP `live_observed` source
+this is effectively always the UPDATE branch (the parent is already in
+`url_state_current_*` because that is where we observed it). The INSERT
+branch is kept as a forward-compat safety net for future source types
+whose parents may not exist in `url_state_current_*` yet, and as a
+defence against ad-hoc row pruning.
 
 ### D10. Delayed evaluation runs as soon as a new metric batch lands
 
@@ -216,8 +235,8 @@ Columns:
 - **Long-loop signals**: `last_eval_batch_id`,
   `consecutive_miss_batches`.
 - **Backstop**: `consecutive_fetch_fail`.
-- **Audit**: `updated_at`, `metadata_json` (JSONB; WAT chunk id, manual
-  reason, etc.).
+- **Audit**: `updated_at`, `metadata_json` (JSONB; per-row provenance or
+  free-form notes; reserved for future loaders).
 
 ORM: `libs/db/models/patrol/state.py` (`GoldenParentPatrolState`).
 Migration: `scripts/migrate_add_golden_parent_patrol.py`.
@@ -238,9 +257,10 @@ when the cron is enabled.
 1. **PR 1 (this PR) — Schema and helpers.** Migration script, `source`
    enum, ORM model, `normalize_parent_url`, plus this design doc.
    No behaviour change.
-2. **PR 2 — Backfill scripts.** `backfill_golden_parent_patrol.py` (live)
-   and `load_wat_golden_parents.py` (WAT). Populates the watchlist;
-   does not touch `url_state_current_*`.
+2. **PR 2 — Backfill script.** `backfill_golden_parent_patrol.py` (live).
+   Populates the watchlist from `url_state_current_*.discovered_from`;
+   does not touch `url_state_current_*`. The WAT-based loader from the
+   original design was dropped in review — see §Scope.
 3. **PR 3 — Cron service.** `run_golden_parent_patrol.py` plus the
    `libs/patrol/cron_loop`, `cadence`, and `evaluation` modules. Includes
    unit tests for cadence transitions and evaluation logic. Disabled
@@ -253,7 +273,8 @@ when the cron is enabled.
 - `url_link` activation (PR D3 limitation): could enable parent → child
   edge attribution for known golden URLs but is a larger change and
   separate proposal.
-- Sub-hour cadences: out of scope; `fast = 1 h` already exceeds typical
-  per-domain politeness limits in production.
+- Sub-6h cadences: out of scope. The original `fast = 1 h` bucket was
+  dropped in review (anti-bot WAFs on productive parents make sub-6h
+  unsafe); `medium = 6 h` is the fastest the MVP will go.
 - Cross-DB direct join via PostgreSQL FDW: skipped in favour of the
   app-code pattern that matches `golden_inject.py`.

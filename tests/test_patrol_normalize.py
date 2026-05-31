@@ -115,6 +115,33 @@ class NormalizeParentUrlTest(unittest.TestCase):
             f"variants did not collapse to one key: {keys}",
         )
 
+    def test_ref_query_param_is_kept(self):
+        # `ref` is content-meaningful on some sites (e.g. GitHub
+        # `?ref=<branch>`), so it must NOT be dropped — even though it
+        # looks tracking-like. Two URLs that differ only in `?ref=`
+        # must stay distinct parent_keys.
+        a = normalize_parent_url("https://github.com/org/repo/tree/main?ref=main")
+        b = normalize_parent_url("https://github.com/org/repo/tree/main?ref=v1.2.0")
+        self.assertNotEqual(a, b)
+        self.assertIn("ref=main", a)
+        self.assertIn("ref=v1.2.0", b)
+
+    def test_tracking_param_match_is_case_insensitive(self):
+        # Real-world URLs sometimes carry uppercase variants like
+        # `UTM_SOURCE` or `FBCLID`. The whitelist match must catch them.
+        self.assertEqual(
+            normalize_parent_url("https://example.com/p?UTM_SOURCE=fb&FBCLID=ABC"),
+            "https://example.com/p",
+        )
+
+    def test_query_param_order_collapses_to_one_key(self):
+        # Same content, different query-param order → must produce the
+        # same parent_key, otherwise the same physical page is split
+        # across patrol rows.
+        a = normalize_parent_url("https://example.com/p?a=1&b=2")
+        b = normalize_parent_url("https://example.com/p?b=2&a=1")
+        self.assertEqual(a, b)
+
     def test_empty_input_returns_empty(self):
         self.assertEqual(normalize_parent_url(""), "")
 

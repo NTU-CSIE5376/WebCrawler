@@ -24,6 +24,13 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 # Drop these query parameters during normalization. Adding to this list is a
 # config decision that affects the patrol_state primary-key partition; only add
 # parameters that are universally tracking, never content keys.
+#
+# NOTE: `ref` is deliberately NOT here even though many sites use it for
+# affiliate tracking — GitHub (and a few others) use `?ref=<branch>` as a
+# content key, so dropping it would collapse different content pages into
+# the same parent_key. Per the safety rule in the module docstring
+# ("normalization bugs degrade dedup precision but never invent unverified
+# URLs"), we prefer to keep a few extra rows over a misleading merge.
 _TRACKING_PARAMS = frozenset(
     {
         "utm_source",
@@ -35,7 +42,6 @@ _TRACKING_PARAMS = frozenset(
         "gclid",
         "mc_cid",
         "mc_eid",
-        "ref",
     }
 )
 
@@ -55,9 +61,14 @@ def _strip_tracking_query(query: str) -> str:
     if not query:
         return ""
     pairs = parse_qsl(query, keep_blank_values=True)
-    kept = [(k, v) for k, v in pairs if k not in _TRACKING_PARAMS]
+    # Case-insensitive key match so `?UTM_SOURCE=...` is dropped too;
+    # parse_qsl is case-sensitive but real-world URLs are mixed.
+    kept = [(k, v) for k, v in pairs if k.lower() not in _TRACKING_PARAMS]
     if not kept:
         return ""
+    # Sort by (key, value) so URLs that differ only in query-param order
+    # (`?a=1&b=2` vs `?b=2&a=1`) collapse to the same parent_key.
+    kept.sort()
     return urlencode(kept, doseq=True)
 
 

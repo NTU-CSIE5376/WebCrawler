@@ -38,8 +38,9 @@ class GoldenParentPatrolState(Base):
     parent_domain = Column(String, nullable=False)
     shard_id = Column(SmallInteger, nullable=False)
 
-    # Source tagging — informs initial cadence policy.
-    # Values: 'live_observed', 'wat_exact', 'manual'
+    # Source tagging — informs initial cadence policy. MVP only emits
+    # 'live_observed'; column kept for future source types (no schema
+    # migration needed when adding new loaders).
     source_type = Column(String, nullable=False)
     first_enrolled_at = Column(
         DateTime(timezone=True),
@@ -48,8 +49,17 @@ class GoldenParentPatrolState(Base):
     )
 
     # Lifecycle.
-    # status values: 'trial', 'active', 'cooling', 'retired'
-    # cadence_bucket values: 'fast', 'medium', 'slow', 'trial', 'cold'
+    # status values produced by current code:
+    #   - 'trial'   (insert default; new enrollments)
+    #   - 'retired' (long_loop_transition after consecutive miss batches)
+    # 'active' and 'cooling' are reserved values for future state-machine
+    # extensions (e.g. trial → active on first hit, active → cooling on
+    # demote); no code path produces them today. The column type stays
+    # TEXT NOT NULL with no CHECK constraint so adding states later does
+    # not require a schema migration.
+    # cadence_bucket values: 'medium', 'slow', 'trial', 'cold'
+    #   (the 'fast' 1h bucket was dropped in design review to avoid
+    #   hammering anti-bot WAFs — see libs/patrol/cadence.py BUCKET_ORDER)
     status = Column(String, nullable=False, server_default=text("'trial'"))
     cadence_bucket = Column(String, nullable=False, server_default=text("'trial'"))
 

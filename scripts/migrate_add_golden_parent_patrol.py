@@ -7,7 +7,7 @@ are performing across golden batches.
 
 Distinct from `url_state_current_*` (the URL frontier). The cron service
 reads this table to find due parents and writes back to `url_state_current_*`
-to set `should_crawl = TRUE` with `source = SOURCE_GOLDEN_PARENT_PATROL` (= 2).
+to set `should_crawl = TRUE` with `source = SOURCE_GOLDEN_PARENT_PATROL` (= 3).
 
 Idempotent via `IF NOT EXISTS`. Indexes are created `CONCURRENTLY` outside
 the table-creation transaction so a partial run can be rerun safely.
