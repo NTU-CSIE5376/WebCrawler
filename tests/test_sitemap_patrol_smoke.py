@@ -6,6 +6,7 @@ IngestorEmitter file layout. No network or DB access.
 """
 from __future__ import annotations
 
+import gzip
 import json
 
 from containers.sitemap_patroller.discover import service as discover_service
@@ -48,6 +49,67 @@ def test_parse_sitemapindex_extracts_nested():
         "https://example.com/sitemap1.xml",
         "https://example.com/sitemap2.xml",
     ]
+
+
+def test_parse_gzipped_urlset_decompresses_then_parses():
+    # Big sites (MLB, news outlets) publish .xml.gz sitemaps; without the
+    # gzip-magic sniff, the parser falls through to "unknown" / parse_error.
+    xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://example.com/a</loc></url>
+  <url><loc>https://example.com/b</loc></url>
+</urlset>
+"""
+    kind, urls = patrol_service.parse_sitemap(gzip.compress(xml))
+    assert kind == "urlset"
+    assert urls == ["https://example.com/a", "https://example.com/b"]
+
+
+def test_parse_gzipped_sitemapindex_extracts_nested():
+    # The case that bit production: MLB's /sitemaps/weekly-news/index.xml.gz
+    # is a sitemap-INDEX served gzipped. The fix has to live in parse_sitemap
+    # (not just at fetch) because each <loc> in this index is ALSO an .xml.gz
+    # that the next patrol cycle re-feeds to parse_sitemap.
+    xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <sitemap><loc>https://example.com/sub-1.xml.gz</loc></sitemap>
+  <sitemap><loc>https://example.com/sub-2.xml.gz</loc></sitemap>
+</sitemapindex>
+"""
+    kind, urls = patrol_service.parse_sitemap(gzip.compress(xml))
+    assert kind == "sitemapindex"
+    assert urls == [
+        "https://example.com/sub-1.xml.gz",
+        "https://example.com/sub-2.xml.gz",
+    ]
+
+
+def test_parse_returns_unknown_for_corrupt_gzip():
+    # Magic bytes match but the rest is junk — must degrade to "unknown",
+    # never raise, so the patrol row gets parse_error instead of crashing
+    # the worker. (This case raises gzip.BadGzipFile, an OSError subclass.)
+    corrupt = b"\x1f\x8b" + b"not-actually-gzip"
+    assert patrol_service.parse_sitemap(corrupt) == ("unknown", [])
+
+
+def test_parse_returns_unknown_for_truncated_gzip():
+    # A valid stream cut short raises EOFError (NOT OSError) from gzip.
+    # The except clause must cover both or the worker crashes mid-batch.
+    full = gzip.compress(b"<urlset>" + b"<url><loc>https://x/a</loc></url>" * 10000 + b"</urlset>")
+    truncated = full[:20]
+    assert patrol_service.parse_sitemap(truncated) == ("unknown", [])
+
+
+def test_parse_returns_unknown_when_decompressed_too_large(monkeypatch):
+    # Refuse to materialise a gzip bomb. Set the cap small for the test;
+    # gzip.compress of a >100-byte payload is well over 100 decompressed.
+    monkeypatch.setattr(patrol_service, "MAX_DECOMPRESSED_BYTES", 100)
+    big_xml = (
+        b"<urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'>"
+        + b"<url><loc>https://example.com/a</loc></url>" * 500
+        + b"</urlset>"
+    )
+    assert patrol_service.parse_sitemap(gzip.compress(big_xml)) == ("unknown", [])
 
 
 def test_parse_skips_non_http_loc():
