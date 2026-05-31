@@ -114,3 +114,57 @@ golden_discovery_ranker_v1:
   #     Override with GOLDEN_DISCOVERY_RANKER_V1_MIN_AGE_DAYS. 0 = no gate.
   rescore_ttl_days: 5
   min_age_days: 3
+
+
+golden_parent_patrol:
+  # Cron-driven (not a supervisord service); see docs/08-golden-parent-patrol.md
+  # for the runbook. Disabled by default so the migration + backfill can land
+  # before any production write happens. Enable with
+  # GOLDEN_PARENT_PATROL_ENABLED=true after backfill is in place.
+  enabled: false
+
+  # Constant url_score written when the cron flips should_crawl=TRUE on a
+  # patrol parent. 1.0 puts patrol parents at the top of the offerer's
+  # ranked candidates without competing against ranker scores numerically.
+  patrol_priority: 1.0
+
+  # next_patrol_at = now() + cadence_buckets[<bucket>] seconds.
+  # Adding or renaming a bucket requires updating libs.patrol.cadence
+  # BUCKET_ORDER as well. The `fast` (1 h) bucket was dropped in design
+  # review to avoid hammering anti-bot WAFs on productive parent pages.
+  cadence_buckets:
+    medium:  21600      # 6h  (fastest cadence)
+    slow:    86400      # 1d
+    trial:   172800     # 2d
+    cold:    345600     # 4d (kept under v2 scorer's 5d TTL — see docs/08 §D1)
+
+  # Short-loop transitions:
+  #   new URL count >= promote_threshold        -> promote one bucket
+  #   no new URL on `demote_threshold` cycles   -> demote one bucket
+  bucket_transitions:
+    promote_threshold: 5
+    demote_threshold:  2
+
+  # Long-loop transitions on each new metric_batches row:
+  #   1st consecutive miss -> demote one bucket
+  #   2nd consecutive miss -> retire (status='retired')
+  retire_policy:
+    consecutive_miss_batches_demote: 1
+    consecutive_miss_batches_retire: 2
+
+  # When the crawler hasn't fetched the parent since the last cron mark,
+  # we re-confirm should_crawl=TRUE without transitioning cadence and
+  # push next_patrol_at out by this much. Avoids penalising parents whose
+  # politeness window is still active.
+  grace_period_seconds: 900       # 15m
+
+  # Max due rows processed per cron invocation. With 10-minute cron and
+  # patrol_state on the order of a few thousand rows, 1000 leaves plenty
+  # of headroom and bounds the per-run wall time.
+  cron_batch_size: 1000
+
+  # Long-loop window: each metric_batch is evaluated against parents that
+  # first-discovered URLs in the cycle ending at the batch's created_at.
+  # Bi-weekly = 14 days; change this and the long-loop becomes mis-aligned
+  # with metric_batches cadence.
+  cycle_days: 14
