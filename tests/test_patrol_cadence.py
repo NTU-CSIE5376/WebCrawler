@@ -18,7 +18,6 @@ from libs.patrol.cadence import (
 def _policy(**overrides) -> CadencePolicy:
     base = dict(
         intervals_sec={
-            "fast": 3600,
             "medium": 21600,
             "slow": 86400,
             "trial": 172800,
@@ -36,13 +35,15 @@ def _policy(**overrides) -> CadencePolicy:
 class BucketOrderTest(unittest.TestCase):
     def test_promote_moves_left(self):
         self.assertEqual(promote_bucket("cold"), "trial")
-        self.assertEqual(promote_bucket("medium"), "fast")
+        self.assertEqual(promote_bucket("slow"), "medium")
 
-    def test_promote_at_fast_is_noop(self):
-        self.assertEqual(promote_bucket("fast"), "fast")
+    def test_promote_at_medium_is_noop(self):
+        # "medium" (6h) is the fastest bucket; "fast" (1h) was dropped in
+        # review to spare anti-bot rate limits.
+        self.assertEqual(promote_bucket("medium"), "medium")
 
     def test_demote_moves_right(self):
-        self.assertEqual(demote_bucket("fast"), "medium")
+        self.assertEqual(demote_bucket("medium"), "slow")
         self.assertEqual(demote_bucket("slow"), "trial")
 
     def test_demote_at_cold_is_noop(self):
@@ -56,7 +57,7 @@ class BucketOrderTest(unittest.TestCase):
 class IntervalSecondsTest(unittest.TestCase):
     def test_returns_configured_interval(self):
         p = _policy()
-        self.assertEqual(interval_seconds("fast", p), 3600)
+        self.assertEqual(interval_seconds("medium", p), 21600)
         self.assertEqual(interval_seconds("cold", p), 604800)
 
     def test_unknown_bucket_raises(self):
@@ -69,12 +70,12 @@ class ShortLoopTransitionTest(unittest.TestCase):
     def test_promote_when_new_url_count_meets_threshold(self):
         p = _policy(promote_new_url_threshold=5)
         out = short_loop_transition(
-            current_bucket="medium",
+            current_bucket="slow",
             consecutive_no_new_url=0,
             new_url_count=5,
             policy=p,
         )
-        self.assertEqual(out, ShortLoopOutcome("fast", 0))
+        self.assertEqual(out, ShortLoopOutcome("medium", 0))
 
     def test_promote_resets_no_new_url_counter(self):
         # Even if the parent had been racking up zeros, a single fruitful
@@ -122,15 +123,16 @@ class ShortLoopTransitionTest(unittest.TestCase):
         )
         self.assertEqual(out, ShortLoopOutcome("medium", 0))
 
-    def test_promote_at_fast_caps(self):
+    def test_promote_at_medium_caps(self):
+        # "medium" is now the fastest bucket (was "fast" before review).
         p = _policy(promote_new_url_threshold=5)
         out = short_loop_transition(
-            current_bucket="fast",
+            current_bucket="medium",
             consecutive_no_new_url=0,
             new_url_count=20,
             policy=p,
         )
-        self.assertEqual(out.new_bucket, "fast")
+        self.assertEqual(out.new_bucket, "medium")
 
     def test_demote_at_cold_caps(self):
         p = _policy(demote_no_new_url_threshold=2)
@@ -208,7 +210,7 @@ class LongLoopTransitionTest(unittest.TestCase):
 class PolicyOrderTest(unittest.TestCase):
     def test_bucket_order_is_intrinsic_constant(self):
         # Sanity: the cron and tests both rely on this ordering.
-        self.assertEqual(BUCKET_ORDER, ("fast", "medium", "slow", "trial", "cold"))
+        self.assertEqual(BUCKET_ORDER, ("medium", "slow", "trial", "cold"))
 
 
 if __name__ == "__main__":

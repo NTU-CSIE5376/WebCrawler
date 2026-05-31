@@ -14,7 +14,7 @@ Pure functions, no IO. Two loops feed in here:
     (two consecutive misses → out).
 
 The bucket set, thresholds, and interval values are config-driven; only
-the *order* (fast → cold) is intrinsic. Adding a bucket means adding it
+the *order* (medium → cold) is intrinsic. Adding a bucket means adding it
 to the policy and updating BUCKET_ORDER.
 """
 from __future__ import annotations
@@ -24,8 +24,10 @@ from dataclasses import dataclass
 
 # Ordered fastest → slowest. Promotion moves left, demotion moves right.
 # When a bucket sits at the end of the array, further promotion / demotion
-# in that direction is a no-op.
-BUCKET_ORDER: tuple[str, ...] = ("fast", "medium", "slow", "trial", "cold")
+# in that direction is a no-op. "medium" is the fastest bucket (6h) —
+# faster (1h) was dropped in review to avoid hammering anti-bot WAFs on
+# the productive parent pages.
+BUCKET_ORDER: tuple[str, ...] = ("medium", "slow", "trial", "cold")
 
 
 @dataclass(frozen=True)
@@ -54,7 +56,7 @@ def interval_seconds(bucket: str, policy: CadencePolicy) -> int:
 
 
 def promote_bucket(bucket: str) -> str:
-    """Move one step toward `fast`. No-op if already at fastest."""
+    """Move one step toward the fastest bucket. No-op if already at the fastest."""
     if bucket not in BUCKET_ORDER:
         return bucket
     idx = BUCKET_ORDER.index(bucket)

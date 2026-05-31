@@ -11,13 +11,13 @@ from libs.patrol.evaluation import (
     aggregate_hits_by_parent_key,
     apply_evaluation,
     bucket_urls_by_shard,
+    find_pending_batches,
 )
 
 
 def _policy() -> CadencePolicy:
     return CadencePolicy(
         intervals_sec={
-            "fast": 3600,
             "medium": 21600,
             "slow": 86400,
             "trial": 172800,
@@ -265,6 +265,66 @@ class ApplyEvaluationTest(unittest.TestCase):
         self.assertIn("last_eval_batch_id = %s", sql)
         self.assertNotIn("cadence_bucket", sql)
         self.assertEqual(params, (42, "https://example.com/e"))
+
+
+class FindPendingBatchesTest(unittest.TestCase):
+    """Pin the cross-DB cursor logic: cron should only evaluate batches
+    whose id is strictly greater than the minimum last_eval_batch_id across
+    non-retired patrol rows. If a single row is still behind, all batches
+    above its cursor must come back so no batch is silently skipped."""
+
+    def _conn_with_select(self, result):
+        cur = MagicMock()
+        if isinstance(result, list):
+            cur.fetchall.return_value = result
+        else:
+            cur.fetchone.return_value = result
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cur
+        return conn, cur
+
+    def test_returns_batches_strictly_greater_than_min_cursor(self):
+        crawler_conn, crawler_cur = self._conn_with_select((5,))
+        batch_rows = [
+            (6, datetime(2026, 5, 1, tzinfo=timezone.utc)),
+            (7, datetime(2026, 5, 15, tzinfo=timezone.utc)),
+        ]
+        metric_conn, metric_cur = self._conn_with_select(batch_rows)
+
+        out = find_pending_batches(
+            metric_conn=metric_conn, crawler_conn=crawler_conn
+        )
+        self.assertEqual([b.batch_id for b in out], [6, 7])
+
+        # crawler runs the MIN query, then metric runs WHERE id > cursor.
+        crawler_cur.execute.assert_called_once()
+        metric_cur.execute.assert_called_once()
+        _, params = metric_cur.execute.call_args[0]
+        self.assertEqual(params, (5,))
+
+    def test_returns_empty_when_no_new_batches(self):
+        crawler_conn, _ = self._conn_with_select((10,))
+        metric_conn, _ = self._conn_with_select([])  # nothing > 10
+        out = find_pending_batches(
+            metric_conn=metric_conn, crawler_conn=crawler_conn
+        )
+        self.assertEqual(out, [])
+
+    def test_returns_all_batches_when_no_patrol_rows_yet(self):
+        # COALESCE(MIN(...), 0) handles the empty-table case (e.g. before
+        # backfill has run); every batch in metricdb should come back.
+        crawler_conn, _ = self._conn_with_select((0,))
+        batch_rows = [
+            (1, datetime(2026, 1, 1, tzinfo=timezone.utc)),
+            (2, datetime(2026, 1, 15, tzinfo=timezone.utc)),
+        ]
+        metric_conn, metric_cur = self._conn_with_select(batch_rows)
+        out = find_pending_batches(
+            metric_conn=metric_conn, crawler_conn=crawler_conn
+        )
+        self.assertEqual([b.batch_id for b in out], [1, 2])
+        _, params = metric_cur.execute.call_args[0]
+        self.assertEqual(params, (0,))
 
 
 if __name__ == "__main__":

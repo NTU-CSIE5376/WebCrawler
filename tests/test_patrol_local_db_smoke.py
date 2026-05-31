@@ -37,7 +37,6 @@ from libs.patrol.cron_loop import (
 
 WEBCRAWLER = Path(__file__).resolve().parents[1]
 INGEST_CONFIG = WEBCRAWLER / "containers/scheduler_ingest/config/ingest.yaml"
-SPLIT_CONFIG = INGEST_CONFIG.parent / "shard_split.yaml"
 
 NUM_SHARDS = 256
 
@@ -68,7 +67,7 @@ class GoldenParentPatrolLocalDBSmokeTest(unittest.TestCase):
                  row for the zero-golden control.
     * Step 5   — backfill is idempotent on rerun.
     * Step 6   — short loop fresh path: enqueues into url_state_current
-                 with source=2 / url_score=1.0 / should_crawl=TRUE.
+                 with source=3 / url_score=1.0 / should_crawl=TRUE.
     * Step 7   — short loop transitioned path: discovers 3 new child
                  URLs across multiple shards (proves the all-shards
                  UNION ALL works), promotes cadence trial -> slow.
@@ -83,7 +82,10 @@ class GoldenParentPatrolLocalDBSmokeTest(unittest.TestCase):
         self.conn = psycopg2.connect(dsn)
         self.conn.autocommit = True
 
-        overrides, splits = load_sharding_config(INGEST_CONFIG, SPLIT_CONFIG)
+        # load_sharding_config takes a crawlerdb connection (not a path)
+        # because split_subdomains lives in the shard_split DB table, not
+        # in a yaml file.
+        overrides, splits = load_sharding_config(INGEST_CONFIG, self.conn)
         self.overrides = overrides
         self.splits = splits
 
@@ -272,7 +274,7 @@ class GoldenParentPatrolLocalDBSmokeTest(unittest.TestCase):
         aggs = aggregate_by_parent_key(all_rows, self.overrides, self.splits)
         self.assertEqual(len(aggs), 2, f"expected 2 parents, got {list(aggs)}")
 
-        upserted, _ = upsert(self.conn, aggs, last_eval, dry_run=False)
+        upserted = upsert(self.conn, aggs, last_eval, dry_run=False)
         self.conn.commit()
 
         with self.conn.cursor() as cur:
@@ -300,7 +302,6 @@ class GoldenParentPatrolLocalDBSmokeTest(unittest.TestCase):
         cfg = PatrolConfig(
             cadence_policy=CadencePolicy(
                 intervals_sec={
-                    "fast": 3600,
                     "medium": 21600,
                     "slow": 86400,
                     "trial": 172800,

@@ -47,7 +47,6 @@ INGEST_CONFIG = (
     Path(__file__).resolve().parents[1]
     / "containers/scheduler_ingest/config/ingest.yaml"
 )
-SPLIT_CONFIG = INGEST_CONFIG.parent / "shard_split.yaml"
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -99,7 +98,6 @@ def main() -> None:
         return
 
     config = parse_patrol_config(section)
-    overrides, split_subdomains = load_sharding_config(INGEST_CONFIG, SPLIT_CONFIG)
 
     if args.dry_run:
         logger.info(
@@ -121,6 +119,10 @@ def main() -> None:
         raise
 
     try:
+        # load_sharding_config takes a crawlerdb connection (not a path) since
+        # split_subdomains lives in the shard_split DB table.
+        overrides, split_subdomains = load_sharding_config(INGEST_CONFIG, crawler_conn)
+
         result = run_once(
             metric_conn=metric_conn,
             crawler_conn=crawler_conn,

@@ -41,10 +41,11 @@ from libs.patrol.evaluation import (
 logger = logging.getLogger("golden_parent_patrol.cron")
 
 
-# Source enum for url_state_current.source (= 2 for patrol). Hard-coded
-# here to avoid an extra config indirection; the value is also defined in
-# scripts/constants.py and the design doc.
-SOURCE_GOLDEN_PARENT_PATROL = 2
+# Source enum for url_state_current.source (= 3 for patrol). Hard-coded
+# here to avoid an extra config indirection. MUST stay in sync with
+# scripts/constants.SOURCE_GOLDEN_PARENT_PATROL — value is 3 (not 2),
+# because 2 is already used by SOURCE_PAGEVIEW (wiki_pageview_inject).
+SOURCE_GOLDEN_PARENT_PATROL = 3
 
 
 @dataclass
@@ -94,8 +95,8 @@ def fetch_last_observed_fetch(
 ) -> datetime | None:
     """Read url_state_current_{shard}.last_fetch_ok for this parent.
 
-    Returns None if the row does not exist (e.g. WAT parent the crawler
-    has never fetched yet).
+    Returns None if the row does not exist (e.g. a newly enrolled parent
+    the crawler has not yet been told to fetch).
     """
     table = f"url_state_current_{shard_id:03d}"
     with crawler_conn.cursor() as cur:
@@ -197,9 +198,10 @@ def enqueue_parent_for_crawl(
 ) -> None:
     """Set should_crawl=TRUE on the patrol parent's url_state_current row.
 
-    INSERT-or-UPDATE. INSERT path covers WAT / manual parents that the
-    crawler has never seen before; UPDATE path covers live_observed
-    parents already in the frontier.
+    INSERT-or-UPDATE. UPDATE path covers live_observed parents the crawler
+    has already seen; INSERT path is kept as a safety net for parents whose
+    url_state_current row was pruned, or for future source_types whose
+    parents the crawler has not yet seen.
     """
     domain_id, domain_score = ensure_domain(
         crawler_conn,
@@ -350,11 +352,23 @@ def process_due_parent(
     )
 
     next_interval = interval_seconds(outcome.new_bucket, config.cadence_policy)
+    # Fetch-anchored cadence: the cadence interval is the time we want to
+    # give the parent to accumulate new outlinks BETWEEN FETCHES, not
+    # between cron marks. If the crawler fetched late (e.g. we marked at
+    # T=0, it actually fetched at T=2h on a 6h cadence), the next patrol
+    # should be at T=8h (fetch + interval), not at T=6h+6h=T=12h that a
+    # `now + interval` formula would give.
+    # `max(..., now)` keeps the schedule from sliding into the past when
+    # the cron itself ran late.
+    next_patrol_at = max(
+        last_observed_fetch_at + timedelta(seconds=next_interval),
+        now,
+    )
     write_short_loop_outcome(
         crawler_conn,
         parent_key=parent.parent_key,
         new_bucket=outcome.new_bucket,
-        next_patrol_at=now + timedelta(seconds=next_interval),
+        next_patrol_at=next_patrol_at,
         last_patrol_at=now,
         last_observed_fetch_at=last_observed_fetch_at,
         last_seen_new_url_count=new_url_count,
