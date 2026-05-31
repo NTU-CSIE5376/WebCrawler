@@ -8,7 +8,9 @@ them by normalized parent URL, and inserts a `live_observed` patrol row for
 each parent that first-discovered at least one golden child.
 
 Idempotent. On conflict the script:
-  - upgrades a `wat_exact` row to `live_observed` (live evidence is stronger),
+  - re-asserts `source_type = 'live_observed'` (no-op today; future-proofs
+    against other loaders that might enroll the same parent under a
+    different source_type).
   - merges the alias set,
   - refreshes `lifetime_golden_child_count` from the live count,
   - leaves operational fields (status, cadence_bucket, next_patrol_at,
@@ -18,6 +20,17 @@ Newly enrolled rows bootstrap `last_eval_batch_id = MAX(metric_batches.id)`
 so future delayed evaluations only credit/blame batches that opened
 *after* enrollment (avoids retroactive miss penalties).
 
+⚠️ Coupling with cron evaluation (libs/patrol/evaluation.py):
+    `lifetime_golden_child_count` is REPLACED here (live snapshot) but
+    the cron's long-loop INCREMENTS the same column
+    (`lifetime_golden_child_count + cycle_hits` per evaluated batch).
+    The two should agree in steady state — both ultimately count
+    distinct first-discovered children — but transient divergence is
+    possible if this script runs between cron's per-batch evaluations.
+    Recommended ordering when running both: invoke this backfill BEFORE
+    the cron's long-loop fires for the latest batch (or accept that
+    the count is approximate and self-corrects on next backfill run).
+
 Usage:
     uv run scripts/backfill_golden_parent_patrol.py [--dry-run] [--limit-shards N]
 """
@@ -25,7 +38,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-from collections import defaultdict
 from pathlib import Path
 
 import psycopg2
@@ -44,7 +56,6 @@ INGEST_CONFIG = (
     Path(__file__).resolve().parents[1]
     / "containers/scheduler_ingest/config/ingest.yaml"
 )
-SPLIT_CONFIG = INGEST_CONFIG.parent / "shard_split.yaml"
 
 # Inline copies of golden_inject's helpers to avoid scripts/-as-package import
 # gymnastics; both live in golden_inject.py too.
@@ -146,8 +157,9 @@ VALUES (
     %(metadata_json)s
 )
 ON CONFLICT (parent_key) DO UPDATE SET
-    -- live_observed is a strict upgrade over wat_exact; if existing is
-    -- already live_observed the assignment is a no-op.
+    -- Re-assert source_type for future loaders; MVP-only loader so this is
+    -- a no-op today, but keeps the contract explicit when other source_types
+    -- land.
     source_type = 'live_observed',
     -- merge alias sets: keep order, dedupe.
     aliases = (
@@ -175,11 +187,10 @@ def upsert(
     aggregates: dict[str, ParentAggregate],
     last_eval_batch_id: int,
     dry_run: bool,
-) -> tuple[int, int]:
+) -> int:
     if not aggregates:
-        return 0, 0
+        return 0
 
-    inserted = 0
     if dry_run:
         for key, agg in aggregates.items():
             log.info(
@@ -189,8 +200,9 @@ def upsert(
                 len(agg.raw_urls),
                 agg.shard_id,
             )
-        return len(aggregates), 0
+        return len(aggregates)
 
+    inserted = 0
     with crawler_conn.cursor() as cur:
         for agg in aggregates.values():
             fetch_url = sorted(agg.raw_urls)[0]
@@ -209,7 +221,7 @@ def upsert(
             )
             inserted += 1
     crawler_conn.commit()
-    return inserted, 0
+    return inserted
 
 
 def main():
@@ -231,8 +243,6 @@ def main():
     )
     args = parser.parse_args()
 
-    overrides, split_subdomains = load_sharding_config(INGEST_CONFIG, SPLIT_CONFIG)
-
     metric_conn = psycopg2.connect(**METRICDB)
     try:
         crawler_conn = psycopg2.connect(**CRAWLERDB)
@@ -241,6 +251,10 @@ def main():
         raise
 
     try:
+        # load_sharding_config takes a crawlerdb connection (not a path) since
+        # split_subdomains lives in the shard_split DB table, not in a yaml.
+        overrides, split_subdomains = load_sharding_config(INGEST_CONFIG, crawler_conn)
+
         last_eval_batch_id = fetch_max_metric_batch_id(metric_conn)
         log.info(
             "bootstrap last_eval_batch_id from metric_batches: %d",
@@ -270,7 +284,7 @@ def main():
         )
         log.info("aggregated to %d parent_keys", len(aggregates))
 
-        upserted, _ = upsert(
+        upserted = upsert(
             crawler_conn, aggregates, last_eval_batch_id, args.dry_run
         )
 
