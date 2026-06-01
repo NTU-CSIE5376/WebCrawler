@@ -171,9 +171,11 @@ def ensure_domain(crawler_conn, *, domain: str, shard_id: int) -> tuple[int, flo
 
 # Order-aware INSERT-or-UPDATE: matches the precedent in
 # scripts/golden_inject.py (force-overwrite source, idempotent enqueue).
-# patrol writes url_score = 1.0 and url_score_updated_at = NOW() so the
-# background scorer (which only scores rows with NULL updated_at) will
-# never re-score a patrol-marked row.
+# patrol writes url_score = 1.0 and url_score_updated_at = NOW(). The v2
+# background scorer re-picks rows with updated_at older than its TTL
+# (currently 5 d), so durability relies on cadence buckets staying under
+# that window — the cold bucket is capped at 4 d for this reason. See
+# docs/08-golden-parent-patrol.md §D1.
 ENQUEUE_SQL_TEMPLATE = """
 INSERT INTO url_state_current_{shard:03d} (
     url, domain_id, domain_score,

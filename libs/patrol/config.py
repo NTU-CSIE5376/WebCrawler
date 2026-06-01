@@ -114,7 +114,7 @@ def parse_patrol_config(raw: Mapping[str, Any]) -> PatrolConfig:
           medium: 21600
           slow: 86400
           trial: 172800
-          cold: 604800
+          cold: 345600
         bucket_transitions:
           promote_threshold: 5
           demote_threshold: 2

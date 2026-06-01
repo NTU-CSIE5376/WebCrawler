@@ -13,7 +13,7 @@ def _valid_raw() -> dict:
             "medium": 21600,
             "slow": 86400,
             "trial": 172800,
-            "cold": 604800,
+            "cold": 345600,
         },
         "bucket_transitions": {
             "promote_threshold": 5,
@@ -39,7 +39,7 @@ class ParsePatrolConfigTest(unittest.TestCase):
 
         p = cfg.cadence_policy
         self.assertEqual(p.intervals_sec["medium"], 21600)
-        self.assertEqual(p.intervals_sec["cold"], 604800)
+        self.assertEqual(p.intervals_sec["cold"], 345600)
         self.assertEqual(p.promote_new_url_threshold, 5)
         self.assertEqual(p.demote_no_new_url_threshold, 2)
         self.assertEqual(p.retire_consecutive_miss_batches, 2)

@@ -22,7 +22,7 @@ def _config() -> PatrolConfig:
                 "medium": 21600,
                 "slow": 86400,
                 "trial": 172800,
-                "cold": 604800,
+                "cold": 345600,
             },
             promote_new_url_threshold=5,
             demote_no_new_url_threshold=2,
