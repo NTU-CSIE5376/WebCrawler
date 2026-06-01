@@ -83,46 +83,13 @@ def extract_youtube_outlinks(
     return outlinks
 
 
-def _scan_json_object(text: str, start: int) -> tuple[int, int] | None:
-    if start >= len(text) or text[start] != "{":
-        return None
-
-    stack: list[str] = []
-    i = start
-    in_string = False
-    while i < len(text):
-        c = text[i]
-        if in_string:
-            if c == "\\":
-                i += 2
-                continue
-            elif c == '"':
-                in_string = False
-        else:
-            if c == '"':
-                in_string = True
-            elif c == "{":
-                stack.append("}")
-            elif c == "[":
-                stack.append("]")
-            elif c == "}" or c == "]":
-                if not stack or stack[-1] != c:
-                    return None
-                stack.pop()
-                if not stack:
-                    return (start, i + 1)
-        i += 1
-    return None
-
-
 def _find_all_yt_json(text: str, prefix_re: re.Pattern) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
+    decoder = json.JSONDecoder()
     for m in prefix_re.finditer(text):
-        span = _scan_json_object(text, m.end())
-        if not span:
-            continue
         try:
-            results.append(json.loads(text[span[0] : span[1]]))
+            obj, _ = decoder.raw_decode(text, m.end())
+            results.append(obj)
         except json.JSONDecodeError:
             continue
     return results
