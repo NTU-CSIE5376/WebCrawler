@@ -8,6 +8,8 @@ ingestor consumes them with no changes.
 """
 from __future__ import annotations
 
+import gzip
+import io
 import logging
 import os
 import time
@@ -35,6 +37,9 @@ logger = logging.getLogger("sitemap_patrol")
 
 FETCH_TIMEOUT_SEC = 10.0
 MAX_RESPONSE_BYTES = 50 * 1024 * 1024
+# Sitemap protocol spec caps an uncompressed sitemap at 50 MiB; allow a little
+# headroom but refuse to materialise unbounded gzip bombs into RAM.
+MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024
 MAX_URL_LEN = 2500  # match ingestor's MAX_URL_LEN
 SNIFF_PREFIX_BYTES = 4096
 
@@ -83,7 +88,38 @@ def _localname(tag: str) -> str:
 
 def parse_sitemap(body: bytes) -> tuple[str, list[str]]:
     """Return (kind, urls). kind is 'urlset', 'sitemapindex', or 'unknown'.
-    URLs are <loc> text, trimmed, absolute http(s) only, capped at MAX_URL_LEN."""
+    URLs are <loc> text, trimmed, absolute http(s) only, capped at MAX_URL_LEN.
+
+    Handles gzip-compressed sitemaps (.xml.gz) by sniffing the gzip magic
+    bytes (1f 8b). Big sites publish their sitemap-INDEX as .xml.gz (MLB,
+    weather.com, many news outlets); without this, every .gz file fell into
+    the unknown / parse_error path. We do not look at the URL suffix or the
+    Content-Type header because some servers mislabel either; the two-byte
+    magic is the authoritative signal.
+    """
+    if body[:2] == b"\x1f\x8b":
+        # OSError: gzip.BadGzipFile on bad header / wrong format.
+        # EOFError: stream truncated mid-decode (real failure mode for
+        # aborted responses; gzip.decompress does NOT raise OSError here).
+        try:
+            with gzip.GzipFile(fileobj=io.BytesIO(body)) as gz:
+                # read one byte past the cap so we can detect "would have
+                # exceeded" without trusting the embedded size header.
+                decompressed = gz.read(MAX_DECOMPRESSED_BYTES + 1)
+        except (OSError, EOFError) as e:
+            logger.info(
+                "patrol.gzip_decompress_error",
+                extra={"event": "patrol.gzip_decompress_error", "err": str(e)},
+            )
+            return "unknown", []
+        if len(decompressed) > MAX_DECOMPRESSED_BYTES:
+            logger.info(
+                "patrol.gzip_too_large",
+                extra={"event": "patrol.gzip_too_large",
+                       "decompressed_bytes_at_least": len(decompressed)},
+            )
+            return "unknown", []
+        body = decompressed
     head = body[:SNIFF_PREFIX_BYTES].lower()
     if b"<urlset" not in head and b"<sitemapindex" not in head:
         return "unknown", []
