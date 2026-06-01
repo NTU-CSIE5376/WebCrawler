@@ -17,9 +17,43 @@ class FeatureDB:
     Updates:
       - content_feature_current_{shard}
       - content_feature_history_{shard}
+      - youtube_video_meta (current-only, unsharded)
     """
     def __init__(self, Session: sessionmaker):
         self.Session = Session
+
+    def process_youtube(self, rec: dict) -> None:
+        if len(rec["url"]) > MAX_URL_LEN:
+            return
+        with self.Session() as sess:
+            try:
+                sess.execute(
+                    text("""
+                    INSERT INTO youtube_video_meta (
+                      video_id, url, channel_id, channel_title, video_title,
+                      view_count, length_seconds, keywords, fetched_at
+                    )
+                    VALUES (
+                      :video_id, :url, :channel_id, :channel_title, :video_title,
+                      :view_count, :length_seconds, :keywords, :fetched_at
+                    )
+                    ON CONFLICT (video_id) DO UPDATE SET
+                      url = EXCLUDED.url,
+                      channel_id = EXCLUDED.channel_id,
+                      channel_title = EXCLUDED.channel_title,
+                      video_title = EXCLUDED.video_title,
+                      view_count = EXCLUDED.view_count,
+                      length_seconds = EXCLUDED.length_seconds,
+                      keywords = EXCLUDED.keywords,
+                      fetched_at = EXCLUDED.fetched_at
+                      ;
+                    """),
+                    rec,
+                )
+                sess.commit()
+            except Exception as e:
+                sess.rollback()
+                raise e
 
     def _tcur(self, shard_id: int) -> str:
         return f"content_feature_current_{shard_id:03d}"
