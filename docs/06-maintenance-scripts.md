@@ -162,7 +162,7 @@ Shared constants:
 
 - `NUM_SHARDS = 256`
 - `CRAWLERDB`, `METRICDB`: psycopg2 connection kwargs
-- `SOURCE_NATURAL = 0`, `SOURCE_GOLDEN = 1`, `SOURCE_PAGEVIEW = 2`: values for `url_state_current.source`
+- `SOURCE_NATURAL = 0`, `SOURCE_GOLDEN = 1`, `SOURCE_PAGEVIEW = 2`, `SOURCE_GOLDEN_PARENT_PATROL = 3`: values for `url_state_current.source`
 
 The `DISCOVERY_SOURCE_*` constants for the "new outlink candidate" IPC
 record live in `libs/ipc/new_link_record.py` (`DISCOVERY_SOURCE_UNKNOWN = 0`,
@@ -338,3 +338,79 @@ uv run scripts/oneoff_drop_trap_frontier.py --execute --include-history
 uv run scripts/wiki_pageview_inject.py [--dry-run] [--skip-inject]
 docker compose exec scheduler_ingest python scripts/wiki_pageview_inject.py --retention-days 30
 ```
+
+## 6.18 `migrate_add_golden_parent_patrol.py`
+
+- One-time migration.
+- Creates the global `golden_parent_patrol_state` table (single table, not sharded) plus two indexes:
+  - `idx_golden_parent_patrol_state_due` partial on `(next_patrol_at) WHERE status <> 'retired'` — hot path for the cron's "find due parents" query.
+  - `idx_golden_parent_patrol_state_domain` on `(parent_domain)` — analysis grouping.
+- Indexes are `CONCURRENTLY` outside the table-creation transaction so a partial run is safe to rerun.
+- Idempotent via `IF NOT EXISTS`.
+- PG 11+ treats `CREATE TABLE IF NOT EXISTS` as metadata-only.
+- Background and full schema rationale: see [`08-golden-parent-patrol.md`](08-golden-parent-patrol.md).
+
+```bash
+uv run scripts/migrate_add_golden_parent_patrol.py [--dry-run]
+```
+
+## 6.19 `backfill_golden_parent_patrol.py`
+
+- Recurring (intended after each new metric_batch is added so newly first-discovered golden URLs are credited to their parents).
+- Scans every `url_state_current_{shard}` for rows where `source = SOURCE_GOLDEN AND discovered_from IS NOT NULL`, normalizes `discovered_from` via `libs.patrol.normalize.normalize_parent_url`, aggregates by normalized `parent_key`, and upserts into `golden_parent_patrol_state` as `source_type='live_observed'`.
+- Bootstraps `last_eval_batch_id = MAX(metric_batches.id)` on first enrollment so the long-loop evaluation does not retroactively penalise newly enrolled parents.
+- Idempotent. ON CONFLICT it re-asserts `source_type='live_observed'`, merges the alias set, and refreshes `lifetime_golden_child_count` from the latest scan. (MVP only ships the `live_observed` loader; the WAT loader from the original design was dropped in review — see [`08-golden-parent-patrol.md`](08-golden-parent-patrol.md) §Scope.)
+
+> ⚠️ **Coupling with cron evaluation**: this script REPLACES `lifetime_golden_child_count` with the live snapshot, while the cron's long-loop INCREMENTS the same column by `cycle_hits` per evaluated batch. The two ultimately agree in steady state, but transient drift is possible if the backfill runs after cron has partially evaluated a batch. **Recommended ordering: run this backfill BEFORE the cron's long-loop fires for the latest batch**, or accept that the count is approximate and self-corrects on next backfill run.
+
+```bash
+uv run scripts/backfill_golden_parent_patrol.py [--dry-run] [--limit-shards N]
+```
+
+## 6.20 `run_golden_parent_patrol.py`
+
+- Recurring (intended every 10 minutes via cron / k8s CronJob; not a long-running supervisord program).
+- One round: long-loop evaluation of any new metric_batches, then short-loop processing of up to `cron_batch_size` due parents (`next_patrol_at <= NOW() AND status <> 'retired'`).
+- For each due parent, syncs `last_observed_fetch_at` from the parent's `url_state_current_*` row, counts new URLs first-discovered since `last_patrol_at`, runs the cadence transition (libs.patrol.cadence), and INSERT-or-UPDATEs `url_state_current_{shard}` to set `should_crawl = TRUE`, `url_score = patrol_priority`, `url_score_updated_at = NOW()`, and `source = SOURCE_GOLDEN_PARENT_PATROL` (= 3 — value `2` was claimed by `SOURCE_PAGEVIEW` after the patrol design was drafted).
+- No-op when `golden_parent_patrol.enabled = false` in `control.yaml` or when the `GOLDEN_PARENT_PATROL_ENABLED` env var is unset.
+
+```bash
+# manual / smoke
+uv run scripts/run_golden_parent_patrol.py --dry-run
+
+# enabled run (production)
+GOLDEN_PARENT_PATROL_ENABLED=true uv run scripts/run_golden_parent_patrol.py
+```
+
+Recommended rollout order:
+
+1. Run `uv run scripts/migrate_add_golden_parent_patrol.py --dry-run`, then for real.
+2. Run `backfill_golden_parent_patrol.py --dry-run`, inspect counts, then for real.
+3. With `golden_parent_patrol.enabled = false` (default), execute one cron tick of `run_golden_parent_patrol.py --dry-run` to verify config parsing.
+4. Flip `enabled: true` (or set `GOLDEN_PARENT_PATROL_ENABLED=true`) and add the cron entry: `*/10 * * * * cd /app && PYTHONPATH=. python scripts/run_golden_parent_patrol.py >> /var/log/patrol.log 2>&1`.
+
+### Monitoring (first 24 h after enabling)
+
+- **Loki**: filter on `service=golden_parent_patrol`. Healthy run logs `patrol.run_once` once per cron tick (every 10 min) with `long_loop_*` and `short_loop_*` counters. High `short_loop.grace` (> 80% of `short_loop.due`) means the crawler isn't picking up patrol marks; expected for the first few ticks while the watchlist warms up, suspicious after an hour.
+- **DB**: the cron's `count_new_urls_since` issues a 256-way `UNION ALL` per due parent. Watch `pg_stat_statements` for `url_state_current_*` reads and the patrol_state table CPU during the first cron tick. If query latency exceeds the 10-minute interval, lower `cron_batch_size` in `control.yaml`.
+- **Coverage signal**: track `golden_parent_patrol_state` row counts per (status, cadence_bucket) hourly. Sudden growth in `retired` means the long-loop is judging parents too harshly — sanity-check `retire_policy` thresholds before they all die.
+
+### Rollback
+
+- **Soft kill**: set `GOLDEN_PARENT_PATROL_ENABLED=false` in the scheduler_control env and the next cron tick will no-op. Active patrol-marked `should_crawl=TRUE` rows in `url_state_current_*` are picked up by the regular ingest cycle and naturally cleared.
+- **Hard rollback**: same env flip, plus clear patrol-marked rows from the shard tables (NOT from `golden_parent_patrol_state` — `should_crawl` lives on `url_state_current_*`, not on the watchlist). For each shard `NNN` in `000..255`:
+  ```sql
+  UPDATE url_state_current_NNN SET should_crawl = FALSE WHERE source = 3;
+  ```
+  `source = 3` is `SOURCE_GOLDEN_PARENT_PATROL`, so this only clears patrol's writes — other sources (golden_inject, pageview, natural ingest) are untouched. The `golden_parent_patrol_state` table itself can be left in place — an empty cron is safe.
+- **Removing the table**: only needed if reverting the schema migration. `DROP TABLE golden_parent_patrol_state` plus dropping the two indexes; no other table references this one (no FKs).
+
+### Tuning (the magic numbers are unmeasured defaults)
+
+The `bucket_transitions` and `retire_policy` values shipped in `control.yaml` are reasoned defaults but **not measured against production parent yield distributions**. After the first metric_batch closes with patrol enabled:
+
+- Plot a histogram of `last_seen_new_url_count` across active patrol rows. If 80%+ are below `promote_threshold` (currently `5`), most parents will be stuck in `trial` forever — lower `promote_threshold` to roughly the P75 of productive parents.
+- Plot a histogram of `consecutive_no_new_url`. If productive parents commonly hit `2` (the current `demote_threshold`) just from quiet cycles, raise the threshold to `3` to absorb more noise.
+- Check the `retired` row count after the first long-loop run. If more than ~10% of the watchlist retired on the first batch, `retire_policy.consecutive_miss_batches_retire` is too aggressive — bump to `3` to give parents one more chance.
+
+All of these are yaml-only changes, no redeploy needed; just restart the cron.
