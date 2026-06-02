@@ -398,7 +398,11 @@ Recommended rollout order:
 ### Rollback
 
 - **Soft kill**: set `GOLDEN_PARENT_PATROL_ENABLED=false` in the scheduler_control env and the next cron tick will no-op. Active patrol-marked `should_crawl=TRUE` rows in `url_state_current_*` are picked up by the regular ingest cycle and naturally cleared.
-- **Hard rollback**: same env flip, plus `UPDATE golden_parent_patrol_state SET should_crawl=FALSE WHERE ...` if there's a specific bad batch to clear. The `golden_parent_patrol_state` table itself can be left in place — empty cron is safe.
+- **Hard rollback**: same env flip, plus clear patrol-marked rows from the shard tables (NOT from `golden_parent_patrol_state` — `should_crawl` lives on `url_state_current_*`, not on the watchlist). For each shard `NNN` in `000..255`:
+  ```sql
+  UPDATE url_state_current_NNN SET should_crawl = FALSE WHERE source = 3;
+  ```
+  `source = 3` is `SOURCE_GOLDEN_PARENT_PATROL`, so this only clears patrol's writes — other sources (golden_inject, pageview, natural ingest) are untouched. The `golden_parent_patrol_state` table itself can be left in place — an empty cron is safe.
 - **Removing the table**: only needed if reverting the schema migration. `DROP TABLE golden_parent_patrol_state` plus dropping the two indexes; no other table references this one (no FKs).
 
 ### Tuning (the magic numbers are unmeasured defaults)
