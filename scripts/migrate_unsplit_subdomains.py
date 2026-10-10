@@ -14,6 +14,7 @@ url_event_counter.
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
 
 import psycopg2
@@ -22,6 +23,10 @@ import tldextract
 from constants import CRAWLERDB
 from libs.config.loader import load_yaml
 from libs.db.sharding.key import compute_shard, load_sharding_config
+from libs.obslog import configure as configure_logging
+
+
+log = logging.getLogger(__name__)
 
 REPO = Path(__file__).resolve().parents[1]
 INGEST_CFG = REPO / "containers/scheduler_ingest/config/ingest.yaml"
@@ -211,24 +216,25 @@ def main() -> None:
     p.add_argument("--execute", dest="dry_run", action="store_false",
                    help="Actually move rows. Requires pipeline pause beforehand.")
     args = p.parse_args()
+    configure_logging(service="migrate_unsplit_subdomains")
 
     with psycopg2.connect(**CRAWLERDB) as conn:
         overrides, split_subdomains = load_sharding_config(INGEST_CFG, conn)
         parents = sorted(parents_of(split_subdomains))
         if not parents:
-            print("no parents in shard_split_subdomain")
+            log.info('no parents in shard_split_subdomain')
             return
 
         num_shards = load_num_shards()
         mode = "DRY-RUN" if args.dry_run else "EXECUTE"
-        print(f"mode: {mode}")
-        print(f"split_subdomains: {sorted(split_subdomains)}")
-        print(f"parents: {parents}")
+        log.info(f'mode: {mode}')
+        log.debug(f'split_subdomains: {sorted(split_subdomains)}')
+        log.debug(f'parents: {parents}')
 
         with conn.cursor() as cur:
             for parent in parents:
                 dst_shard = compute_shard(parent, num_shards, overrides, split_subdomains)
-                print(f"\n======== {parent} -> shard {dst_shard:03d} ========")
+                log.info(f'======== {parent} -> shard {dst_shard:03d} ========')
 
                 if args.dry_run:
                     cur.execute("SELECT domain_id FROM domain_state WHERE domain = %s", (parent,))
@@ -239,7 +245,7 @@ def main() -> None:
                     conn.commit()
 
                 victims = find_victims(cur, parent, split_subdomains)
-                print(f"  {len(victims)} non-whitelisted subdomains found")
+                log.info(f'  {len(victims)} non-whitelisted subdomains found')
                 if not victims:
                     continue
 
@@ -256,19 +262,25 @@ def main() -> None:
                             (v_did,),
                         )
                         n_hist = cur.fetchone()[0]
-                        print(f"    [dry] {v_dom:50s} shard={v_shard:03d} did={v_did}  "
-                              f"cur={n_cur:>9,} hist={n_hist:>9,}")
+                        log.info(
+                            f'    [dry] {v_dom:50s} shard={v_shard:03d} did={v_did}  cur={n_cur:>9,} hist='
+                            f'{n_hist:>9,}'
+                        )
                     else:
                         c = move_one(cur, (v_dom, v_shard, v_did), dst_shard, dst_did)
                         conn.commit()
                         for k, v in c.items():
                             grand[k] += v
-                        print(f"    {v_dom:50s} shard={v_shard:03d} did={v_did} -> "
-                              f"shard {dst_shard:03d} did={dst_did}  "
-                              f"cur={c['current']:>9,} hist={c['history']:>9,} evt={c['event']:>9,}")
+                        log.info(
+                            f'    {v_dom:50s} shard={v_shard:03d} did={v_did} -> shard {dst_shard:03d} did='
+                            f"{dst_did}  cur={c['current']:>9,} hist={c['history']:>9,} evt={c['event']:>9,}"
+                        )
 
                 if not args.dry_run:
-                    print(f"  totals: cur={grand['current']:,} hist={grand['history']:,} evt={grand['event']:,}")
+                    log.info(
+                        f"  totals: cur={grand['current']:,} hist={grand['history']:,} evt="
+                        f"{grand['event']:,}"
+                    )
 
 
 if __name__ == "__main__":

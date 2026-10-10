@@ -33,6 +33,7 @@ scheduler_ingest paused) to move existing rows for the new entries.
 from __future__ import annotations
 
 import argparse
+import logging
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -45,6 +46,10 @@ import psycopg2
 from constants import CRAWLERDB
 from libs.config.loader import load_yaml
 from libs.db.sharding.key import SPLIT_TABLE, load_split_subdomains
+from libs.obslog import configure as configure_logging
+
+
+log = logging.getLogger(__name__)
 
 REPO = Path(__file__).resolve().parents[1]
 INGEST_CFG = REPO / "containers/scheduler_ingest/config/ingest.yaml"
@@ -149,6 +154,7 @@ def main() -> None:
     p.add_argument("--execute", action="store_true",
                    help="apply INSERT/DELETE to shard_split_subdomain")
     args = p.parse_args()
+    configure_logging(service="refresh_split_whitelist")
 
     if args.domain and args.top_error_rate:
         p.error("--domain and --top-error-rate are mutually exclusive")
@@ -168,8 +174,8 @@ def main() -> None:
             else:
                 parents = sorted(overrides.keys())
 
-            print(f"scope: {len(parents)} parent(s): {', '.join(parents)}")
-            print(f"min_fetch_ok: {args.min_fetch_ok:,}\n")
+            log.info(f"scope: {len(parents)} parent(s): {', '.join(parents)}")
+            log.info(f'min_fetch_ok: {args.min_fetch_ok:,}')
 
             parent_set = set(parents)
             for parent in parents:
@@ -205,21 +211,22 @@ def main() -> None:
             elif cnt >= args.min_fetch_ok and rb == "ok" and ap == "self":
                 add.append((host, cnt))
 
-        def _print(label: str, sign: str, items: list[tuple[str, int]]) -> None:
-            print(f"{label} ({len(items)}):")
+        def _log_diff(label: str, sign: str, items: list[tuple[str, int]]) -> None:
+            log.info(f'{label} ({len(items)}):')
             for host, cnt in items:
-                print(f"  {sign} {host:55s} fetch_ok={cnt:>10,}"
-                      f"  robots={robots.get(host, '?')}  apex={apex.get(host, '?')}")
-            print()
+                log.info(
+                    f"  {sign} {host:55s} fetch_ok={cnt:>10,}  robots={robots.get(host, '?')}  apex="
+                    f"{apex.get(host, '?')}"
+                )
 
         deferred: list[tuple[str, int]] = []
         if len(add) > args.max_add:
             deferred = add[args.max_add:]
             add = add[:args.max_add]
 
-        _print("ADD", "+", add)
-        _print("REMOVE", "-", remove)
-        _print("KEEP", "=", keep)
+        _log_diff("ADD", "+", add)
+        _log_diff("REMOVE", "-", remove)
+        _log_diff("KEEP", "=", keep)
 
         new_counts = {h: c for h, c in counts.items() if h not in current}
         discovered = len(new_counts)
@@ -229,21 +236,28 @@ def main() -> None:
         keep_ok = sum(c for _, c in keep)
         deferred_ok = sum(c for _, c in deferred)
         pct = lambda n, d: f"{100 * n / d:.1f}%" if d else "-"
-        print("analytics (excluding hosts already in whitelist):")
-        print(f"  subdomains discovered under {len(parents)} parent(s): {discovered:,}")
-        print(f"  passed fetch_ok >= {args.min_fetch_ok:,}: {above_threshold:,} ({pct(above_threshold, discovered)})")
-        print(f"  eligible after robots + apex: {eligible:,} ({pct(eligible, above_threshold)} of above-threshold)")
-        print(f"  ADD this run (max {args.max_add}): {len(add):,}")
-        print(f"  deferred to next run: {len(deferred):,} ({deferred_ok:,} fetch_ok URLs)")
-        print(f"  fetch_ok URLs newly rescued by ADD: {add_ok:,}")
-        print(f"  fetch_ok URLs already covered by KEEP: {keep_ok:,}")
-        print()
+        log.info('analytics (excluding hosts already in whitelist):')
+        log.info(f'  subdomains discovered under {len(parents)} parent(s): {discovered:,}')
+        log.info(
+            f'  passed fetch_ok >= {args.min_fetch_ok:,}: {above_threshold:,} ('
+            f'{pct(above_threshold, discovered)})'
+        )
+        log.info(
+            f'  eligible after robots + apex: {eligible:,} ({pct(eligible, above_threshold)}'
+            f' of above-threshold)'
+        )
+        log.info(f'  ADD this run (max {args.max_add}): {len(add):,}')
+        log.info(f'  deferred to next run: {len(deferred):,} ({deferred_ok:,} fetch_ok URLs)')
+        log.info(f'  fetch_ok URLs newly rescued by ADD: {add_ok:,}')
+        log.info(f'  fetch_ok URLs already covered by KEEP: {keep_ok:,}')
 
         final = sorted((current | {h for h, _ in add}) - {h for h, _ in remove})
 
         if args.execute:
             if args.domain:
-                print("refusing to --execute with --domain (partial scan); rerun without --domain")
+                log.error(
+                    'refusing to --execute with --domain (partial scan); rerun without --domain',
+                )
                 return
             with conn.cursor() as cur:
                 if add:
@@ -257,10 +271,14 @@ def main() -> None:
                         [(h,) for h, _ in remove],
                     )
             conn.commit()
-            print(f"updated {SPLIT_TABLE}: +{len(add)} / -{len(remove)} ({len(final)} entries total)")
-            print("next: scripts/migrate_shard_split.py --execute (with scheduler_ingest paused)")
+            log.info(
+                f'updated {SPLIT_TABLE}: +{len(add)} / -{len(remove)} ({len(final)} entries total)'
+            )
+            log.info(
+                'next: scripts/migrate_shard_split.py --execute (with scheduler_ingest paused)',
+            )
         else:
-            print(f"dry-run. final list would be {len(final)} entries.")
+            log.info(f'dry-run. final list would be {len(final)} entries.')
 
 
 if __name__ == "__main__":

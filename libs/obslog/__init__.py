@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import sys
-from typing import Any
+from typing import Any, TextIO
 
 from pythonjsonlogger import jsonlogger
 
@@ -31,6 +31,8 @@ def configure(
     worker_id: int | str | None = None,
     shard: int | None = None,
     level: int = logging.INFO,
+    *,
+    stream: TextIO | None = None,
 ) -> None:
     global _CONFIGURED
 
@@ -39,7 +41,7 @@ def configure(
         for h in list(root.handlers):
             root.removeHandler(h)
 
-        handler = logging.StreamHandler(sys.stdout)
+        handler = logging.StreamHandler(sys.stdout if stream is None else stream)
         handler.setFormatter(
             jsonlogger.JsonFormatter(
                 fmt="%(asctime)s %(levelname)s %(name)s %(message)s",

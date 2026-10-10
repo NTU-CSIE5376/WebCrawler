@@ -26,6 +26,7 @@ Use --dry-run to print the plan without touching anything.
 from __future__ import annotations
 
 import argparse
+import logging
 from datetime import datetime, timedelta, timezone
 
 import psycopg2
@@ -35,6 +36,10 @@ from libs.db.sharding.history_partition import (
     partition_of_sql,
     months_covering,
 )
+from libs.obslog import configure as configure_logging
+
+
+log = logging.getLogger(__name__)
 
 
 def _table(prefix: str, shard: int) -> str:
@@ -74,7 +79,7 @@ def migrate_shard(conn, prefix: str, shard: int, retention_days: int,
         f"DROP TABLE {table}_old",
     ]
     if dry_run:
-        print("\n".join(plan))
+        log.info("\n".join(plan))
         return
 
     # Phase 1: online build + bulk copy.
@@ -104,7 +109,7 @@ def migrate_shard(conn, prefix: str, shard: int, retention_days: int,
     # Phase 3: reclaim.
     cur.execute(f"DROP TABLE {table}_old")
     conn.commit()
-    print(f"shard {shard}: migrated, kept rows since {cutoff.date()}, dropped {table}_old")
+    log.info(f'shard {shard}: migrated, kept rows since {cutoff.date()}, dropped {table}_old')
 
 
 def main() -> None:
@@ -121,6 +126,7 @@ def main() -> None:
     ap.add_argument("--retention-days", type=int, default=30)
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
+    configure_logging(service="migrate_partition_history")
 
     conn = psycopg2.connect(host=args.host, port=args.port, user=args.user,
                             password=args.password, dbname=args.dbname)

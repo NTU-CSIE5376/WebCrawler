@@ -9,6 +9,7 @@ robots.txt for each host so we don't whitelist a subdomain we cannot crawl.
 from __future__ import annotations
 
 import argparse
+import logging
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from urllib.robotparser import RobotFileParser
@@ -16,6 +17,10 @@ from urllib.robotparser import RobotFileParser
 import psycopg2
 
 from constants import CRAWLERDB
+from libs.obslog import configure as configure_logging
+
+
+log = logging.getLogger(__name__)
 
 HOST_EXTRACT = "LOWER(SUBSTRING(url FROM '^https?://([^/:]+)'))"
 
@@ -55,8 +60,9 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("domain", help="eTLD+1, e.g. facebook.com")
-    p.add_argument("--top", type=int, default=50, help="rows to print (default 50)")
+    p.add_argument("--top", type=int, default=50, help="rows to display (default 50)")
     args = p.parse_args()
+    configure_logging(service="show_subdomain_counts")
 
     parent = args.domain.lower()
     with psycopg2.connect(**CRAWLERDB) as conn:
@@ -71,7 +77,7 @@ def main() -> None:
             )
             rows = cur.fetchall()
             if not rows:
-                print(f"no domain_state rows for {parent}")
+                log.warning(f'no domain_state rows for {parent}')
                 return
 
             counts: dict[str, int] = defaultdict(int)
@@ -93,12 +99,12 @@ def main() -> None:
             ):
                 robots[host] = status
 
-    print(f"{parent}: {len(counts)} hostnames, {total:,} URLs with fetch_ok")
-    print(f"  scanned {len(rows)} domain_state row(s)\n")
-    print(f"  {'host':55s} {'fetch_ok':>12s}  {'robots':>8s}  shards")
+    log.info(f'{parent}: {len(counts)} hostnames, {total:,} URLs with fetch_ok')
+    log.info(f'  scanned {len(rows)} domain_state row(s)')
+    log.info(f"  {'host':55s} {'fetch_ok':>12s}  {'robots':>8s}  shards")
     for host, c in items:
         sh = ",".join(f"{s:03d}" for s in sorted(sources[host]))
-        print(f"  {host[:55]:55s} {c:>12,}  {robots.get(host, '?'):>8s}  {sh}")
+        log.info(f"  {host[:55]:55s} {c:>12,}  {robots.get(host, '?'):>8s}  {sh}")
 
 
 if __name__ == "__main__":

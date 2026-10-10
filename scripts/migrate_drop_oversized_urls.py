@@ -20,10 +20,15 @@ insertion paths, so no concurrent inserts can land that we'd be racing.
 from __future__ import annotations
 
 import argparse
+import logging
 
 import psycopg2
 
 from constants import CRAWLERDB, NUM_SHARDS
+from libs.obslog import configure as configure_logging
+
+
+log = logging.getLogger(__name__)
 
 CAP = 2500
 
@@ -49,7 +54,7 @@ def sweep_sharded(cur, dry_run: bool) -> dict[str, int]:
                 n = cur.rowcount
             totals[tbl] += n
             if n:
-                print(f"  shard {shard:03d}  {tbl:25s} {n:>9,}")
+                log.info(f'  shard {shard:03d}  {tbl:25s} {n:>9,}')
     return totals
 
 
@@ -67,7 +72,7 @@ def sweep_url_link(cur, dry_run: bool) -> int:
         )
         n = cur.rowcount
     if n:
-        print(f"  url_link {n:,}")
+        log.info(f'  url_link {n:,}')
     return n
 
 
@@ -78,9 +83,10 @@ def main() -> None:
     p.add_argument("--execute", dest="dry_run", action="store_false",
                    help="Actually delete rows.")
     args = p.parse_args()
+    configure_logging(service="migrate_drop_oversized_urls")
 
     mode = "DRY-RUN" if args.dry_run else "EXECUTE"
-    print(f"mode: {mode}  cap: octet_length > {CAP}\n")
+    log.info(f'mode: {mode}  cap: octet_length > {CAP}')
 
     with psycopg2.connect(**CRAWLERDB) as conn:
         with conn.cursor() as cur:
@@ -89,10 +95,10 @@ def main() -> None:
         if not args.dry_run:
             conn.commit()
 
-    print("\ntotals:")
+    log.info('totals:')
     for tbl, n in sharded.items():
-        print(f"  {tbl:25s} {n:>12,}")
-    print(f"  {'url_link':25s} {link:>12,}")
+        log.info(f'  {tbl:25s} {n:>12,}')
+    log.info(f'  url_link                  {link:>12,}')
 
 
 if __name__ == "__main__":

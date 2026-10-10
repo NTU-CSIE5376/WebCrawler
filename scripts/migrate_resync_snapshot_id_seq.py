@@ -23,11 +23,16 @@ on their next nextval().
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 
 import psycopg2
 
 from constants import CRAWLERDB, NUM_SHARDS
+from libs.obslog import configure as configure_logging
+
+
+log = logging.getLogger(__name__)
 
 TABLES = ("url_state_history", "content_feature_history")
 
@@ -54,6 +59,7 @@ def main() -> int:
     ap.add_argument("--table", choices=TABLES, default=None,
                     help="limit to one table family")
     args = ap.parse_args()
+    configure_logging(service="migrate_resync_snapshot_id_seq")
 
     targets = [args.table] if args.table else list(TABLES)
 
@@ -61,15 +67,15 @@ def main() -> int:
         conn.autocommit = False
         with conn.cursor() as cur:
             for prefix in targets:
-                print(f"\n=== {prefix} ===")
+                log.info(f'=== {prefix} ===')
                 bad = scan(cur, prefix)
                 if not bad:
-                    print(f"  all {NUM_SHARDS} shards healthy, nothing to do.")
+                    log.info(f'  all {NUM_SHARDS} shards healthy, nothing to do.')
                     continue
-                print(f"  {len(bad)} shard(s) with seq_last < max(snapshot_id)")
-                print(f"  {'shard':>5} {'seq_last':>14} {'max_id':>14} {'gap':>14}")
+                log.warning(f'  {len(bad)} shard(s) with seq_last < max(snapshot_id)')
+                log.info(f"  {'shard':>5} {'seq_last':>14} {'max_id':>14} {'gap':>14}")
                 for s, last, m in bad:
-                    print(f"  {s:>5} {last:>14} {m:>14} {(m-last):>14}")
+                    log.warning(f'  {s:>5} {last:>14} {m:>14} {m - last:>14}')
 
                 if not args.execute:
                     continue
@@ -78,12 +84,12 @@ def main() -> int:
                     seq = f"{prefix}_{s:03d}_snapshot_id_seq"
                     cur.execute("SELECT setval(%s, %s)", (seq, m))
                     new_val = cur.fetchone()[0]
-                    print(f"  shard {s:>3} setval -> {new_val}")
+                    log.info(f'  shard {s:>3} setval -> {new_val}')
             if args.execute:
                 conn.commit()
-                print("\nCOMMITTED.")
+                log.info('COMMITTED.')
             else:
-                print("\nDRY-RUN, no changes. Re-run with --execute to apply.")
+                log.info('DRY-RUN, no changes. Re-run with --execute to apply.')
     return 0
 
 
