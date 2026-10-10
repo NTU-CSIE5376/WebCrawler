@@ -984,7 +984,7 @@ def main() -> None:
         sys.path.insert(0, str(WEBCRAWLER_DIR))
     from libs.obslog import configure as configure_logging
 
-    configure_logging(service="wiki_pageview_inject")
+    configure_logging(service="wiki_pageview_inject", stream=sys.stderr)
     if args.download_retries <= 0:
         raise ValueError("--download-retries must be positive")
     if args.retry_backoff_seconds < 0:
