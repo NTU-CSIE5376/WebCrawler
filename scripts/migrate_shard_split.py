@@ -18,6 +18,7 @@ to resume on the next run.
 from __future__ import annotations
 
 import argparse
+import logging
 import time
 from collections import Counter
 from pathlib import Path
@@ -33,6 +34,10 @@ from libs.db.sharding.key import (
     load_sharding_config,
     mark_split_subdomain_migrated,
 )
+from libs.obslog import configure as configure_logging
+
+
+log = logging.getLogger(__name__)
 
 
 def parents_of(hosts: set[str]) -> set[str]:
@@ -72,22 +77,22 @@ def fetch_hostname_counts(cur, shard: int, domain_id: int) -> list[tuple[str, in
 def dry_run_one(cur, etld1: str, num_shards: int,
                 overrides: dict[str, int], split_subdomains: set[str],
                 pending: set[str]) -> None:
-    print(f"\n======== {etld1} ========")
+    log.info(f'======== {etld1} ========')
     cur.execute("SELECT domain_id, shard_id FROM domain_state WHERE domain = %s", (etld1,))
     row = cur.fetchone()
     if not row:
-        print("  not found in domain_state, skip")
+        log.warning('  not found in domain_state, skip')
         return
     domain_id, cur_shard = row
-    print(f"  current: shard={cur_shard:03d}  domain_id={domain_id}")
+    log.info(f'  current: shard={cur_shard:03d}  domain_id={domain_id}')
 
     cur.execute(f"SELECT COUNT(*) FROM url_state_current_{cur_shard:03d} WHERE domain_id = %s", (domain_id,))
     total = cur.fetchone()[0]
-    print(f"  rows in url_state_current_{cur_shard:03d}: {total:,}")
+    log.info(f'  rows in url_state_current_{cur_shard:03d}: {total:,}')
     if total == 0:
         return
 
-    print("  scanning per-hostname breakdown...")
+    log.info('  scanning per-hostname breakdown...')
     host_counts = fetch_hostname_counts(cur, cur_shard, domain_id)
 
     per_host = []
@@ -99,11 +104,11 @@ def dry_run_one(cur, etld1: str, num_shards: int,
         new_shard_dist[ns] += cnt
 
     rows_move = sum(c for _, c, _, moves in per_host if moves)
-    print(f"  distinct hostnames: {len(per_host):,}")
-    print(f"  rows moving (pending only): {rows_move:,}  staying: {total - rows_move:,}")
+    log.info(f'  distinct hostnames: {len(per_host):,}')
+    log.info(f'  rows moving (pending only): {rows_move:,}  staying: {total - rows_move:,}')
 
-    print("\n  top 20 hostnames:")
-    print(f"    {'host':55s} {'rows':>12s} {'new_shard':>10s}")
+    log.debug('  top 20 hostnames:')
+    log.debug(f'    host                                                            rows  new_shard')
     for host, cnt, ns, moves in per_host[:20]:
         if moves:
             tag = "  [pending]"
@@ -111,26 +116,26 @@ def dry_run_one(cur, etld1: str, num_shards: int,
             tag = "  [already migrated]"
         else:
             tag = "  [stay]"
-        print(f"    {host[:55]:55s} {cnt:>12,} {ns:>10d}{tag}")
+        log.debug(f'    {host[:55]:55s} {cnt:>12,} {ns:>10d}{tag}')
 
-    print("\n  projected new shard distribution (top 15):")
+    log.debug('  projected new shard distribution (top 15):')
     for sid, cnt in new_shard_dist.most_common(15):
         bar = "#" * min(40, int(cnt / max(1, total) * 40))
-        print(f"    shard {sid:03d}: {cnt:>12,}  {bar}")
-    print(f"  (spread across {len(new_shard_dist)} shards)")
+        log.debug(f'    shard {sid:03d}: {cnt:>12,}  {bar}')
+    log.info(f'  (spread across {len(new_shard_dist)} shards)')
 
-    print("\n  row counts in other shard tables (same domain_id):")
+    log.debug('  row counts in other shard tables (same domain_id):')
     hist_tbl = f"url_state_history_{cur_shard:03d}"
     evt_tbl = f"url_event_counter_{cur_shard:03d}"
     cur.execute(f"SELECT COUNT(*) FROM {hist_tbl} WHERE domain_id = %s", (domain_id,))
-    print(f"    {hist_tbl}: {cur.fetchone()[0]:,}")
+    log.debug(f'    {hist_tbl}: {cur.fetchone()[0]:,}')
     cur.execute(
         f"""SELECT COUNT(*) FROM {evt_tbl} e
              WHERE EXISTS (SELECT 1 FROM url_state_current_{cur_shard:03d} u
                            WHERE u.url = e.url AND u.domain_id = %s)""",
         (domain_id,),
     )
-    print(f"    {evt_tbl}: {cur.fetchone()[0]:,}")
+    log.debug(f'    {evt_tbl}: {cur.fetchone()[0]:,}')
 
 
 def ensure_domain_state(cur, host: str, shard: int) -> int:
@@ -339,14 +344,14 @@ def execute_one(cur, etld1: str, pending_under_parent: list[str], num_shards: in
                 overrides: dict[str, int], split_subdomains: set[str],
                 batch_size: int, deadline: float | None) -> bool:
     """Returns False if the deadline was hit and we should stop the outer loop."""
-    print(f"\n======== EXECUTE {etld1} ({len(pending_under_parent)} pending host(s)) ========")
+    log.info(f'======== EXECUTE {etld1} ({len(pending_under_parent)} pending host(s)) ========')
     cur.execute("SELECT domain_id, shard_id FROM domain_state WHERE domain = %s", (etld1,))
     row = cur.fetchone()
     if not row:
-        print("  parent not found in domain_state, skip")
+        log.warning('  parent not found in domain_state, skip')
         return True
     old_did, old_shard = row
-    print(f"  source: shard={old_shard:03d} domain_id={old_did}")
+    log.info(f'  source: shard={old_shard:03d} domain_id={old_did}')
 
     grand = {"current": 0, "history": 0, "event": 0}
     for host in pending_under_parent:
@@ -361,13 +366,18 @@ def execute_one(cur, etld1: str, pending_under_parent: list[str], num_shards: in
             mark_split_subdomain_migrated(cur.connection, host)
             cur.connection.commit()
         tag = "" if finished else "  [DEADLINE; resume next run]"
-        print(f"    {host:50s} -> shard {new_shard:03d} did={new_did}  "
-              f"cur={stats['current']:>9,} hist={stats['history']:>9,} evt={stats['event']:>9,}{tag}")
+        log.info(
+            f"    {host:50s} -> shard {new_shard:03d} did={new_did}  cur={stats['current']:>9,}"
+            f" hist={stats['history']:>9,} evt={stats['event']:>9,}{tag}"
+        )
         if not finished:
+            log.warning(f'Deadline reached while migrating {host}; resume next run')
             return False
 
-    print(f"\n  totals: url_state_current={grand['current']:,}  "
-          f"history={grand['history']:,}  event_counter={grand['event']:,}")
+    log.info(
+        f"  totals: url_state_current={grand['current']:,}  history={grand['history']:,}"
+        f"  event_counter={grand['event']:,}"
+    )
     return True
 
 
@@ -383,13 +393,14 @@ def main() -> None:
                    help="hard deadline in seconds; mid-batch stop, partial hosts "
                         "stay migrated_at NULL and resume next run")
     args = p.parse_args()
+    configure_logging(service="migrate_shard_split")
 
     deadline = (time.monotonic() + args.deadline_sec) if args.deadline_sec else None
 
     with psycopg2.connect(**CRAWLERDB) as conn:
         overrides, split_subdomains = load_sharding_config(INGEST_CFG, conn)
         if not split_subdomains:
-            print("no whitelist entries in shard_split_subdomain.")
+            log.info('no whitelist entries in shard_split_subdomain.')
             return
 
         if args.dry_run:
@@ -397,19 +408,19 @@ def main() -> None:
         else:
             scope = load_pending_split_subdomains(conn)
             if not scope:
-                print("no pending hosts (all whitelist entries already migrated).")
+                log.info('no pending hosts (all whitelist entries already migrated).')
                 return
 
         targets = sorted(parents_of(scope))
         num_shards = load_num_shards()
         mode = "DRY-RUN (full whitelist)" if args.dry_run else "EXECUTE (pending only)"
-        print(f"mode: {mode}")
-        print(f"scope hosts: {sorted(scope)}")
-        print(f"parents: {targets}")
-        print(f"overrides: {overrides}")
-        print(f"num_shards: {num_shards}")
+        log.info(f'mode: {mode}')
+        log.debug(f'scope hosts: {sorted(scope)}')
+        log.debug(f'parents: {targets}')
+        log.debug(f'overrides: {overrides}')
+        log.debug(f'num_shards: {num_shards}')
         if deadline:
-            print(f"deadline: {args.deadline_sec:.0f}s")
+            log.info(f'deadline: {args.deadline_sec:.0f}s')
 
         with conn.cursor() as cur:
             for etld1 in targets:

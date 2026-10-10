@@ -7,6 +7,7 @@ import argparse
 import bz2
 import heapq
 import http.client
+import logging
 import os
 import re
 import sys
@@ -19,6 +20,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+
+log = logging.getLogger(__name__)
 
 N = 1000000
 BASE_URL = "https://dumps.wikimedia.org/other/pageview_complete"
@@ -131,10 +134,8 @@ def fetch_listing(
             if attempt >= retries or not is_retryable_error(exc):
                 raise
             sleep_for = retry_sleep_seconds(backoff_seconds, attempt)
-            print(
-                f"Listing fetch failed ({exc}); retrying in {sleep_for:.1f}s "
-                f"({attempt}/{retries})",
-                file=sys.stderr,
+            log.warning(
+                f'Listing fetch failed ({exc}); retrying in {sleep_for:.1f}s ({attempt}/{retries})'
             )
             time.sleep(sleep_for)
 
@@ -225,17 +226,16 @@ def validate_existing_dump(path: str | Path) -> bool:
     try:
         stats = validate_pageview_dump(path)
     except DownloadValidationError as exc:
-        print(f"Existing dump {path} is invalid: {exc}", file=sys.stderr)
+        log.warning(f'Existing dump {path} is invalid: {exc}')
         try:
             Path(path).unlink()
         except FileNotFoundError:
             pass
         return False
 
-    print(
-        f"{path} already exists and validated "
-        f"({stats.compressed_size:,} bytes, {stats.valid_rows:,} valid rows)",
-        file=sys.stderr,
+    log.info(
+        f'{path} already exists and validated ({stats.compressed_size:,} bytes, '
+        f'{stats.valid_rows:,} valid rows)'
     )
     return True
 
@@ -313,7 +313,7 @@ def response_download_plan(resp, resume_from: int) -> tuple[bool, int | None]:
         return True, None
 
     if resume_from > 0 and status == 200:
-        print("  server ignored Range request; restarting download", file=sys.stderr)
+        log.warning('  server ignored Range request; restarting download')
 
     return False, content_length
 
@@ -325,10 +325,9 @@ def promote_valid_partial(part_path: Path, dest_path: Path) -> bool:
         return False
 
     part_path.replace(dest_path)
-    print(
-        f"  saved {dest_path} "
-        f"({stats.compressed_size:,} bytes, {stats.valid_rows:,} valid rows)",
-        file=sys.stderr,
+    log.info(
+        f'  saved {dest_path} ({stats.compressed_size:,} bytes, {stats.valid_rows:,}'
+        f' valid rows)'
     )
     return True
 
@@ -367,13 +366,9 @@ def download(
         try:
             resume_from = part_path.stat().st_size if part_path.exists() else 0
             action = "Resuming" if resume_from > 0 else "Downloading"
-            print(
-                f"{action} {url} to {part_path} "
-                f"(attempt {attempt}/{retries}) ...",
-                file=sys.stderr,
-            )
+            log.info(f'{action} {url} to {part_path} (attempt {attempt}/{retries}) ...')
             if resume_from > 0:
-                print(f"  starting at byte {resume_from:,}", file=sys.stderr)
+                log.debug(f'  starting at byte {resume_from:,}')
 
             request = download_request(url, resume_from)
             with urllib.request.urlopen(
@@ -407,10 +402,9 @@ def download(
 
             stats = validate_pageview_dump(part_path)
             part_path.replace(dest_path)
-            print(
-                f"  saved {dest_path} "
-                f"({stats.compressed_size:,} bytes, {stats.valid_rows:,} valid rows)",
-                file=sys.stderr,
+            log.info(
+                f'  saved {dest_path} ({stats.compressed_size:,} bytes, {stats.valid_rows:,}'
+                f' valid rows)'
             )
             return
         except (
@@ -452,11 +446,9 @@ def download(
                     )
                 except OSError:
                     partial_note = "; keeping partial"
-            print(
-                f"Download failed ({exc}){partial_note}; "
-                f"retrying in {sleep_for:.1f}s "
-                f"({attempt}/{retries})",
-                file=sys.stderr,
+            log.warning(
+                f'Download failed ({exc}){partial_note}; retrying in {sleep_for:.1f}s ({attempt}/'
+                f'{retries})'
             )
             time.sleep(sleep_for)
 
@@ -508,7 +500,7 @@ def extract_top(input_path: str | Path, output_path: str | Path, n: int) -> None
     output_path.parent.mkdir(parents=True, exist_ok=True)
     part_output_path = Path(f"{output_path}.part")
 
-    print(f"Pass 1: finding threshold (top {n}) ...", file=sys.stderr)
+    log.info(f'Pass 1: finding threshold (top {n}) ...')
     if part_output_path.exists():
         part_output_path.unlink()
 
@@ -524,18 +516,15 @@ def extract_top(input_path: str | Path, output_path: str | Path, n: int) -> None
                 elif views > heap[0]:
                     heapq.heapreplace(heap, views)
                 if i > 0 and i % 10_000_000 == 0:
-                    print(
-                        f"  pass1: {i:,} lines, heap[0]={heap[0]}",
-                        file=sys.stderr,
-                    )
+                    log.debug(f'  pass1: {i:,} lines, heap[0]={heap[0]}')
 
         if not heap:
             raise RuntimeError(f"no valid pageview rows found in {input_path}")
 
         threshold = heap[0]
-        print(f"Threshold: {threshold}", file=sys.stderr)
+        log.debug(f'Threshold: {threshold}')
 
-        print("Pass 2: collecting lines ...", file=sys.stderr)
+        log.info('Pass 2: collecting lines ...')
         above: list[tuple[int, bytes]] = []
         at: list[tuple[int, bytes]] = []
         with bz2.open(input_path, "rb") as f:
@@ -548,17 +537,14 @@ def extract_top(input_path: str | Path, output_path: str | Path, n: int) -> None
                 elif views == threshold:
                     at.append((views, line))
                 if i > 0 and i % 10_000_000 == 0:
-                    print(
-                        f"  pass2: {i:,} lines, above={len(above)}, at={len(at)}",
-                        file=sys.stderr,
-                    )
+                    log.debug(f'  pass2: {i:,} lines, above={len(above)}, at={len(at)}')
 
         above.sort(key=lambda x: (-x[0], x[1]))
         at.sort(key=lambda x: (-x[0], x[1]))
         result = above + at[: max(0, n - len(above))]
         result = result[:n]
 
-        print(f"Writing {part_output_path} ...", file=sys.stderr)
+        log.info(f'Writing {part_output_path} ...')
         count = 0
         with open(part_output_path, "w", encoding="utf-8") as out:
             for views, line in result:
@@ -571,8 +557,8 @@ def extract_top(input_path: str | Path, output_path: str | Path, n: int) -> None
             raise RuntimeError(f"no valid extracted pageview rows in {part_output_path}")
 
         part_output_path.replace(output_path)
-        print(f"  {count} URLs written to {output_path}", file=sys.stderr)
-        print("Done.", file=sys.stderr)
+        log.info(f'  {count} URLs written to {output_path}')
+        log.info('Done.')
     except Exception:
         try:
             part_output_path.unlink()
@@ -618,7 +604,7 @@ def validate_existing_top_file(path: str | Path) -> bool:
     try:
         max_pageviews, valid_rows = find_max_pageviews(path)
     except (OSError, UnicodeDecodeError) as exc:
-        print(f"Existing extracted file {path} is invalid: {exc}", file=sys.stderr)
+        log.warning(f'Existing extracted file {path} is invalid: {exc}')
         try:
             Path(path).unlink()
         except FileNotFoundError:
@@ -626,17 +612,16 @@ def validate_existing_top_file(path: str | Path) -> bool:
         return False
 
     if max_pageviews <= 0 or valid_rows <= 0:
-        print(f"Existing extracted file {path} has no valid rows", file=sys.stderr)
+        log.warning(f'Existing extracted file {path} has no valid rows')
         try:
             Path(path).unlink()
         except FileNotFoundError:
             pass
         return False
 
-    print(
-        f"{path} already exists and validated "
-        f"({valid_rows:,} valid rows, max_pageviews={max_pageviews:,})",
-        file=sys.stderr,
+    log.info(
+        f'{path} already exists and validated ({valid_rows:,} valid rows, max_pageviews='
+        f'{max_pageviews:,})'
     )
     return True
 
@@ -716,10 +701,7 @@ def cleanup_old_artifacts(
         deleted.append(path)
 
     if deleted:
-        print(
-            f"Cleaned {len(deleted)} old pageview artifact(s) from {root}",
-            file=sys.stderr,
-        )
+        log.info(f'Cleaned {len(deleted)} old pageview artifact(s) from {root}')
     return deleted
 
 
@@ -850,7 +832,7 @@ def inject_top_pageviews(
     stats = InjectionStats()
     stats.max_pageviews, stats.valid_file_rows = find_max_pageviews(pageview_path)
     if stats.max_pageviews <= 0:
-        print(f"No valid pageview rows found in {pageview_path}", file=sys.stderr)
+        log.warning(f'No valid pageview rows found in {pageview_path}')
         return stats
 
     deps = load_crawler_deps()
@@ -918,10 +900,7 @@ def inject_top_pageviews(
 
             if stats.queued - last_progress >= 100_000:
                 last_progress = stats.queued
-                print(
-                    f"  inject scan: {stats.queued:,} unique URLs queued",
-                    file=sys.stderr,
-                )
+                log.info(f'  inject scan: {stats.queued:,} unique URLs queued')
 
         if not dry_run:
             for shard_id in list(pending):
@@ -929,17 +908,13 @@ def inject_top_pageviews(
             crawler_conn.commit()
 
         action = "Would inject" if dry_run else "Injected"
-        print(
-            (
-                f"{action} pageview URLs from {pageview_path}: "
-                f"max_pageviews={stats.max_pageviews:,}, "
-                f"unique_valid={stats.queued:,}, "
-                f"inserted={stats.inserted:,}, updated={stats.updated:,}, "
-                f"dry_run_urls={stats.dry_run_urls:,}, "
-                f"invalid={stats.invalid:,}, duplicates={stats.duplicates:,}, "
-                f"oversized={stats.oversized:,}, bad_domain={stats.bad_domain:,}"
-            ),
-            file=sys.stderr,
+        log.info(
+            f'{action} pageview URLs from {pageview_path}: '
+            f'max_pageviews={stats.max_pageviews:,}, unique_valid={stats.queued:,}, '
+            f'inserted={stats.inserted:,}, updated={stats.updated:,}, '
+            f'dry_run_urls={stats.dry_run_urls:,}, invalid={stats.invalid:,}, '
+            f'duplicates={stats.duplicates:,}, oversized={stats.oversized:,}, '
+            f'bad_domain={stats.bad_domain:,}'
         )
         return stats
     except Exception:
@@ -1004,6 +979,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    if str(WEBCRAWLER_DIR) not in sys.path:
+        sys.path.insert(0, str(WEBCRAWLER_DIR))
+    from libs.obslog import configure as configure_logging
+
+    configure_logging(service="wiki_pageview_inject")
     if args.download_retries <= 0:
         raise ValueError("--download-retries must be positive")
     if args.retry_backoff_seconds < 0:
@@ -1028,8 +1009,8 @@ def main() -> None:
     bz2_path = data_dir / fname
     out_path = data_dir / f"top{N}_pageviews_{date_str}.txt"
 
-    print(f"Target date: {date_str}", file=sys.stderr)
-    print(f"Data directory: {data_dir}", file=sys.stderr)
+    log.info(f'Target date: {date_str}')
+    log.info(f'Data directory: {data_dir}')
 
     top_file_ready = out_path.exists() and validate_existing_top_file(out_path)
     if not top_file_ready:
@@ -1043,7 +1024,7 @@ def main() -> None:
         extract_top(bz2_path, out_path, N)
 
     if args.skip_inject:
-        print("Skipping crawlerdb injection", file=sys.stderr)
+        log.info('Skipping crawlerdb injection')
     else:
         inject_top_pageviews(
             out_path,

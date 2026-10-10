@@ -14,11 +14,16 @@ cannot run inside a transaction, so the connection is set to autocommit.
 from __future__ import annotations
 
 import argparse
+import logging
 import time
 
 import psycopg2
 
 from constants import CRAWLERDB, NUM_SHARDS
+from libs.obslog import configure as configure_logging
+
+
+log = logging.getLogger(__name__)
 
 
 def main() -> None:
@@ -28,9 +33,10 @@ def main() -> None:
     p.add_argument("--execute", dest="dry_run", action="store_false",
                    help="Actually drop indexes.")
     args = p.parse_args()
+    configure_logging(service="migrate_drop_sched_index")
 
     mode = "DRY-RUN" if args.dry_run else "EXECUTE"
-    print(f"mode: {mode}\n")
+    log.info(f'mode: {mode}')
 
     conn = psycopg2.connect(**CRAWLERDB)
     conn.autocommit = True
@@ -49,16 +55,16 @@ def main() -> None:
                 )
                 size = cur.fetchone()
                 size_str = size[0] if size else "missing"
-                print(f"  [DRY-RUN] {name}  size={size_str}")
+                log.info(f'  [DRY-RUN] {name}  size={size_str}')
             else:
                 t0 = time.time()
                 cur.execute(sql)
-                print(f"  dropped {name}  ({time.time() - t0:.1f}s)")
+                log.info(f'  dropped {name}  ({time.time() - t0:.1f}s)')
             dropped += 1
     finally:
         conn.close()
 
-    print(f"\n{'would drop' if args.dry_run else 'dropped'}: {dropped} indexes")
+    log.info(f"{('would drop' if args.dry_run else 'dropped')}: {dropped} indexes")
 
 
 if __name__ == "__main__":

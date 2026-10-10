@@ -40,8 +40,8 @@ import requests
 from protego import Protego
 
 from constants import CRAWLERDB
+from libs.obslog import configure as configure_logging
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 ROBOTS_FAIL_PREFIX = "IgnoreRequest Forbidden by robots.txt"
@@ -192,11 +192,12 @@ def main():
                    help="Emit UPDATE statement to clear pause on domains "
                         "the new headers would unblock")
     args = p.parse_args()
+    configure_logging(service="check_pause_unblock")
 
     dom_filter = ([d.strip() for d in args.domains.split(",") if d.strip()]
                   if args.domains else None)
     paused = fetch_paused(args.limit, dom_filter)
-    log.info("Found %d paused domains", len(paused))
+    log.info(f'Found {len(paused)} paused domains')
 
     work: list[tuple] = []
     with psycopg2.connect(**CRAWLERDB) as conn, conn.cursor() as cur:
@@ -221,41 +222,44 @@ def main():
     for r in results:
         buckets.setdefault(r["verdict"], []).append(r)
 
-    print()
-    print(f"{'Verdict':<22}{'Domain':<28}{'Bare':<14}{'Browser':<14}"
-          f"{'Top fail reason'}")
-    print("-" * 110)
+    log.info(
+        f"{'Verdict':<22}{'Domain':<28}{'Bare':<14}{'Browser':<14}Top fail reason"
+    )
+    log.debug("-" * 110)
     for v in order:
         for r in sorted(buckets[v], key=lambda x: x["domain"]):
-            print(f"{v:<22}{r['domain']:<28}{fmt_probe(r['bare']):<14}"
-                  f"{fmt_probe(r['browser']):<14}{r['fail_reason'] or ''}")
+            log.info(
+                f"{v:<22}{r['domain']:<28}{fmt_probe(r['bare']):<14}{fmt_probe(r['browser']):<14}"
+                f"{r['fail_reason'] or ''}"
+            )
     for v, items in buckets.items():
         if v not in order and items:
             for r in items:
-                print(f"{v:<22}{r['domain']:<28}{fmt_probe(r['bare']):<14}"
-                      f"{fmt_probe(r['browser']):<14}{r['fail_reason'] or ''}")
+                log.info(
+                    f"{v:<22}{r['domain']:<28}{fmt_probe(r['bare']):<14}{fmt_probe(r['browser']):<14}"
+                    f"{r['fail_reason'] or ''}"
+                )
 
-    print()
-    print("Summary:")
+    log.info('Summary:')
     for v in order:
         if buckets[v]:
-            print(f"  {v:<22}{len(buckets[v])}")
+            log.info(f'  {v:<22}{len(buckets[v])}')
     for v, items in buckets.items():
         if v not in order and items:
-            print(f"  {v:<22}{len(items)}")
-    print(f"  {'TOTAL':<22}{len(results)}")
+            log.info(f'  {v:<22}{len(items)}')
+    log.info(f"  {'TOTAL':<22}{len(results)}")
 
     if args.print_unblock_sql:
         unblock = sorted({r["domain"] for v in ("UNBLOCKED", "ROBOTS_UA_HELPS")
                           for r in buckets[v]})
         if not unblock:
-            print("\n-- No domains to unblock.")
+            log.info('-- No domains to unblock.')
         else:
             domains_sql = ", ".join(f"'{d}'" for d in unblock)
-            print("\n-- Run after the new headers are deployed:")
-            print("UPDATE domain_state")
-            print("   SET crawl_paused_until = NULL, domain_fail_count = 0")
-            print(f" WHERE domain IN ({domains_sql});")
+            log.info('-- Run after the new headers are deployed:')
+            log.info('UPDATE domain_state')
+            log.info('   SET crawl_paused_until = NULL, domain_fail_count = 0')
+            log.info(f' WHERE domain IN ({domains_sql});')
 
 
 if __name__ == "__main__":

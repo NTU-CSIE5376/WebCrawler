@@ -18,10 +18,15 @@ rows, run `pg_repack` per shard afterward (not done here).
 from __future__ import annotations
 
 import argparse
+import logging
 
 import psycopg2
 
 from constants import CRAWLERDB, NUM_SHARDS
+from libs.obslog import configure as configure_logging
+
+
+log = logging.getLogger(__name__)
 
 FILLFACTOR = 80
 
@@ -33,9 +38,10 @@ def main() -> None:
     p.add_argument("--execute", dest="dry_run", action="store_false",
                    help="Actually apply.")
     args = p.parse_args()
+    configure_logging(service="migrate_set_fillfactor")
 
     mode = "DRY-RUN" if args.dry_run else "EXECUTE"
-    print(f"mode: {mode}  fillfactor: {FILLFACTOR}\n")
+    log.info(f'mode: {mode}  fillfactor: {FILLFACTOR}')
 
     with psycopg2.connect(**CRAWLERDB) as conn:
         with conn.cursor() as cur:
@@ -43,14 +49,14 @@ def main() -> None:
                 table = f"url_state_current_{shard:03d}"
                 sql = f"ALTER TABLE {table} SET (fillfactor={FILLFACTOR})"
                 if args.dry_run:
-                    print(f"  [DRY-RUN] {sql}")
+                    log.info(f'  [DRY-RUN] {sql}')
                 else:
                     cur.execute(sql)
-                    print(f"  set fillfactor on {table}")
+                    log.info(f'  set fillfactor on {table}')
         if not args.dry_run:
             conn.commit()
 
-    print(f"\n{'would update' if args.dry_run else 'updated'}: {NUM_SHARDS} tables")
+    log.info(f"{('would update' if args.dry_run else 'updated')}: {NUM_SHARDS} tables")
 
 
 if __name__ == "__main__":

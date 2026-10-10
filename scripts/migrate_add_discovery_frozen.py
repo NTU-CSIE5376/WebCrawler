@@ -18,8 +18,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 
 import psycopg2
+from libs.obslog import configure as configure_logging
+
+
+log = logging.getLogger(__name__)
 
 try:
     from scripts.constants import CRAWLERDB
@@ -39,9 +44,10 @@ def main() -> None:
     p.add_argument("--execute", dest="dry_run", action="store_false",
                    help="Actually run the ALTER TABLE.")
     args = p.parse_args()
+    configure_logging(service="migrate_add_discovery_frozen")
 
-    print(f"mode: {'DRY-RUN' if args.dry_run else 'EXECUTE'}")
-    print(ADD_COLUMN_SQL)
+    log.info(f"mode: {('DRY-RUN' if args.dry_run else 'EXECUTE')}")
+    log.info(f'{ADD_COLUMN_SQL}')
     if args.dry_run:
         return
 
@@ -49,7 +55,7 @@ def main() -> None:
         with conn.cursor() as cur:
             cur.execute(ADD_COLUMN_SQL)
         conn.commit()
-    print("done")
+    log.info('done')
 
 
 if __name__ == "__main__":

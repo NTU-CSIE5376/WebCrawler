@@ -16,6 +16,7 @@ detached from the parent's domain_id (otherwise they'd be dragged along).
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
 
 import psycopg2
@@ -23,6 +24,10 @@ import psycopg2
 from constants import CRAWLERDB
 from libs.config.loader import load_yaml
 from libs.db.sharding.key import compute_shard, load_sharding_config
+from libs.obslog import configure as configure_logging
+
+
+log = logging.getLogger(__name__)
 
 REPO = Path(__file__).resolve().parents[1]
 INGEST_CFG = REPO / "containers/scheduler_ingest/config/ingest.yaml"
@@ -178,13 +183,14 @@ def main() -> None:
     p.add_argument("--execute", dest="dry_run", action="store_false",
                    help="Actually move rows. Requires pipeline pause beforehand.")
     args = p.parse_args()
+    configure_logging(service="migrate_parent_reshard")
 
     with psycopg2.connect(**CRAWLERDB) as conn:
         overrides, split_subdomains = load_sharding_config(INGEST_CFG, conn)
         num_shards = load_num_shards()
         mode = "DRY-RUN" if args.dry_run else "EXECUTE"
-        print(f"mode: {mode}")
-        print(f"overrides: {overrides}")
+        log.info(f'mode: {mode}')
+        log.debug(f'overrides: {overrides}')
 
         with conn.cursor() as cur:
             for domain in sorted(overrides):
@@ -192,14 +198,16 @@ def main() -> None:
                 cur.execute("SELECT domain_id, shard_id FROM domain_state WHERE domain = %s", (domain,))
                 row = cur.fetchone()
                 if not row:
-                    print(f"\n{domain}: no domain_state row, skip")
+                    log.warning(f'{domain}: no domain_state row, skip')
                     continue
                 did, cur_shard = int(row[0]), int(row[1])
                 if cur_shard == target:
-                    print(f"\n{domain}: already on shard {target:03d}, skip")
+                    log.info(f'{domain}: already on shard {target:03d}, skip')
                     continue
 
-                print(f"\n======== {domain}: shard {cur_shard:03d} -> {target:03d} (did={did}) ========")
+                log.info(
+                    f'======== {domain}: shard {cur_shard:03d} -> {target:03d} (did={did}) ========'
+                )
                 src_cur = f"url_state_current_{cur_shard:03d}"
                 src_hist = f"url_state_history_{cur_shard:03d}"
                 src_evt = f"url_event_counter_{cur_shard:03d}"
@@ -214,14 +222,17 @@ def main() -> None:
                     (did,),
                 )
                 n_evt = cur.fetchone()[0]
-                print(f"  to move: cur={n_cur:,}  hist={n_hist:,}  evt={n_evt:,}")
+                log.info(f'  to move: cur={n_cur:,}  hist={n_hist:,}  evt={n_evt:,}')
 
                 if args.dry_run:
                     continue
 
                 stats = move_parent(cur, did, cur_shard, target)
                 conn.commit()
-                print(f"  moved:   cur={stats['current']:,}  hist={stats['history']:,}  evt={stats['event']:,}")
+                log.info(
+                    f"  moved:   cur={stats['current']:,}  hist={stats['history']:,}  evt="
+                    f"{stats['event']:,}"
+                )
 
 
 if __name__ == "__main__":

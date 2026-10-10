@@ -22,8 +22,13 @@ return it to the OS (the script prints the per-shard commands).
 from __future__ import annotations
 
 import argparse
+import logging
 
 import psycopg2
+from libs.obslog import configure as configure_logging
+
+
+log = logging.getLogger(__name__)
 
 try:
     from scripts.constants import CRAWLERDB, NUM_SHARDS
@@ -147,10 +152,12 @@ def main() -> None:
     p.add_argument("--sample-pct", type=float, default=DEFAULT_SAMPLE_PCT)
     p.add_argument("--batch", type=int, default=DEFAULT_BATCH)
     args = p.parse_args()
+    configure_logging(service="oneoff_drop_trap_frontier")
 
-    print(f"mode: {'DRY-RUN' if args.dry_run else 'EXECUTE'}  "
-          f"cap={args.cap:,}  yield_floor={args.yield_floor}  "
-          f"include_history={args.include_history}\n")
+    log.info(
+        f"mode: {('DRY-RUN' if args.dry_run else 'EXECUTE')}  cap={args.cap:,}  yield_floor="
+        f'{args.yield_floor}  include_history={args.include_history}'
+    )
 
     conn = psycopg2.connect(**CRAWLERDB)
     conn.autocommit = True
@@ -163,16 +170,18 @@ def main() -> None:
     targets = find_targets(cur, args.cap, args.yield_floor, args.sample_pct)
     targets.sort(key=lambda t: -t["pending"])
 
-    print(f"{'shard':>5} {'domain':30} {'pending':>14} {'ever_ok':>10} {'yield':>7}")
+    log.info(f"{'shard':>5} {'domain':30} {'pending':>14} {'ever_ok':>10} {'yield':>7}")
     total_pending = 0
     for t in targets:
         total_pending += t["pending"]
-        print(f"{t['shard']:>5} {t['domain']:30} {t['pending']:>14,} "
-              f"{t['ok']:>10,} {t['yield']*100:>6.2f}%")
-    print(f"\n{len(targets)} target domains, {total_pending:,} frontier rows to drop")
+        log.info(
+            f"{t['shard']:>5} {t['domain']:30} {t['pending']:>14,} {t['ok']:>10,} "
+            f"{t['yield'] * 100:>6.2f}%"
+        )
+    log.info(f'{len(targets)} target domains, {total_pending:,} frontier rows to drop')
 
     if args.dry_run:
-        print("\ndry-run: nothing changed. Re-run with --execute to apply.")
+        log.info('dry-run: nothing changed. Re-run with --execute to apply.')
         return
 
     grand = 0
@@ -180,14 +189,15 @@ def main() -> None:
         freeze_and_pause(cur, t["domain_id"])
         n = drain_frontier(conn, cur, t, args.batch, args.include_history)
         grand += n
-        print(f"  drained {t['domain']:30} shard {t['shard']:03d}: {n:,} rows")
-    print(f"\ndeleted {grand:,} frontier rows across {len(targets)} domains")
+        log.info(f"  drained {t['domain']:30} shard {t['shard']:03d}: {n:,} rows")
+    log.info(f'deleted {grand:,} frontier rows across {len(targets)} domains')
 
     shards = sorted({t["shard"] for t in targets})
-    print("\nNext: reclaim the freed space to the OS on the affected shards "
-          "(deletes only released it to the table free list):")
+    log.info(
+        'Next: reclaim the freed space to the OS on the affected shards (deletes only released it to the table free list):',
+    )
     for s in shards:
-        print(f"  pg_repack -t url_state_current_{s:03d}   # or VACUUM FULL in a window")
+        log.info(f'  pg_repack -t url_state_current_{s:03d}   # or VACUUM FULL in a window')
 
     cur.close()
     conn.close()
