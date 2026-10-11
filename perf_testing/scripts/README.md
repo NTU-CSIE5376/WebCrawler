@@ -21,12 +21,10 @@ yugabytedb/
   upsert_worker.sql                 baseline (plain SQL, merged table)
   upsert_worker_concurrency30.sql   concurrency ablation (one of the 30 workers)
   upsert_worker_concurrency50.sql   concurrency ablation (one of the 50 workers)
-  upsert_worker_batched20.sql       batched insert (20 rows per INSERT)
 
 cockroachdb/
   upsert_worker_prepared.sql        PREPARE/EXECUTE (required, see below)
   upsert_worker_concurrency50.sql   concurrency ablation (PREPARE/EXECUTE)
-  upsert_worker_batched20.sql       batched insert (plain SQL, 20 rows per INSERT)
 ```
 
 ## Why CockroachDB needs PREPARE/EXECUTE
