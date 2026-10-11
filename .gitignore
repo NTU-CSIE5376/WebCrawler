@@ -17,3 +17,6 @@ tmp/
 artifacts/
 
 Not_push/
+
+notes/
+perf_testing/data/
