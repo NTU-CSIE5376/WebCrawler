@@ -123,7 +123,6 @@ Key columns:
 
 - identity and assignment: `url`, `domain_id`
 - scheduler times: `first_seen`, `last_scheduled`, `last_fetch_ok`, `last_content_update`
-- explicit crawl request: `last_crawl_request_at TIMESTAMPTZ` (current table only). A request newer than `last_scheduled` keeps the URL crawlable even if an older fetch result arrives late. Replaying an already scheduled request does not enqueue another crawl.
 - rolling counters: `num_scheduled_90d`, `num_fetch_ok_90d`, `num_fetch_fail_90d`, `num_content_update_90d`
 - quality/failure: `num_consecutive_fail`, `last_fail_reason`, `content_hash`
 - scheduling flags/signals: `should_crawl`, `url_score`, `url_score_updated_at`, `domain_score`

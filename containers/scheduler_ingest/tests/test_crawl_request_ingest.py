@@ -11,7 +11,6 @@ from containers.scheduler_ingest.ingestor.db_ops import IngestDB
 from libs.db.models.domain.state import DomainState
 from libs.db.sharding.table_factory import url_state_current_table, url_state_history_table, url_event_counter_table
 from containers.scheduler_control.offerer.selection.golden_discovery_ranker_v1_strategy import GoldenDiscoveryRankerV1Strategy
-from scripts.migrate_add_last_crawl_request_at import migrate
 
 
 @pytest.fixture
@@ -76,7 +75,6 @@ def test_api_requests_requeue_existing_urls_and_bypass_discovery_freeze(database
     claim(engine, at + timedelta(seconds=1))
     assert db.process_batch([request_record(at=at + timedelta(seconds=2))]) == [False]
     assert state(engine)["should_crawl"] is True
-    assert state(engine)["last_crawl_request_at"] == at + timedelta(seconds=2)
 
 
 def test_replayed_request_does_not_schedule_another_crawl(database):
@@ -152,17 +150,3 @@ def test_offer_claim_uses_actual_time_not_transaction_start(database):
         assert state(engine)["should_crawl"] is False
     finally:
         session.close()
-
-
-def test_migration_adds_nullable_marker_and_is_idempotent(database):
-    _, engine = database
-    with engine.begin() as conn:
-        conn.execute(text("CREATE TABLE url_state_current_000 (url TEXT PRIMARY KEY)"))
-    raw = engine.raw_connection()
-    try:
-        migrate(raw.driver_connection, num_shards=1)
-        migrate(raw.driver_connection, num_shards=1)
-    finally:
-        raw.close()
-    with engine.connect() as conn:
-        assert conn.execute(text("SELECT last_crawl_request_at FROM url_state_current_000")).fetchall() == []

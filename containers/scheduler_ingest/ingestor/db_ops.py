@@ -383,11 +383,8 @@ class IngestDB:
             WHEN EXCLUDED.num_content_update_90d = 1 THEN EXCLUDED.content_hash
             ELSE {tcur}.content_hash
           END,
-          should_crawl = (
-            {tcur}.last_crawl_request_at IS NOT NULL AND
-            ({tcur}.last_scheduled IS NULL OR
-             {tcur}.last_crawl_request_at > {tcur}.last_scheduled)
-          ),
+          -- Preserve pending crawl intent. Offerers clear it when claiming
+          -- work; a delayed fetch result must not cancel a newer request.
           title = COALESCE(EXCLUDED.title, {tcur}.title),
           hreflang_count = COALESCE(EXCLUDED.hreflang_count, {tcur}.hreflang_count),
           has_json_ld = COALESCE(EXCLUDED.has_json_ld, {tcur}.has_json_ld),
@@ -652,11 +649,10 @@ class IngestDB:
             cur,
             f"""
             UPDATE {table} AS u
-            SET last_crawl_request_at = GREATEST(u.last_crawl_request_at, r.requested_at),
-                should_crawl = COALESCE(u.should_crawl, FALSE) OR u.last_scheduled IS NULL OR
-                    GREATEST(u.last_crawl_request_at, r.requested_at) > u.last_scheduled
+            SET should_crawl = TRUE
             FROM (VALUES %s) AS r(url, requested_at)
             WHERE u.url = r.url
+              AND (u.last_scheduled IS NULL OR u.last_scheduled < r.requested_at)
             """,
             list(newest.items()), page_size=len(newest),
         )
