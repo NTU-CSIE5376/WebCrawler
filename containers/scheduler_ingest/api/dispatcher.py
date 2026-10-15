@@ -15,7 +15,7 @@ from libs.obslog import configure
 from .queue_lock import queue_lock
 
 
-logger = logging.getLogger("url_submission_dispatcher")
+logger = logging.getLogger("crawl_request_dispatcher")
 
 
 class SubmissionDispatcher:
@@ -68,7 +68,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     args = parser.parse_args()
-    configure(service="url_submission_dispatcher")
+    configure(service="crawl_request_dispatcher")
     config = load_yaml(args.config)
     dispatcher = SubmissionDispatcher(config)
     while True:
