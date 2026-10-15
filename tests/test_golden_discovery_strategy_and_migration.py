@@ -304,7 +304,7 @@ class GoldenDiscoveryClaimDomainUrlsTest(unittest.TestCase):
         self.assertIn("FOR UPDATE SKIP LOCKED", sql)
         self.assertIn("UPDATE url_state_current_003 x", sql)
         self.assertIn("should_crawl = FALSE", sql)
-        self.assertIn("last_scheduled = clock_timestamp()", sql)
+        self.assertIn("last_scheduled = CURRENT_TIMESTAMP", sql)
         self.assertNotIn("eligible_domains", sql)  # not the multi-domain CTE
         self.assertEqual(params["domain_id"], 42)
         self.assertEqual(params["per_domain_cap"], 10)

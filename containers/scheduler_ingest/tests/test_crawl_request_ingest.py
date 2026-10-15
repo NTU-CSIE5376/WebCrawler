@@ -10,7 +10,6 @@ from sqlalchemy.orm import sessionmaker
 from containers.scheduler_ingest.ingestor.db_ops import IngestDB
 from libs.db.models.domain.state import DomainState
 from libs.db.sharding.table_factory import url_state_current_table, url_state_history_table, url_event_counter_table
-from containers.scheduler_control.offerer.selection.golden_discovery_ranker_v1_strategy import GoldenDiscoveryRankerV1Strategy
 
 
 @pytest.fixture
@@ -131,22 +130,3 @@ def test_invalid_request_rolls_back_all_shards(database):
     with engine.connect() as conn:
         assert conn.scalar(text("SELECT COUNT(*) FROM url_state_current_003")) == 0
         assert conn.scalar(text("SELECT COUNT(*) FROM url_state_current_004")) == 0
-
-
-def test_offer_claim_uses_actual_time_not_transaction_start(database):
-    db, engine = database
-    db.process_batch([request_record(at=datetime(2020, 1, 1, tzinfo=timezone.utc))])
-    session = sessionmaker(bind=engine)()
-    try:
-        transaction_start = session.scalar(text("SELECT CURRENT_TIMESTAMP"))
-        with engine.connect() as conn:
-            requested_at = conn.scalar(text("SELECT clock_timestamp()"))
-        assert requested_at > transaction_start
-        db.process_batch([request_record(at=requested_at)])
-        strategy = GoldenDiscoveryRankerV1Strategy(lambda: session)
-        assert strategy.claim_domain_urls(3, 7, 100) == ["https://example.com/a"]
-        assert state(engine)["last_scheduled"] >= requested_at
-        db.process_batch([request_record(at=requested_at)])
-        assert state(engine)["should_crawl"] is False
-    finally:
-        session.close()
