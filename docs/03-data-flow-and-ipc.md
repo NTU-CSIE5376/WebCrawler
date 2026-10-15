@@ -143,95 +143,98 @@ so the schema stays in sync with the ingestor's `_bulk_links` reader.
 - DB interactions include retries for router domain resolution on transient DB transport errors.
 - Supervisor autorestart is enabled for all long-running processes.
 
-## 3.6 URL Submission API (PoC)
+## 3.6 External API
 
-`scheduler_ingest` runs `url_submission_api` (Flask under Gunicorn) on port
-8080. It has no authentication. The `api_gateway` Nginx container publishes
-host loopback port 4000 and proxies `/scheduler_ingest/` to this Flask server,
-stripping the prefix. Thus `POST /scheduler_ingest/v1/urls` forwards to
-`POST http://scheduler_ingest:8080/v1/urls`. Flask only hosts `/v1/urls` and
-`/healthz`; it does not handle a service prefix. Other Compose services can
-call Flask directly at `http://scheduler_ingest:8080/v1/urls`.
-Set `API_GATEWAY_BIND_ADDRESS` and `API_GATEWAY_PORT` when a different
-host interface or port is needed.
+The external API lets other services submit URLs for crawling. The default
+local base URL is `http://localhost:4000`; remote clients use the host address
+provided by the deployment. Authentication is not required.
 
-```bash
-curl -X POST http://localhost:4000/scheduler_ingest/v1/urls \
-  -H 'Content-Type: application/json' \
-  -d '{"urls":["https://example.com/article"]}'
+### 3.6.1 Submit URLs
+
+`POST /scheduler_ingest/v1/urls`
+
+Submit one or more URLs for the crawler to discover and schedule. The
+request must use `Content-Type: application/json`.
+
+**Request body**
+
+```json
+{
+  "urls": [
+    "https://example.com/article",
+    "https://example.org/page"
+  ]
+}
 ```
 
-The request must contain only `urls`, a nonempty list of HTTP(S) URLs.
-The whole batch is validated before writes. Limits in `ingest.yaml` are
-1,000 entries and a 1 MiB request body; URLs are limited to 2,500 characters
-both before and after canonicalization. Credentials in URLs are rejected.
-Canonical duplicates within one request are collapsed.
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `urls` | Array of strings | Yes | Between 1 and 1,000 absolute HTTP or HTTPS URLs. |
 
-A successful response is `200 OK`:
+The body must contain only `urls` and must not exceed 1 MiB. Each URL must
+have a valid hostname and port, contain no credentials, whitespace, or
+control characters, and be at most 2,500 characters both before and after
+normalization. If any URL is invalid, the entire request is rejected.
+
+**Successful response**
+
+`200 OK`
 
 ```json
 {"status":"ok"}
 ```
 
-The API loads shared YAML overrides and the DB subdomain whitelist, resolves
-domains through the existing `DomainResolver`, commits those domains, then
-publishes `status="new"` records using `build_new_link_record`. Records have
-unknown/seed discovery type (`0`) and zero inlink counts. Each destination
-gets a uniquely named `api_{uuid}.jsonl` in its current UTC bucket;
-the completed, flushed file is renamed from `.tmp` before readers see it.
+Submission is all-or-nothing: `200 OK` means the entire batch has been
+accepted for processing. It does not mean the URLs have already been
+crawled. Crawling is asynchronous and subject to
+scheduling priority and crawl policy. No completion time is guaranteed.
 
-`200` means published to IPC, not inserted or crawled. Existing URLs are not
-automatically requeued; discovery-frozen domains are skipped by the ingestor.
-Normal bucket delays and scheduler priority apply. There is no request-status
-endpoint, forced recrawl, or cross-request idempotency in this PoC.
+URLs are normalized before submission, and duplicates within the same
+request are collapsed. Submitting an already-known URL does not create a
+duplicate URL or force another crawl. This endpoint does not return crawl
+results or provide submission-status tracking.
 
-Flask returns JSON `400` for invalid input, `415` for a non-JSON content type,
-`413` for an oversized body, and `503` for storage failures. The gateway also
-enforces a 1 MiB body limit and may return its own HTML `413` before Flask.
-Publication across destinations is
-not atomic: a publication failure returns
-`published_count` for files already published. A crash may also leave partial
-publication. Retrying creates a new submission and may repeat discovery
-signals; there is no durable submission/outbox table.
+**Error responses**
 
-`GET /scheduler_ingest/healthz` through the gateway (`/healthz` on Flask)
-is a process liveness check; it does not check DB availability.
-`INGEST_CONFIG_PATH` overrides the API's default ingest config path.
+| HTTP status | Meaning |
+|-------------|---------|
+| `400 Bad Request` | Malformed JSON, unexpected fields, an invalid URL, or a URL list outside the permitted size. |
+| `413 Content Too Large` | Request body exceeds 1 MiB. |
+| `415 Unsupported Media Type` | Content type is not JSON. |
+| `500 Internal Server Error` | An unexpected internal failure prevented submission. The entire batch was rejected. |
+| `503 Service Unavailable` | A temporary service or resource availability problem prevented submission, such as a database connection outage. The entire batch was rejected. |
 
-Build and run with the existing source bind mount:
+API errors use an `error` field, for example:
 
-```bash
-docker compose up -d --build scheduler_ingest api_gateway
-docker compose exec scheduler_ingest python -m pytest containers/scheduler_ingest/tests -q
+```json
+{"error":"Invalid HTTP(S) URL at index 1"}
 ```
 
-Tests use temporary IPC files and SQLite for domain resolution, with the DB
-subdomain whitelist stubbed. They require neither a live PostgreSQL instance
-nor external HTTP access. Dependencies, including pytest, are pinned in
-`containers/scheduler_ingest/requirements.txt`, shared by the Dockerfile and
-the host test environment.
+URL indices are zero-based. Oversized requests may receive an HTML error
+response instead of JSON.
 
-Both services expose the same Task interface for local development and CI.
-Install [Task](https://taskfile.dev/docs/installation) and Python 3.12, then
-run from either service directory (gateway tests also require Docker):
+For `500`, the response is:
 
-```bash
-task install
-task test
+```json
+{"error":"Submission failed; no URLs accepted"}
 ```
 
-Or use `task --dir containers/scheduler_ingest install` / `test` and
-`task --dir containers/api_gateway install` / `test` from the repository root.
-Both services install Python dependencies in service-local `.venv` directories
-and execute pytest on the host, matching the CI runner. The scheduler reads
-its requirements file and requires neither Docker nor PostgreSQL. Gateway tasks
-install pytest, pull Nginx and
-the mock-backend images, and run real proxy tests in temporary containers.
-Gateway tests are always enabled through `task test`; their temporary
-containers/network are removed at teardown. Extra pytest arguments can be
-passed after `--`, for example `task test -- -v`. To choose a Python executable,
-use `task install PYTHON_BIN=python3.12`.
+For `503`, the response is:
 
-`.github/workflows/ci.yml` runs both services as independent matrix jobs on
-pushes and pull requests, and supports manual dispatch. Each job calls
-`task install` followed by `task test`.
+```json
+{"error":"Submission unavailable; no URLs accepted"}
+```
+
+**Retries and batch behavior**
+
+- A `200` response accepts the entire batch. Do not resubmit it merely because
+  crawling has not completed yet.
+- A `500` or `503` response accepts none of the URLs. There is no partial-success
+  response or per-URL acceptance count.
+- After `503`, retry the entire request with a delay between attempts.
+- After `500`, investigate the failure before retrying; immediate retries may
+  encounter the same internal error.
+- After `400`, `413`, or `415`, correct the request before resubmitting.
+- If the connection is lost without an HTTP response, acceptance is unknown.
+  Retrying may submit the batch again; URL records remain unique, but this
+  endpoint does not provide cross-request idempotency.

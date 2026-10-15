@@ -99,12 +99,14 @@ Crawler worker behavior:
 
 ## 2.4 `scheduler_ingest` Container
 
-Runs 4 program families via `supervisord`:
+Runs 6 program families via `supervisord`:
 
 - `router` x16
 - `ingestor` x16
 - `feature_extractor` x16
 - `stats_aggregator` x1
+- `url_submission_api` x1 (Gunicorn with 2 workers)
+- `url_submission_dispatcher` x1
 
 ### Router (x16)
 
