@@ -38,7 +38,6 @@ def setup_api(tmp_path, monkeypatch):
         },
         "postgres": {"dsn": f"sqlite:///{tmp_path / 'test.db'}"},
         "api": {
-            "max_content_length": 8192,
             "crawl_request": {"max_urls": 3, "pending_dir": str(tmp_path / "pending")},
         },
     }
@@ -357,18 +356,6 @@ def test_health_does_not_access_db(setup_api, monkeypatch):
     assert client.get("/healthz").json() == {"status": "ok"}
 
 
-def test_streamed_body_limit_rejects_before_acceptance(setup_api):
-    client, _, _, tmp_path = setup_api
-
-    def chunks():
-        yield b'{"urls":["https://example.com/'
-        yield b"a" * 9000
-        yield b'"]}'
-
-    response = client.post("/v1/crawl-requests", content=chunks(), headers={"Content-Type": "application/json"})
-    assert response.status_code == 413
-    assert not list((tmp_path / "pending").glob("*.json"))
-
 
 def test_openapi_documents_gateway_prefix_and_validation_responses(setup_api):
     client, *_ = setup_api
@@ -412,12 +399,12 @@ def test_invalid_limit_configuration_fails_at_startup(setup_api, name, value):
         create_app(str(config_path), service=svc)
 
 
-def test_oversized_declared_body_is_rejected_before_submission(setup_api, monkeypatch):
-    client, service, _, tmp_path = setup_api
-    submit = Mock()
-    monkeypatch.setattr(service, "submit", submit)
-    response = client.post("/v1/crawl-requests", content="x" * 9000,
+@pytest.mark.parametrize("streamed", [False, True])
+def test_api_does_not_enforce_a_body_size_limit(setup_api, streamed):
+    client, _, _, tmp_path = setup_api
+    chunks = [b" " * (4 * 1024 * 1024), b'{"urls":["https://example.com/a"]}']
+    content = iter(chunks) if streamed else b"".join(chunks)
+    response = client.post("/v1/crawl-requests", content=content,
                            headers={"Content-Type": "application/json"})
-    assert response.status_code == 413
-    submit.assert_not_called()
-    assert not list((tmp_path / "pending").glob("*.json"))
+    assert response.status_code == 200
+    assert len(list((tmp_path / "pending").glob("*.json"))) == 1

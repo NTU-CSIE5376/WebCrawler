@@ -9,7 +9,6 @@ import psycopg2
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, StrictStr
-from starlette.middleware.body_limit import RequestBodyLimitMiddleware
 from starlette.responses import JSONResponse
 from sqlalchemy import create_engine
 from sqlalchemy.exc import SQLAlchemyError, TimeoutError as PoolTimeoutError
@@ -54,8 +53,6 @@ def create_app(config_path: str | None = None, *, service=None) -> FastAPI:
     )
     config = load_yaml(config_path)
     api_config = config.get("api", {})
-    max_body_size = int(api_config.get("max_content_length", 4_194_304))
-    app.add_middleware(RequestBodyLimitMiddleware, max_body_size=max_body_size)
     crawl_request_config = api_config.get("crawl_request", {})
     max_urls = int(crawl_request_config.get("max_urls", 1000))
     max_url_length = int(crawl_request_config.get("max_url_length", MAX_URL_LEN))
