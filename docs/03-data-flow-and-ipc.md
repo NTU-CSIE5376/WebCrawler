@@ -172,7 +172,7 @@ and schedule. The request must use `Content-Type: application/json`.
 |-------|------|----------|-------------|
 | `urls` | Array of strings | Yes | Nonempty list of absolute HTTP or HTTPS URLs; default maximum 1,000 per request. |
 
-The body must contain only `urls` and must not exceed 1 MiB. The default URL
+The body must contain only `urls` and must not exceed 4 MiB. The default URL
 length limit is 2,500 characters, checked both before and after normalization.
 Deployments may configure a smaller length limit or a different per-request
 URL count limit. Each URL must have a valid hostname and port and contain no
@@ -204,7 +204,7 @@ tracking.
 | HTTP status | Meaning |
 |-------------|---------|
 | `400 Bad Request` | Malformed JSON, unexpected fields, an invalid URL, or a URL list outside the permitted size. |
-| `413 Content Too Large` | Request body exceeds 1 MiB. |
+| `413 Content Too Large` | Request body exceeds 4 MiB. |
 | `415 Unsupported Media Type` | Content type is not JSON. |
 | `500 Internal Server Error` | An unexpected internal failure prevented submission. The entire batch was rejected. |
 | `503 Service Unavailable` | A temporary service or resource availability problem prevented submission, such as a database connection outage. The entire batch was rejected. |

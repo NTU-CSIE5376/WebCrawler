@@ -53,7 +53,7 @@ def create_app(config_path: str | None = None, *, service=None) -> FastAPI:
     )
     config = load_yaml(config_path)
     api_config = config.get("api", {})
-    max_body_size = int(api_config.get("max_content_length", 1_048_576))
+    max_body_size = int(api_config.get("max_content_length", 4_194_304))
     app.add_middleware(RequestLimitsMiddleware, max_body_size=max_body_size)
     max_urls = int(os.environ.get("CRAWL_REQUEST_MAX_URLS", api_config.get("max_urls", 1000)))
     max_url_length = int(os.environ.get(
