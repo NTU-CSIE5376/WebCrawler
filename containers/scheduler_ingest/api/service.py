@@ -4,7 +4,6 @@ import json
 import os
 from pathlib import Path
 from uuid import uuid4
-from datetime import datetime, timezone
 
 from libs.db.sharding.key import load_sharding_config
 from libs.db.sharding.router import ShardRouter
@@ -69,10 +68,6 @@ class SubmissionService:
                     inlink_count_approx=0,
                     inlink_count_external=0,
                 ))
-
-        requested_at = datetime.now(timezone.utc).isoformat()
-        for record in records:
-            record.update(status="crawl_request", requested_at=requested_at)
 
         # One rename is the acceptance boundary, regardless of shard count.
         # No fallible work follows it: a returned storage error means no batch

@@ -383,8 +383,7 @@ class IngestDB:
             WHEN EXCLUDED.num_content_update_90d = 1 THEN EXCLUDED.content_hash
             ELSE {tcur}.content_hash
           END,
-          -- Preserve pending crawl intent. Offerers clear it when claiming
-          -- work; a delayed fetch result must not cancel a newer request.
+          should_crawl = FALSE,
           title = COALESCE(EXCLUDED.title, {tcur}.title),
           hreflang_count = COALESCE(EXCLUDED.hreflang_count, {tcur}.hreflang_count),
           has_json_ld = COALESCE(EXCLUDED.has_json_ld, {tcur}.has_json_ld),
@@ -495,7 +494,6 @@ class IngestDB:
 
     def _bulk_links(
         self, cur, shard_id: int, items: list[tuple[int, dict]],
-        *, allow_frozen: bool = False,
     ) -> list[tuple[int, bool]]:
         if not items:
             return []
@@ -527,7 +525,7 @@ class IngestDB:
 
         # Frontier budget: drop links for domains the GC service has frozen
         # (oversized, near-zero fetch yield). Reported as not-inserted.
-        frozen = set() if allow_frozen else self._frozen_domains(
+        frozen = self._frozen_domains(
             cur, {int(rec["domain_id"]) for _, rec in unique_items}
         )
         frozen_results: list[tuple[int, bool]] = []
@@ -628,36 +626,6 @@ class IngestDB:
         results.extend(frozen_results)
         return results
 
-    def _bulk_crawl_requests(
-        self, cur, shard_id: int, items: list[tuple[int, dict]],
-    ) -> list[tuple[int, bool]]:
-        if not items:
-            return []
-        # Explicit requests bypass discovery freezing, but still use the normal
-        # offerer and its domain pause / crawler politeness controls.
-        results = self._bulk_links(cur, shard_id, items, allow_frozen=True)
-        newest = {}
-        for _, rec in items:
-            requested_at = datetime.fromisoformat(rec["requested_at"])
-            if requested_at.tzinfo is None:
-                raise ValueError("Crawl request timestamp must include a timezone")
-            url = rec["url"]
-            if url not in newest or requested_at > newest[url]:
-                newest[url] = requested_at
-        table = self._tcur(shard_id)
-        execute_values(
-            cur,
-            f"""
-            UPDATE {table} AS u
-            SET should_crawl = TRUE
-            FROM (VALUES %s) AS r(url, requested_at)
-            WHERE u.url = r.url
-              AND (u.last_scheduled IS NULL OR u.last_scheduled < r.requested_at)
-            """,
-            list(newest.items()), page_size=len(newest),
-        )
-        return results
-
     @staticmethod
     def aggregate_links(recs: list[dict]) -> list[dict]:
         """Collapse discovery records by url: sum inlink counters, keep first
@@ -693,15 +661,12 @@ class IngestDB:
 
         results_by_shard: dict[int, list[tuple[int, dict]]] = defaultdict(list)
         links_by_shard: dict[int, list[tuple[int, dict]]] = defaultdict(list)
-        requests_by_shard: dict[int, list[tuple[int, dict]]] = defaultdict(list)
         for i, rec in enumerate(recs):
             if len(rec.get("url", "")) > MAX_URL_LEN:
                 continue
             sid = int(rec["shard_id"])
             if rec.get("status") == "new":
                 links_by_shard[sid].append((i, rec))
-            elif rec.get("status") == "crawl_request":
-                requests_by_shard[sid].append((i, rec))
             else:
                 results_by_shard[sid].append((i, rec))
 
@@ -716,8 +681,4 @@ class IngestDB:
                 for sid, items in results_by_shard.items():
                     for idx, ir in self._bulk_results(cur, sid, items):
                         results[idx] = ir
-                # Apply explicit requeues after any results in this batch.
-                for sid, items in requests_by_shard.items():
-                    for idx, inserted in self._bulk_crawl_requests(cur, sid, items):
-                        results[idx] = inserted
         return results

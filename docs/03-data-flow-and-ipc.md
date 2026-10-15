@@ -193,8 +193,10 @@ crawled. Crawling is asynchronous and subject to
 scheduling priority and crawl policy. No completion time is guaranteed.
 
 URLs are normalized before submission, and duplicates within the same
-request are collapsed. Already-known URLs are requeued for crawling; new URLs
-are added to the crawl queue. This does not create duplicate URL records.
+request are collapsed. Already-known URLs are marked eligible for crawling
+again; new URLs follow the normal discovery process. A result from an ongoing crawl may
+satisfy a request without another crawl. This does not create duplicate URL
+records.
 Scheduling priority, domain pauses, and crawler politeness controls still
 apply. This endpoint does not return crawl results or provide submission-status
 tracking.

@@ -9,7 +9,10 @@ from pathlib import Path
 import time
 
 import click
+from sqlalchemy import create_engine, update
+from sqlalchemy.orm import sessionmaker
 
+from libs.db.sharding.table_factory import url_state_current_table
 from libs.config.loader import load_yaml
 from libs.ipc.folder_reader import current_interval
 from libs.obslog import configure
@@ -20,9 +23,12 @@ logger = logging.getLogger("crawl_request_dispatcher")
 
 
 class SubmissionDispatcher:
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, *, session_factory=None):
         self.pending_dir = Path(config["api"]["crawl_request"]["pending_dir"])
         self.router = config["router"]
+        self.Session = session_factory or sessionmaker(
+            bind=create_engine(config["postgres"]["dsn"], pool_pre_ping=True),
+        )
 
     def process_file(self, batch: Path) -> None:
         with queue_lock(self.pending_dir):
@@ -32,6 +38,17 @@ class SubmissionDispatcher:
 
     def _process_locked(self, batch: Path) -> None:
         records = json.loads(batch.read_text(encoding="utf-8"))
+        # Existing URLs only need their scheduling flag reset. New URLs use
+        # the ingestor's existing discovery interface. Retrying may recrawl.
+        by_shard = defaultdict(list)
+        for record in records:
+            by_shard[int(record["shard_id"])].append(record["url"])
+        with self.Session.begin() as session:
+            for shard_id, urls in sorted(by_shard.items()):
+                table = url_state_current_table(shard_id).__table__
+                session.execute(
+                    update(table).where(table.c.url.in_(urls)).values(should_crawl=True)
+                )
         groups = defaultdict(list)
         for record in records:
             worker = record["shard_id"] // int(self.router["shards_per_ingestor"])

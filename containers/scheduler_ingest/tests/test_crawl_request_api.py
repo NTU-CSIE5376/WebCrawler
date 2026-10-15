@@ -36,6 +36,7 @@ def setup_api(tmp_path, monkeypatch):
             "domain_overrides": {"example.com": 37, "example.org": 98,
                                  "special.example.com": 65},
         },
+        "postgres": {"dsn": f"sqlite:///{tmp_path / 'test.db'}"},
         "api": {
             "max_content_length": 8192,
             "crawl_request": {"max_urls": 3, "pending_dir": str(tmp_path / "pending")},
@@ -48,7 +49,7 @@ def setup_api(tmp_path, monkeypatch):
     monkeypatch.setattr(key.tldextract, "extract", tldextract.TLDExtract(
         suffix_list_urls=(), cache_dir=None,
     ))
-    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    engine = create_engine(config["postgres"]["dsn"], connect_args={"check_same_thread": False}, poolclass=StaticPool)
     with engine.begin() as conn:
         conn.execute(text("""
             CREATE TABLE domain_state (
@@ -58,6 +59,8 @@ def setup_api(tmp_path, monkeypatch):
                 domain_score FLOAT DEFAULT 0
             )
         """))
+        for shard in (37, 65, 98):
+            conn.execute(text(f"CREATE TABLE url_state_current_{shard:03d} (url TEXT PRIMARY KEY, should_crawl BOOLEAN)"))
     svc = SubmissionService(sessionmaker(bind=engine), config, str(path))
     app = create_app(str(path), service=svc)
     with TestClient(app) as client:
@@ -92,8 +95,8 @@ def test_submission_routes_records_and_commits_domains(setup_api):
         domains = {row.domain_id: row for row in conn.execute(text("SELECT * FROM domain_state"))}
     for worker, records in groups.items():
         for record in records:
-            assert record["status"] == "crawl_request"
-            assert record["requested_at"]
+            assert record["status"] == "new"
+            assert "requested_at" not in record
             assert record["shard_id"] // 16 == int(worker[-2:])
             assert domains[record["domain_id"]].shard_id == record["shard_id"]
             assert record["domain_score"] == 0

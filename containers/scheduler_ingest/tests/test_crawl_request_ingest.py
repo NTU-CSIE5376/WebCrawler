@@ -1,13 +1,17 @@
 """Database integration tests. CI supplies CRAWL_REQUEST_TEST_DSN."""
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+import json
 import os
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import Boolean, Column, DateTime, DefaultClause, Integer, MetaData, SmallInteger, String, create_engine, text
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import sessionmaker
 
 from containers.scheduler_ingest.ingestor.db_ops import IngestDB
+from containers.scheduler_ingest.api.dispatcher import SubmissionDispatcher
+from libs.ipc.new_link_record import build_new_link_record
 from libs.db.models.domain.state import DomainState
 from libs.db.sharding.table_factory import url_state_current_table, url_state_history_table, url_event_counter_table
 
@@ -41,7 +45,7 @@ def database():
                     table.append_column(Column("discovered_from", String))
         metadata.create_all(engine)
         with engine.begin() as conn:
-            conn.execute(text("INSERT INTO domain_state (domain_id,domain,shard_id,discovery_frozen) VALUES (7,'example.com',3,true)"))
+            conn.execute(text("INSERT INTO domain_state (domain_id,domain,shard_id,discovery_frozen) VALUES (7,'example.com',3,false)"))
         yield IngestDB(sessionmaker(bind=engine)), engine
     finally:
         engine.dispose()
@@ -50,10 +54,28 @@ def database():
         admin.dispose()
 
 
-def request_record(url="https://example.com/a", at=None, shard=3):
-    return {"url": url, "status": "crawl_request", "shard_id": shard,
-            "domain_id": 7, "domain_score": 0.9, "inlink_count_approx": 0,
-            "requested_at": (at or datetime.now(timezone.utc)).isoformat()}
+
+def request_record(url="https://example.com/a", shard=3):
+    return build_new_link_record(
+        url=url, shard_id=shard, domain_id=7, domain_score=0.9,
+        discovered_from=None, discovery_source_type=0,
+        inlink_count_approx=0, inlink_count_external=0,
+    )
+
+
+def dispatch(engine, tmp_path, records):
+    pending = tmp_path / "pending"
+    pending.mkdir(exist_ok=True)
+    batch = pending / "batch.json"
+    batch.write_text(json.dumps(records))
+    dispatcher = SubmissionDispatcher({
+        "api": {"crawl_request": {"pending_dir": str(pending)}},
+        "router": {"shards_per_ingestor": 16, "interval_minutes": 10,
+                   "ingestor_dir_template": str(tmp_path / "ingestor_{id:02d}")},
+    }, session_factory=sessionmaker(bind=engine))
+    dispatcher.process_file(batch)
+    return [json.loads(line) for path in tmp_path.rglob("*.jsonl")
+            for line in path.read_text().splitlines()]
 
 
 def state(engine):
@@ -61,72 +83,57 @@ def state(engine):
         return conn.execute(text("SELECT * FROM url_state_current_003 WHERE url='https://example.com/a'")).mappings().one()
 
 
-def claim(engine, at):
+def test_new_requests_use_original_ingestor(database, tmp_path):
+    db, engine = database
+    records = dispatch(engine, tmp_path, [request_record()])
+    assert records[0]["status"] == "new"
+    assert db.process_batch(records) == [True]
+    assert state(engine)["should_crawl"] is True
+
+
+def test_known_requests_only_reset_crawl_flag_even_when_discovery_frozen(database, tmp_path):
+    db, engine = database
+    db.process_batch([request_record()])
     with engine.begin() as conn:
-        conn.execute(text("UPDATE url_state_current_003 SET should_crawl=false,last_scheduled=:at"), {"at": at})
-
-
-def test_api_requests_requeue_existing_urls_and_bypass_discovery_freeze(database):
-    db, engine = database
-    at = datetime.now(timezone.utc)
-    assert db.process_batch([request_record(at=at)]) == [True]
+        conn.execute(text("UPDATE url_state_current_003 SET should_crawl=false,title='Keep me',num_fetch_ok_90d=5"))
+        conn.execute(text("UPDATE domain_state SET discovery_frozen=true"))
+    records = dispatch(engine, tmp_path, [request_record()])
     assert state(engine)["should_crawl"] is True
-    claim(engine, at + timedelta(seconds=1))
-    assert db.process_batch([request_record(at=at + timedelta(seconds=2))]) == [False]
-    assert state(engine)["should_crawl"] is True
-
-
-def test_replayed_request_does_not_schedule_another_crawl(database):
-    db, engine = database
-    at = datetime.now(timezone.utc)
-    record = request_record(at=at)
-    db.process_batch([record])
-    claim(engine, at + timedelta(seconds=1))
-    db.process_batch([record])
-    assert state(engine)["should_crawl"] is False
+    assert db.process_batch(records) == [False]
+    assert state(engine)["title"] == "Keep me"
+    assert state(engine)["num_fetch_ok_90d"] == 5
 
 
 @pytest.mark.parametrize("status", ["ok", "fail"])
-def test_delayed_result_cannot_clear_a_newer_unscheduled_request(database, status):
+def test_existing_fetch_result_handling_is_preserved(database, tmp_path, status):
     db, engine = database
-    at = datetime.now(timezone.utc)
-    db.process_batch([request_record(at=at)])
-    claim(engine, at + timedelta(seconds=1))
-    db.process_batch([request_record(at=at + timedelta(seconds=3))])
-    old_result = {"url": "https://example.com/a", "status": status, "domain_id": 7,
-                  "shard_id": 3, "fetched_at": (at + timedelta(seconds=2)).isoformat()}
-    db.process_batch([old_result])
+    db.process_batch([request_record()])
+    dispatch(engine, tmp_path, [request_record()])
     assert state(engine)["should_crawl"] is True
-    claim(engine, at + timedelta(seconds=4))
-    db.process_batch([{**old_result, "fetched_at": (at + timedelta(seconds=5)).isoformat()}])
+    db.process_batch([{"url": "https://example.com/a", "status": status,
+                      "domain_id": 7, "shard_id": 3,
+                      "fetched_at": datetime.now(timezone.utc).isoformat()}])
     assert state(engine)["should_crawl"] is False
 
 
-def test_request_wins_over_result_in_same_batch(database):
+def test_dispatch_failure_rolls_back_requeues_and_retains_batch(database, tmp_path):
     db, engine = database
-    at = datetime.now(timezone.utc)
-    result = {"url": "https://example.com/a", "status": "ok", "domain_id": 7,
-              "shard_id": 3, "fetched_at": at.isoformat()}
-    db.process_batch([request_record(at=at + timedelta(seconds=1)), result])
-    assert state(engine)["should_crawl"] is True
-
-
-def test_normal_discovery_does_not_force_a_recrawl(database):
-    db, engine = database
-    at = datetime.now(timezone.utc)
-    db.process_batch([request_record(at=at)])
-    claim(engine, at + timedelta(seconds=1))
+    db.process_batch([request_record()])
     with engine.begin() as conn:
-        conn.execute(text("UPDATE domain_state SET discovery_frozen=false"))
-    discovery = {**request_record(at=at + timedelta(seconds=2)), "status": "new"}
-    db.process_batch([discovery])
+        conn.execute(text("UPDATE url_state_current_003 SET should_crawl=false"))
+        conn.execute(text("DROP TABLE url_state_current_004"))
+    with pytest.raises(ProgrammingError, match="url_state_current_004"):
+        dispatch(engine, tmp_path, [request_record(), request_record(shard=4)])
     assert state(engine)["should_crawl"] is False
+    assert (tmp_path / "pending" / "batch.json").exists()
+    assert not list(tmp_path.rglob("*.jsonl"))
 
 
-def test_invalid_request_rolls_back_all_shards(database):
+def test_repeated_request_can_requeue_again(database, tmp_path):
     db, engine = database
-    with pytest.raises(ValueError):
-        db.process_batch([request_record(), request_record(url="https://example.com/b", shard=4) | {"requested_at": "bad"}])
-    with engine.connect() as conn:
-        assert conn.scalar(text("SELECT COUNT(*) FROM url_state_current_003")) == 0
-        assert conn.scalar(text("SELECT COUNT(*) FROM url_state_current_004")) == 0
+    db.process_batch([request_record()])
+    for _ in range(2):
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE url_state_current_003 SET should_crawl=false"))
+        dispatch(engine, tmp_path, [request_record()])
+        assert state(engine)["should_crawl"] is True
