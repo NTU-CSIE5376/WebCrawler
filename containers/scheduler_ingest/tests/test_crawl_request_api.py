@@ -36,8 +36,10 @@ def setup_api(tmp_path, monkeypatch):
             "domain_overrides": {"example.com": 37, "example.org": 98,
                                  "special.example.com": 65},
         },
-        "api": {"crawl_request": {"max_urls": 3}, "max_content_length": 8192,
-                "pending_dir": str(tmp_path / "pending")},
+        "api": {
+            "max_content_length": 8192,
+            "crawl_request": {"max_urls": 3, "pending_dir": str(tmp_path / "pending")},
+        },
     }
     path = tmp_path / "ingest.yaml"
     path.write_text(yaml.safe_dump(config))
@@ -380,7 +382,7 @@ def test_crawl_request_limits_are_loaded_from_yaml(setup_api):
     _, svc, _, tmp_path = setup_api
     config_path = tmp_path / "ingest.yaml"
     config = yaml.safe_load(config_path.read_text())
-    config["api"]["crawl_request"] = {"max_urls": 1, "max_url_length": 40}
+    config["api"]["crawl_request"].update(max_urls=1, max_url_length=40)
     config_path.write_text(yaml.safe_dump(config))
     client = TestClient(create_app(str(config_path), service=svc))
     assert client.post("/v1/crawl-requests", json={"urls": [

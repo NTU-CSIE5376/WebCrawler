@@ -21,7 +21,7 @@ logger = logging.getLogger("crawl_request_dispatcher")
 
 class SubmissionDispatcher:
     def __init__(self, config: dict):
-        self.pending_dir = Path(config["api"]["pending_dir"])
+        self.pending_dir = Path(config["api"]["crawl_request"]["pending_dir"])
         self.router = config["router"]
 
     def process_file(self, batch: Path) -> None:

@@ -36,7 +36,7 @@ class SubmissionService:
         self.session_factory = session_factory
         self.config = config["router"]
         self.config_path = config_path
-        self.pending_dir = Path(config["api"]["pending_dir"])
+        self.pending_dir = Path(config["api"]["crawl_request"]["pending_dir"])
 
     def submit(self, urls: list[str]) -> None:
         with queue_lock(self.pending_dir):
