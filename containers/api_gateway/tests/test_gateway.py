@@ -22,6 +22,14 @@ import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path == '/too-large':
+            body = b'Content Too Large'
+            self.send_response(413)
+            self.send_header('Content-Type', 'text/plain')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.respond(200)
     def do_POST(self):
         self.respond(200)
@@ -106,3 +114,31 @@ def test_unprefixed_route_is_not_exposed(gateway):
     )
     assert response.returncode != 0
     assert "404" in response.stderr
+
+
+@pytest.mark.parametrize("origin", ["gateway", "upstream"])
+def test_oversized_request_returns_json(gateway, origin):
+    proxy, prefix = gateway
+    script = """
+import http.client
+import json
+import sys
+connection = http.client.HTTPConnection('localhost', 80, timeout=10)
+if sys.argv[2] == 'gateway':
+    connection.request('POST', sys.argv[1] + '/resources', body=b'', headers={
+        'Content-Type': 'application/json', 'Content-Length': str(4 * 1024 * 1024 + 1),
+    })
+else:
+    connection.request('GET', sys.argv[1] + '/too-large')
+response = connection.getresponse()
+print(json.dumps({'status': response.status, 'content_type': response.getheader('Content-Type'),
+                  'body': json.loads(response.read())}))
+"""
+    response = json.loads(docker(
+        "run", "--rm", "--network", f"container:{proxy}",
+        "python:3.12-alpine", "python", "-c", script, prefix, origin,
+    ))
+    assert response == {
+        "status": 413, "content_type": "application/json",
+        "body": {"error": "Request body too large"},
+    }

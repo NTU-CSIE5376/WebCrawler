@@ -217,8 +217,12 @@ API errors use an `error` field, for example:
 {"error":"Invalid HTTP(S) URL at index 1"}
 ```
 
-URL indices are zero-based. Oversized requests may receive a plain-text or
-HTML error response instead of JSON.
+URL indices are zero-based. Oversized requests return `413` with a JSON body
+when accessed through the gateway:
+
+```json
+{"error":"Request body too large"}
+```
 
 For `500`, the response is:
 
