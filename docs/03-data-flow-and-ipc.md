@@ -148,6 +148,7 @@ so the schema stays in sync with the ingestor's `_bulk_links` reader.
 The external API lets other services submit URLs for crawling. The default
 local base URL is `http://localhost:4000`; remote clients use the host address
 provided by the deployment. Authentication is not required.
+Interactive API documentation is available at `/scheduler_ingest/docs`.
 
 ### 3.6.1 Crawl Request API
 
@@ -169,12 +170,14 @@ and schedule. The request must use `Content-Type: application/json`.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `urls` | Array of strings | Yes | Between 1 and 1,000 absolute HTTP or HTTPS URLs. |
+| `urls` | Array of strings | Yes | Nonempty list of absolute HTTP or HTTPS URLs; default maximum 1,000 per request. |
 
-The body must contain only `urls` and must not exceed 1 MiB. Each URL must
-have a valid hostname and port, contain no credentials, whitespace, or
-control characters, and be at most 2,500 characters both before and after
-normalization. If any URL is invalid, the entire request is rejected.
+The body must contain only `urls` and must not exceed 1 MiB. The default URL
+length limit is 2,500 characters, checked both before and after normalization.
+Deployments may configure a smaller length limit or a different per-request
+URL count limit. Each URL must have a valid hostname and port and contain no
+credentials, whitespace, or control characters. If any URL is invalid, the
+entire request is rejected.
 
 **Successful response**
 
@@ -190,9 +193,11 @@ crawled. Crawling is asynchronous and subject to
 scheduling priority and crawl policy. No completion time is guaranteed.
 
 URLs are normalized before submission, and duplicates within the same
-request are collapsed. Submitting an already-known URL does not create a
-duplicate URL or force another crawl. This endpoint does not return crawl
-results or provide submission-status tracking.
+request are collapsed. Already-known URLs are requeued for crawling; new URLs
+are added to the crawl queue. This does not create duplicate URL records.
+Scheduling priority, domain pauses, and crawler politeness controls still
+apply. This endpoint does not return crawl results or provide submission-status
+tracking.
 
 **Error responses**
 

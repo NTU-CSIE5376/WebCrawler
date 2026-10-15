@@ -121,3 +121,25 @@ Implication:
 4. Confirm shard parameters match schema generation.
 5. Start compose stack and verify all supervisord child processes are healthy.
 6. Monitor `/data/ipc/stats/bad` for aggregation failures.
+
+## 5.10 Crawl Request API
+
+Before deploying the API and ingestor, add the request marker to all current
+URL shards. The migration is idempotent and uses a short transaction per shard:
+
+```bash
+python -m scripts.migrate_add_last_crawl_request_at --dry-run
+python -m scripts.migrate_add_last_crawl_request_at
+```
+
+The FastAPI server runs under Uvicorn. Configure request limits in
+`containers/scheduler_ingest/supervisord.conf`, under `[program:scheduler_ingest_api]`:
+
+```ini
+environment=PYTHONPATH="/app",CRAWL_REQUEST_MAX_URLS="1000",CRAWL_REQUEST_MAX_URL_LENGTH="2500"
+```
+
+`CRAWL_REQUEST_MAX_URLS` must be positive. `CRAWL_REQUEST_MAX_URL_LENGTH`
+can be set from 1 to 2,500 characters, the current datastore limit. Restart
+the API process after changing these values. The 1 MiB request body limit
+still applies independently.
