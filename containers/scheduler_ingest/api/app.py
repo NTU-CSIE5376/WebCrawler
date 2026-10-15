@@ -55,14 +55,13 @@ def create_app(config_path: str | None = None, *, service=None) -> FastAPI:
     api_config = config.get("api", {})
     max_body_size = int(api_config.get("max_content_length", 4_194_304))
     app.add_middleware(RequestLimitsMiddleware, max_body_size=max_body_size)
-    max_urls = int(os.environ.get("CRAWL_REQUEST_MAX_URLS", api_config.get("max_urls", 1000)))
-    max_url_length = int(os.environ.get(
-        "CRAWL_REQUEST_MAX_URL_LENGTH", api_config.get("max_url_length", MAX_URL_LEN),
-    ))
+    crawl_request_config = api_config.get("crawl_request", {})
+    max_urls = int(crawl_request_config.get("max_urls", 1000))
+    max_url_length = int(crawl_request_config.get("max_url_length", MAX_URL_LEN))
     if max_urls < 1:
-        raise ValueError("CRAWL_REQUEST_MAX_URLS must be positive")
+        raise ValueError("api.crawl_request.max_urls must be positive")
     if not 1 <= max_url_length <= MAX_URL_LEN:
-        raise ValueError(f"CRAWL_REQUEST_MAX_URL_LENGTH must be between 1 and {MAX_URL_LEN}")
+        raise ValueError(f"api.crawl_request.max_url_length must be between 1 and {MAX_URL_LEN}")
 
     if service is None:
         configure(service="scheduler_ingest_api")

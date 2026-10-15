@@ -35,8 +35,10 @@ extractor:
 
 api:
   pending_dir: "/data/ipc/url_submission/pending"
-  max_urls: 1000
   max_content_length: 4194304
+  crawl_request:
+    max_urls: 1000
+    max_url_length: 2500
 
 stats:
   stats_dir: "/data/ipc/stats"

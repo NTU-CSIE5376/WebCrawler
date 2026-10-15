@@ -36,7 +36,7 @@ def setup_api(tmp_path, monkeypatch):
             "domain_overrides": {"example.com": 37, "example.org": 98,
                                  "special.example.com": 65},
         },
-        "api": {"max_urls": 3, "max_content_length": 8192,
+        "api": {"crawl_request": {"max_urls": 3}, "max_content_length": 8192,
                 "pending_dir": str(tmp_path / "pending")},
     }
     path = tmp_path / "ingest.yaml"
@@ -376,11 +376,13 @@ def test_openapi_documents_gateway_prefix_and_validation_responses(setup_api):
     assert "/scheduler_ingest/openapi.json" in client.get("/docs").text
 
 
-def test_supervisor_limits_override_yaml_defaults(setup_api, monkeypatch):
+def test_crawl_request_limits_are_loaded_from_yaml(setup_api):
     _, svc, _, tmp_path = setup_api
-    monkeypatch.setenv("CRAWL_REQUEST_MAX_URLS", "1")
-    monkeypatch.setenv("CRAWL_REQUEST_MAX_URL_LENGTH", "40")
-    client = TestClient(create_app(str(tmp_path / "ingest.yaml"), service=svc))
+    config_path = tmp_path / "ingest.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    config["api"]["crawl_request"] = {"max_urls": 1, "max_url_length": 40}
+    config_path.write_text(yaml.safe_dump(config))
+    client = TestClient(create_app(str(config_path), service=svc))
     assert client.post("/v1/crawl-requests", json={"urls": [
         "https://example.com/a", "https://example.org/b",
     ]}).status_code == 400
@@ -392,12 +394,15 @@ def test_supervisor_limits_override_yaml_defaults(setup_api, monkeypatch):
 
 
 @pytest.mark.parametrize("name,value", [
-    ("CRAWL_REQUEST_MAX_URLS", "0"),
-    ("CRAWL_REQUEST_MAX_URL_LENGTH", "0"),
-    ("CRAWL_REQUEST_MAX_URL_LENGTH", "2501"),
+    ("max_urls", 0),
+    ("max_url_length", 0),
+    ("max_url_length", 2501),
 ])
-def test_invalid_limit_configuration_fails_at_startup(setup_api, monkeypatch, name, value):
+def test_invalid_limit_configuration_fails_at_startup(setup_api, name, value):
     _, svc, _, tmp_path = setup_api
-    monkeypatch.setenv(name, value)
-    with pytest.raises(ValueError, match=name):
-        create_app(str(tmp_path / "ingest.yaml"), service=svc)
+    config_path = tmp_path / "ingest.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    config["api"]["crawl_request"][name] = value
+    config_path.write_text(yaml.safe_dump(config))
+    with pytest.raises(ValueError, match=f"api.crawl_request.{name}"):
+        create_app(str(config_path), service=svc)
