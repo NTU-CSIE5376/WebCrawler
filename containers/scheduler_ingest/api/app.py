@@ -3,11 +3,13 @@ from __future__ import annotations
 import os
 import errno
 import logging
+from email.message import Message
 
 import psycopg2
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, StrictStr
+from starlette.middleware.body_limit import RequestBodyLimitMiddleware
 from starlette.responses import JSONResponse
 from sqlalchemy import create_engine
 from sqlalchemy.exc import SQLAlchemyError, TimeoutError as PoolTimeoutError
@@ -17,7 +19,6 @@ from libs.config.loader import load_yaml
 from libs.obslog import configure
 from libs.urls import MAX_URL_LEN
 from .service import SubmissionService, validate_urls
-from .middleware import RequestLimitsMiddleware
 
 
 logger = logging.getLogger("scheduler_ingest_api")
@@ -54,7 +55,7 @@ def create_app(config_path: str | None = None, *, service=None) -> FastAPI:
     config = load_yaml(config_path)
     api_config = config.get("api", {})
     max_body_size = int(api_config.get("max_content_length", 4_194_304))
-    app.add_middleware(RequestLimitsMiddleware, max_body_size=max_body_size)
+    app.add_middleware(RequestBodyLimitMiddleware, max_body_size=max_body_size)
     crawl_request_config = api_config.get("crawl_request", {})
     max_urls = int(crawl_request_config.get("max_urls", 1000))
     max_url_length = int(crawl_request_config.get("max_url_length", MAX_URL_LEN))
@@ -106,6 +107,13 @@ def create_app(config_path: str | None = None, *, service=None) -> FastAPI:
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request, error):
+        content_type = Message()
+        content_type["content-type"] = request.headers.get("content-type", "")
+        if content_type.get_content_maintype() != "application" or not (
+            content_type.get_content_subtype() == "json"
+            or content_type.get_content_subtype().endswith("+json")
+        ):
+            return JSONResponse({"error": "Content-Type must be application/json"}, status_code=415)
         return JSONResponse({"error": "Invalid request body"}, status_code=400)
 
     return app

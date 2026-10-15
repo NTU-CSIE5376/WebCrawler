@@ -217,8 +217,8 @@ API errors use an `error` field, for example:
 {"error":"Invalid HTTP(S) URL at index 1"}
 ```
 
-URL indices are zero-based. Oversized requests may receive an HTML error
-response instead of JSON.
+URL indices are zero-based. Oversized requests may receive a plain-text or
+HTML error response instead of JSON.
 
 For `500`, the response is:
 

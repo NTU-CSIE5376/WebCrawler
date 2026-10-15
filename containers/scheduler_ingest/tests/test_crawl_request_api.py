@@ -172,7 +172,6 @@ def test_invalid_batch_has_no_side_effects(setup_api, payload):
 @pytest.mark.parametrize("data,content_type,status", [
     ("{", "application/json", 400),
     ('{"urls": []}', "text/plain", 415),
-    ("x" * 9000, "application/json", 413),
 ])
 def test_http_errors_are_json(setup_api, data, content_type, status):
     client, *_ = setup_api
@@ -411,3 +410,14 @@ def test_invalid_limit_configuration_fails_at_startup(setup_api, name, value):
     config_path.write_text(yaml.safe_dump(config))
     with pytest.raises(ValueError, match=f"api.crawl_request.{name}"):
         create_app(str(config_path), service=svc)
+
+
+def test_oversized_declared_body_is_rejected_before_submission(setup_api, monkeypatch):
+    client, service, _, tmp_path = setup_api
+    submit = Mock()
+    monkeypatch.setattr(service, "submit", submit)
+    response = client.post("/v1/crawl-requests", content="x" * 9000,
+                           headers={"Content-Type": "application/json"})
+    assert response.status_code == 413
+    submit.assert_not_called()
+    assert not list((tmp_path / "pending").glob("*.json"))
