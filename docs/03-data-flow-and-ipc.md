@@ -150,6 +150,13 @@ local base URL is `http://localhost:4000`; remote clients use the host address
 provided by the deployment. Authentication is not required.
 Interactive API documentation is available at `/scheduler_ingest/docs`.
 
+The gateway limits request bodies to 20 MiB. Oversized requests return
+`413 Content Too Large` with a JSON body:
+
+```json
+{"error":"Request body too large"}
+```
+
 ### 3.6.1 Crawl Request API
 
 `POST /scheduler_ingest/v1/crawl-requests`
@@ -172,9 +179,8 @@ and schedule. The request must use `Content-Type: application/json`.
 |-------|------|----------|-------------|
 | `urls` | Array of strings | Yes | Nonempty list of absolute HTTP or HTTPS URLs; default maximum 1,000 per request. |
 
-The body must contain only `urls`. The gateway enforces a 20 MiB request
-body limit. The default URL
-length limit is 2,500 characters, checked both before and after normalization.
+The body must contain only `urls`. The default URL length limit is 2,500
+characters, checked both before and after normalization.
 Deployments may configure a smaller length limit or a different per-request
 URL count limit. Each URL must have a valid hostname and port and contain no
 credentials, whitespace, or control characters. If any URL is invalid, the
@@ -207,7 +213,6 @@ tracking.
 | HTTP status | Meaning |
 |-------------|---------|
 | `400 Bad Request` | Malformed JSON, unexpected fields, an invalid URL, or a URL list outside the permitted size. |
-| `413 Content Too Large` | Request body exceeds the gateway’s 20 MiB limit. |
 | `415 Unsupported Media Type` | Content type is not JSON. |
 | `500 Internal Server Error` | An unexpected internal failure prevented submission. The entire batch was rejected. |
 | `503 Service Unavailable` | A temporary service or resource availability problem prevented submission, such as a database connection outage. The entire batch was rejected. |
@@ -218,12 +223,7 @@ API errors use an `error` field, for example:
 {"error":"Invalid HTTP(S) URL at index 1"}
 ```
 
-URL indices are zero-based. Oversized requests return `413` with a JSON body
-when accessed through the gateway:
-
-```json
-{"error":"Request body too large"}
-```
+URL indices are zero-based.
 
 For `500`, the response is:
 
@@ -246,7 +246,7 @@ For `503`, the response is:
 - After `503`, retry the entire request with a delay between attempts.
 - After `500`, investigate the failure before retrying; immediate retries may
   encounter the same internal error.
-- After `400`, `413`, or `415`, correct the request before resubmitting.
+- After `400` or `415`, correct the request before resubmitting.
 - If the connection is lost without an HTTP response, acceptance is unknown.
   Retrying may submit the batch again; URL records remain unique, but this
   endpoint does not provide cross-request idempotency.
