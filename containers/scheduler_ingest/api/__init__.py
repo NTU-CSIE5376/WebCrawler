@@ -1,1 +1,1 @@
-"""HTTP URL submission entry point."""
+"""Flask entry point for crawl-request-api."""

@@ -72,7 +72,7 @@ def records_by_worker(tmp_path):
 
 def test_submission_routes_records_and_commits_domains(setup_api):
     client, svc, engine, tmp_path = setup_api
-    response = client.post("/v1/urls", json={"urls": [
+    response = client.post("/v1/crawl-requests", json={"urls": [
         "https://www.example.com/a?b=2&a=1#fragment",
         "https://example.org/b",
         "https://special.example.com/c",
@@ -103,7 +103,7 @@ def test_submission_routes_records_and_commits_domains(setup_api):
 
 def test_canonical_duplicates_are_deduplicated(setup_api):
     client, _, _, tmp_path = setup_api
-    response = client.post("/v1/urls", json={"urls": [
+    response = client.post("/v1/crawl-requests", json={"urls": [
         "https://example.com/a#one", "https://example.com/a#two",
     ]})
     assert response.status_code == 200
@@ -114,16 +114,23 @@ def test_canonical_duplicates_are_deduplicated(setup_api):
 @pytest.mark.parametrize("prefix", ["scheduler_ingest", "scheduler_injest"])
 def test_flask_does_not_handle_gateway_prefix(setup_api, prefix):
     client, _, _, tmp_path = setup_api
-    response = client.post(f"/{prefix}/v1/urls", json={"urls": ["https://example.com/a"]})
+    response = client.post(f"/{prefix}/v1/crawl-requests", json={"urls": ["https://example.com/a"]})
     assert response.status_code == 404
     assert not list(tmp_path.rglob("*.jsonl"))
+
+
+def test_old_generic_urls_route_is_not_exposed(setup_api):
+    client, _, _, tmp_path = setup_api
+    response = client.post("/v1/urls", json={"urls": ["https://example.com/a"]})
+    assert response.status_code == 404
+    assert not list((tmp_path / "pending").glob("*.json"))
 
 
 def test_existing_domain_is_reused_and_submissions_get_unique_files(setup_api):
     client, _, engine, tmp_path = setup_api
     with engine.begin() as conn:
         conn.execute(text("INSERT INTO domain_state VALUES (123, 'example.com', 37, 0.9)"))
-    results = [client.post("/v1/urls", json={"urls": ["https://example.com/a"]}) for _ in range(2)]
+    results = [client.post("/v1/crawl-requests", json={"urls": ["https://example.com/a"]}) for _ in range(2)]
     assert all(result.status_code == 200 for result in results)
     assert all(result.json == {"status": "ok"} for result in results)
     records_by_worker(tmp_path)
@@ -147,7 +154,7 @@ def test_existing_domain_is_reused_and_submissions_get_unique_files(setup_api):
 ])
 def test_invalid_batch_has_no_side_effects(setup_api, payload):
     client, _, engine, tmp_path = setup_api
-    response = client.post("/v1/urls", data=json.dumps(payload), content_type="application/json")
+    response = client.post("/v1/crawl-requests", data=json.dumps(payload), content_type="application/json")
     assert response.status_code == 400
     assert "error" in response.json
     assert not list(tmp_path.rglob("*.jsonl"))
@@ -163,7 +170,7 @@ def test_invalid_batch_has_no_side_effects(setup_api, payload):
 ])
 def test_http_errors_are_json(setup_api, data, content_type, status):
     client, *_ = setup_api
-    response = client.post("/v1/urls", data=data, content_type=content_type)
+    response = client.post("/v1/crawl-requests", data=data, content_type=content_type)
     assert response.status_code == status
     assert response.is_json
 
@@ -177,7 +184,7 @@ def test_db_failure_returns_503_without_publishing(setup_api, monkeypatch, error
     monkeypatch.setattr(service_module, "load_sharding_config", Mock(
         side_effect=error,
     ))
-    response = client.post("/v1/urls", json={"urls": ["https://example.com/a"]})
+    response = client.post("/v1/crawl-requests", json={"urls": ["https://example.com/a"]})
     assert response.status_code == 503
     assert "secret" not in response.text
     assert not list(tmp_path.rglob("*.jsonl"))
@@ -194,7 +201,7 @@ def test_domain_failure_rolls_back_whole_transaction(setup_api, monkeypatch):
         return original(self, domain, shard_id)
 
     monkeypatch.setattr(service_module.DomainResolver, "ensure_and_get", fail_second)
-    response = client.post("/v1/urls", json={"urls": [
+    response = client.post("/v1/crawl-requests", json={"urls": [
         "https://example.com/a", "https://example.org/b",
     ]})
     assert response.status_code == 503
@@ -209,7 +216,7 @@ def test_storage_failure_rejects_entire_multishard_batch(setup_api, monkeypatch,
     client, _, _, tmp_path = setup_api
     operation = "replace" if failure == "rename" else "fsync"
     monkeypatch.setattr(service_module.os, operation, Mock(side_effect=OSError(errno.ENOSPC, "disk full")))
-    response = client.post("/v1/urls", json={"urls": [
+    response = client.post("/v1/crawl-requests", json={"urls": [
         "https://example.com/a", "https://example.org/b",
     ]})
     assert response.status_code == 503
@@ -224,7 +231,7 @@ def test_batch_is_published_with_one_rename_regardless_of_shards(setup_api, monk
     original = service_module.os.replace
     publish = Mock(side_effect=original)
     monkeypatch.setattr(service_module.os, "replace", publish)
-    response = client.post("/v1/urls", json={"urls": [
+    response = client.post("/v1/crawl-requests", json={"urls": [
         "https://example.com/a", "https://example.org/b",
     ]})
     assert response.status_code == 200
@@ -236,7 +243,7 @@ def test_batch_is_published_with_one_rename_regardless_of_shards(setup_api, monk
 
 def test_delivery_failure_retains_accepted_batch_for_retry(setup_api, monkeypatch):
     client, _, _, tmp_path = setup_api
-    response = client.post("/v1/urls", json={"urls": [
+    response = client.post("/v1/crawl-requests", json={"urls": [
         "https://example.com/a", "https://example.org/b",
     ]})
     assert response.status_code == 200
@@ -288,7 +295,7 @@ def test_dispatcher_ignores_unaccepted_temporary_files(setup_api):
 def test_unexpected_failure_returns_500_and_accepts_nothing(setup_api, monkeypatch, error):
     client, svc, _, tmp_path = setup_api
     monkeypatch.setattr(svc, "_submit_locked", Mock(side_effect=error))
-    response = client.post("/v1/urls", json={"urls": ["https://example.com/a"]})
+    response = client.post("/v1/crawl-requests", json={"urls": ["https://example.com/a"]})
     assert response.status_code == 500
     assert response.json == {"error": "Submission failed; no URLs accepted"}
     assert not list((tmp_path / "pending").glob("*.json"))
@@ -301,7 +308,7 @@ def test_overlapping_api_requests_publish_complete_distinct_batches(setup_api):
     def submit(path):
         with client.application.test_client() as concurrent_client:
             start.wait(timeout=5)
-            return concurrent_client.post("/v1/urls", json={"urls": [
+            return concurrent_client.post("/v1/crawl-requests", json={"urls": [
                 f"https://example.com/{path}", f"https://example.org/{path}",
             ]}).status_code
 
@@ -318,7 +325,7 @@ def test_overlapping_api_requests_publish_complete_distinct_batches(setup_api):
 
 def test_overlapping_dispatchers_do_not_deliver_same_batch_twice(setup_api, monkeypatch):
     client, _, _, tmp_path = setup_api
-    assert client.post("/v1/urls", json={"urls": ["https://example.com/a"]}).status_code == 200
+    assert client.post("/v1/crawl-requests", json={"urls": ["https://example.com/a"]}).status_code == 200
     batch = next((tmp_path / "pending").glob("*.json"))
     dispatcher = SubmissionDispatcher(yaml.safe_load((tmp_path / "ingest.yaml").read_text()))
     deliver = Mock(wraps=dispatcher._process_locked)

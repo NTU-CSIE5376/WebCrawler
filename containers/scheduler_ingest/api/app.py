@@ -34,7 +34,7 @@ def temporary_storage_error(error: Exception) -> bool:
 
 
 def create_app(config_path: str | None = None, *, service=None) -> Flask:
-    app = Flask(__name__)
+    app = Flask("crawl-request-api")
     config_path = config_path or os.environ.get(
         "INGEST_CONFIG_PATH", "/app/containers/scheduler_ingest/config/ingest.yaml"
     )
@@ -44,7 +44,7 @@ def create_app(config_path: str | None = None, *, service=None) -> Flask:
     max_urls = int(api_config.get("max_urls", 1000))
 
     if service is None:
-        configure(service="url_submission_api")
+        configure(service="crawl-request-api")
         engine = create_engine(
             config["postgres"]["dsn"], pool_pre_ping=True,
             pool_size=2, max_overflow=1, pool_timeout=10,
@@ -58,8 +58,8 @@ def create_app(config_path: str | None = None, *, service=None) -> Flask:
     def health():
         return jsonify(status="ok")
 
-    @app.post("/v1/urls")
-    def submit_urls():
+    @app.post("/v1/crawl-requests")
+    def create_crawl_request():
         try:
             urls = validate_urls(request.get_json(), max_urls)
         except ValueError as exc:

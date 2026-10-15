@@ -105,7 +105,7 @@ Runs 6 program families via `supervisord`:
 - `ingestor` x16
 - `feature_extractor` x16
 - `stats_aggregator` x1
-- `url_submission_api` x1 (Gunicorn with 2 workers)
+- `crawl-request-api` x1 (Gunicorn with 2 workers)
 - `url_submission_dispatcher` x1
 
 ### Router (x16)

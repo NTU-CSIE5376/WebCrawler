@@ -149,12 +149,12 @@ The external API lets other services submit URLs for crawling. The default
 local base URL is `http://localhost:4000`; remote clients use the host address
 provided by the deployment. Authentication is not required.
 
-### 3.6.1 Submit URLs
+### 3.6.1 Crawl Request API
 
-`POST /scheduler_ingest/v1/urls`
+`POST /scheduler_ingest/v1/crawl-requests`
 
-Submit one or more URLs for the crawler to discover and schedule. The
-request must use `Content-Type: application/json`.
+The `crawl-request-api` accepts one or more URLs for the crawler to discover
+and schedule. The request must use `Content-Type: application/json`.
 
 **Request body**
 

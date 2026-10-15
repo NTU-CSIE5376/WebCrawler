@@ -74,9 +74,9 @@ def gateway():
 def test_post_strips_prefix_preserves_query_body_and_content_type(gateway):
     body = json.dumps({"urls": ["https://example.com/a"]})
     response = docker("exec", gateway, "wget", "-qO-", "--header", "Content-Type: application/json",
-                      "--post-data", body, "http://localhost/scheduler_ingest/v1/urls?batch=test")
+                      "--post-data", body, "http://localhost/scheduler_ingest/v1/crawl-requests?batch=test")
     assert json.loads(response) == {
-        "path": "/v1/urls?batch=test", "method": "POST", "body": body,
+        "path": "/v1/crawl-requests?batch=test", "method": "POST", "body": body,
         "content_type": "application/json", "prefix": "/scheduler_ingest",
     }
 
@@ -88,7 +88,7 @@ def test_health_path_is_forwarded(gateway):
 
 def test_unprefixed_route_is_not_exposed(gateway):
     response = subprocess.run(
-        ["docker", "exec", gateway, "wget", "-S", "-O-", "http://localhost/v1/urls"],
+        ["docker", "exec", gateway, "wget", "-S", "-O-", "http://localhost/v1/crawl-requests"],
         capture_output=True, text=True,
     )
     assert response.returncode != 0
