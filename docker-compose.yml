@@ -76,11 +76,29 @@ services:
       - OFFERER_STRATEGY=golden_discovery_ranker_v1
     logging: *loki-logging
 
+  api_gateway:
+    image: nginx:1.28-alpine
+    container_name: api_gateway
+    restart: unless-stopped
+    ports:
+      - "${API_GATEWAY_BIND_ADDRESS:-127.0.0.1}:${API_GATEWAY_PORT:-4000}:80"
+    volumes:
+      - ./containers/api_gateway/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - scheduler_ingest
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
   scheduler_ingest:
     build:
       context: .
       dockerfile: containers/scheduler_ingest/Dockerfile
     container_name: scheduler_ingest
+    expose:
+      - "8080"
     init: true
     restart: unless-stopped
     volumes:
