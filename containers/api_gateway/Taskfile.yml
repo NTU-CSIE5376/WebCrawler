@@ -1,0 +1,33 @@
+version: '3'
+
+vars:
+  REPO_ROOT: '{{.TASKFILE_DIR}}/../..'
+  PYTHON_BIN: python3
+
+tasks:
+  install:
+    desc: Install pytest in a local venv and pull the gateway test images
+    dir: '{{.TASKFILE_DIR}}'
+    preconditions:
+      - sh: docker info >/dev/null 2>&1
+        msg: Docker must be installed and running
+    cmds:
+      - '{{.PYTHON_BIN}} -m venv .venv'
+      - .venv/bin/python -m pip install pytest==8.4.2
+      - docker pull nginx:1.28-alpine
+      - docker pull python:3.12-alpine
+
+  test:
+    desc: Run real Nginx proxy tests in isolated Docker containers
+    dir: '{{.REPO_ROOT}}'
+    env:
+      RUN_GATEWAY_TESTS: '1'
+    preconditions:
+      - sh: test -x '{{.TASKFILE_DIR}}/.venv/bin/python'
+        msg: Run task install first
+      - sh: docker info >/dev/null 2>&1
+        msg: Docker must be installed and running
+    cmds:
+      - >-
+        '{{.TASKFILE_DIR}}/.venv/bin/python'
+        -m pytest containers/api_gateway/tests -q -p no:cacheprovider {{.CLI_ARGS}}

@@ -142,3 +142,96 @@ so the schema stays in sync with the ingestor's `_bulk_links` reader.
 - Queue consumer deletes selected batch file immediately after read; failures after delete may lose that batch (tradeoff for simplicity).
 - DB interactions include retries for router domain resolution on transient DB transport errors.
 - Supervisor autorestart is enabled for all long-running processes.
+
+## 3.6 URL Submission API (PoC)
+
+`scheduler_ingest` runs `url_submission_api` (Flask under Gunicorn) on port
+8080. It has no authentication. The `api_gateway` Nginx container publishes
+host loopback port 4000 and proxies `/scheduler_ingest/` to this Flask server,
+stripping the prefix. Thus `POST /scheduler_ingest/v1/urls` forwards to
+`POST http://scheduler_ingest:8080/v1/urls`. Flask only hosts `/v1/urls` and
+`/healthz`; it does not handle a service prefix. Other Compose services can
+call Flask directly at `http://scheduler_ingest:8080/v1/urls`.
+Set `API_GATEWAY_BIND_ADDRESS` and `API_GATEWAY_PORT` when a different
+host interface or port is needed.
+
+```bash
+curl -X POST http://localhost:4000/scheduler_ingest/v1/urls \
+  -H 'Content-Type: application/json' \
+  -d '{"urls":["https://example.com/article"]}'
+```
+
+The request must contain only `urls`, a nonempty list of HTTP(S) URLs.
+The whole batch is validated before writes. Limits in `ingest.yaml` are
+1,000 entries and a 1 MiB request body; URLs are limited to 2,500 characters
+both before and after canonicalization. Credentials in URLs are rejected.
+Canonical duplicates within one request are collapsed.
+
+A successful response is `200 OK`:
+
+```json
+{"status":"ok"}
+```
+
+The API loads shared YAML overrides and the DB subdomain whitelist, resolves
+domains through the existing `DomainResolver`, commits those domains, then
+publishes `status="new"` records using `build_new_link_record`. Records have
+unknown/seed discovery type (`0`) and zero inlink counts. Each destination
+gets a uniquely named `api_{uuid}.jsonl` in its current UTC bucket;
+the completed, flushed file is renamed from `.tmp` before readers see it.
+
+`200` means published to IPC, not inserted or crawled. Existing URLs are not
+automatically requeued; discovery-frozen domains are skipped by the ingestor.
+Normal bucket delays and scheduler priority apply. There is no request-status
+endpoint, forced recrawl, or cross-request idempotency in this PoC.
+
+Flask returns JSON `400` for invalid input, `415` for a non-JSON content type,
+`413` for an oversized body, and `503` for storage failures. The gateway also
+enforces a 1 MiB body limit and may return its own HTML `413` before Flask.
+Publication across destinations is
+not atomic: a publication failure returns
+`published_count` for files already published. A crash may also leave partial
+publication. Retrying creates a new submission and may repeat discovery
+signals; there is no durable submission/outbox table.
+
+`GET /scheduler_ingest/healthz` through the gateway (`/healthz` on Flask)
+is a process liveness check; it does not check DB availability.
+`INGEST_CONFIG_PATH` overrides the API's default ingest config path.
+
+Build and run with the existing source bind mount:
+
+```bash
+docker compose up -d --build scheduler_ingest api_gateway
+docker compose exec scheduler_ingest python -m pytest containers/scheduler_ingest/tests -q
+```
+
+Tests use temporary IPC files and SQLite for domain resolution, with the DB
+subdomain whitelist stubbed. They require neither a live PostgreSQL instance
+nor external HTTP access. Dependencies, including pytest, are pinned in
+`containers/scheduler_ingest/requirements.txt`, shared by the Dockerfile and
+the host test environment.
+
+Both services expose the same Task interface for local development and CI.
+Install [Task](https://taskfile.dev/docs/installation) and Python 3.12, then
+run from either service directory (gateway tests also require Docker):
+
+```bash
+task install
+task test
+```
+
+Or use `task --dir containers/scheduler_ingest install` / `test` and
+`task --dir containers/api_gateway install` / `test` from the repository root.
+Both services install Python dependencies in service-local `.venv` directories
+and execute pytest on the host, matching the CI runner. The scheduler reads
+its requirements file and requires neither Docker nor PostgreSQL. Gateway tasks
+install pytest, pull Nginx and
+the mock-backend images, and run real proxy tests in temporary containers.
+Gateway tests are always enabled through `task test`; their temporary
+containers/network are removed at teardown. Extra pytest arguments can be
+passed after `--`, for example `task test -- -v`. To choose a Python executable,
+use `task install PYTHON_BIN=python3.12`.
+
+`.github/workflows/ci.yml` runs both services as independent matrix jobs on
+pushes and pull requests, and supports manual dispatch. Each job calls
+`task install` followed by `task test`.
