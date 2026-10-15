@@ -4,16 +4,17 @@ import json
 import os
 from pathlib import Path
 from uuid import uuid4
+from datetime import datetime, timezone
 
 from libs.db.sharding.key import load_sharding_config
 from libs.db.sharding.router import ShardRouter
 from libs.ipc.new_link_record import DISCOVERY_SOURCE_UNKNOWN, build_new_link_record
-from libs.urls import validate_url
+from libs.urls import MAX_URL_LEN, validate_url
 from containers.scheduler_ingest.router.domain_resolver import DomainResolver
 from .queue_lock import queue_lock
 
 
-def validate_urls(payload: object, max_urls: int) -> list[str]:
+def validate_urls(payload: object, max_urls: int, max_url_length: int = MAX_URL_LEN) -> list[str]:
     """Validate the whole request before any DB/file writes; deduplicate canonically."""
     if not isinstance(payload, dict) or set(payload) != {"urls"}:
         raise ValueError('Expected an object containing only "urls"')
@@ -23,7 +24,7 @@ def validate_urls(payload: object, max_urls: int) -> list[str]:
     normalized = {}
     for index, url in enumerate(urls):
         try:
-            canonical = validate_url(url)
+            canonical = validate_url(url, max_length=max_url_length)
         except ValueError:
             raise ValueError(f"Invalid HTTP(S) URL at index {index}") from None
         normalized[canonical] = None
@@ -68,6 +69,10 @@ class SubmissionService:
                     inlink_count_approx=0,
                     inlink_count_external=0,
                 ))
+
+        requested_at = datetime.now(timezone.utc).isoformat()
+        for record in records:
+            record.update(status="crawl_request", requested_at=requested_at)
 
         # One rename is the acceptance boundary, regardless of shard count.
         # No fallible work follows it: a returned storage error means no batch

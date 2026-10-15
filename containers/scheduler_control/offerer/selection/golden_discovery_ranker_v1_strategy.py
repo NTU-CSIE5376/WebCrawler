@@ -94,7 +94,7 @@ class GoldenDiscoveryRankerV1Strategy(SelectionStrategy):
             UPDATE {table} x
             SET
                 should_crawl = FALSE,
-                last_scheduled = CURRENT_TIMESTAMP,
+                last_scheduled = clock_timestamp(),
                 num_scheduled_90d = x.num_scheduled_90d + 1
             FROM picked
             WHERE x.url = picked.url
@@ -204,7 +204,7 @@ class GoldenDiscoveryRankerV1Strategy(SelectionStrategy):
             UPDATE {table} x
             SET
                 should_crawl = FALSE,
-                last_scheduled = CURRENT_TIMESTAMP,
+                last_scheduled = clock_timestamp(),
                 num_scheduled_90d = x.num_scheduled_90d + 1
             FROM picked
             WHERE x.url = picked.url

@@ -10,6 +10,7 @@ import pytest
 import psycopg2
 import tldextract
 import yaml
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
@@ -57,8 +58,8 @@ def setup_api(tmp_path, monkeypatch):
         """))
     svc = SubmissionService(sessionmaker(bind=engine), config, str(path))
     app = create_app(str(path), service=svc)
-    app.config["TESTING"] = True
-    yield app.test_client(), svc, engine, tmp_path
+    with TestClient(app) as client:
+        yield client, svc, engine, tmp_path
     engine.dispose()
 
 
@@ -78,7 +79,7 @@ def test_submission_routes_records_and_commits_domains(setup_api):
         "https://special.example.com/c",
     ]})
     assert response.status_code == 200
-    assert response.json == {"status": "ok"}
+    assert response.json() == {"status": "ok"}
     batches = list((tmp_path / "pending").glob("*.json"))
     assert len(batches) == 1
     assert len(json.loads(batches[0].read_text())) == 3
@@ -89,7 +90,8 @@ def test_submission_routes_records_and_commits_domains(setup_api):
         domains = {row.domain_id: row for row in conn.execute(text("SELECT * FROM domain_state"))}
     for worker, records in groups.items():
         for record in records:
-            assert record["status"] == "new"
+            assert record["status"] == "crawl_request"
+            assert record["requested_at"]
             assert record["shard_id"] // 16 == int(worker[-2:])
             assert domains[record["domain_id"]].shard_id == record["shard_id"]
             assert record["domain_score"] == 0
@@ -107,16 +109,15 @@ def test_canonical_duplicates_are_deduplicated(setup_api):
         "https://example.com/a#one", "https://example.com/a#two",
     ]})
     assert response.status_code == 200
-    assert response.json == {"status": "ok"}
+    assert response.json() == {"status": "ok"}
     assert len(records_by_worker(tmp_path)["ingestor_02"]) == 1
 
 
-@pytest.mark.parametrize("prefix", ["scheduler_ingest", "scheduler_injest"])
-def test_flask_does_not_handle_gateway_prefix(setup_api, prefix):
-    client, _, _, tmp_path = setup_api
-    response = client.post(f"/{prefix}/v1/crawl-requests", json={"urls": ["https://example.com/a"]})
-    assert response.status_code == 404
-    assert not list(tmp_path.rglob("*.jsonl"))
+def test_routes_are_defined_without_gateway_prefix(setup_api):
+    client, *_ = setup_api
+    paths = {route.path for route in client.app.routes}
+    assert "/v1/crawl-requests" in paths
+    assert all(not path.startswith("/scheduler_ingest/") for path in paths)
 
 
 def test_old_generic_urls_route_is_not_exposed(setup_api):
@@ -132,7 +133,7 @@ def test_existing_domain_is_reused_and_submissions_get_unique_files(setup_api):
         conn.execute(text("INSERT INTO domain_state VALUES (123, 'example.com', 37, 0.9)"))
     results = [client.post("/v1/crawl-requests", json={"urls": ["https://example.com/a"]}) for _ in range(2)]
     assert all(result.status_code == 200 for result in results)
-    assert all(result.json == {"status": "ok"} for result in results)
+    assert all(result.json() == {"status": "ok"} for result in results)
     records_by_worker(tmp_path)
     files = list(tmp_path.rglob("*.jsonl"))
     assert len(files) == 2
@@ -154,9 +155,9 @@ def test_existing_domain_is_reused_and_submissions_get_unique_files(setup_api):
 ])
 def test_invalid_batch_has_no_side_effects(setup_api, payload):
     client, _, engine, tmp_path = setup_api
-    response = client.post("/v1/crawl-requests", data=json.dumps(payload), content_type="application/json")
+    response = client.post("/v1/crawl-requests", content=json.dumps(payload), headers={"Content-Type": "application/json"})
     assert response.status_code == 400
-    assert "error" in response.json
+    assert "error" in response.json()
     assert not list(tmp_path.rglob("*.jsonl"))
     assert not list((tmp_path / "pending").glob("*.json"))
     with engine.connect() as conn:
@@ -170,9 +171,9 @@ def test_invalid_batch_has_no_side_effects(setup_api, payload):
 ])
 def test_http_errors_are_json(setup_api, data, content_type, status):
     client, *_ = setup_api
-    response = client.post("/v1/crawl-requests", data=data, content_type=content_type)
+    response = client.post("/v1/crawl-requests", content=data, headers={"Content-Type": content_type})
     assert response.status_code == status
-    assert response.is_json
+    assert response.headers["content-type"].startswith("application/json")
 
 
 @pytest.mark.parametrize("error", [
@@ -220,7 +221,7 @@ def test_storage_failure_rejects_entire_multishard_batch(setup_api, monkeypatch,
         "https://example.com/a", "https://example.org/b",
     ]})
     assert response.status_code == 503
-    assert response.json == {"error": "Submission unavailable; no URLs accepted"}
+    assert response.json() == {"error": "Submission unavailable; no URLs accepted"}
     assert not list((tmp_path / "pending").glob("*.json"))
     assert not list(tmp_path.rglob("*.jsonl"))
     assert not list(tmp_path.rglob("*.tmp"))
@@ -297,7 +298,7 @@ def test_unexpected_failure_returns_500_and_accepts_nothing(setup_api, monkeypat
     monkeypatch.setattr(svc, "_submit_locked", Mock(side_effect=error))
     response = client.post("/v1/crawl-requests", json={"urls": ["https://example.com/a"]})
     assert response.status_code == 500
-    assert response.json == {"error": "Submission failed; no URLs accepted"}
+    assert response.json() == {"error": "Submission failed; no URLs accepted"}
     assert not list((tmp_path / "pending").glob("*.json"))
 
 
@@ -306,7 +307,7 @@ def test_overlapping_api_requests_publish_complete_distinct_batches(setup_api):
     start = Barrier(3)
 
     def submit(path):
-        with client.application.test_client() as concurrent_client:
+        with TestClient(client.app) as concurrent_client:
             start.wait(timeout=5)
             return concurrent_client.post("/v1/crawl-requests", json={"urls": [
                 f"https://example.com/{path}", f"https://example.org/{path}",
@@ -349,4 +350,54 @@ def test_overlapping_dispatchers_do_not_deliver_same_batch_twice(setup_api, monk
 def test_health_does_not_access_db(setup_api, monkeypatch):
     client, svc, *_ = setup_api
     monkeypatch.setattr(svc, "submit", Mock(side_effect=AssertionError("unexpected call")))
-    assert client.get("/healthz").json == {"status": "ok"}
+    assert client.get("/healthz").json() == {"status": "ok"}
+
+
+def test_streamed_body_limit_rejects_before_acceptance(setup_api):
+    client, _, _, tmp_path = setup_api
+
+    def chunks():
+        yield b'{"urls":["https://example.com/'
+        yield b"a" * 9000
+        yield b'"]}'
+
+    response = client.post("/v1/crawl-requests", content=chunks(), headers={"Content-Type": "application/json"})
+    assert response.status_code == 413
+    assert not list((tmp_path / "pending").glob("*.json"))
+
+
+def test_openapi_documents_gateway_prefix_and_validation_responses(setup_api):
+    client, *_ = setup_api
+    schema = client.get("/openapi.json").json()
+    assert {"url": "/scheduler_ingest"} in schema["servers"]
+    responses = schema["paths"]["/v1/crawl-requests"]["post"]["responses"]
+    assert "400" in responses
+    assert "422" not in responses
+    assert "/scheduler_ingest/openapi.json" in client.get("/docs").text
+
+
+def test_supervisor_limits_override_yaml_defaults(setup_api, monkeypatch):
+    _, svc, _, tmp_path = setup_api
+    monkeypatch.setenv("CRAWL_REQUEST_MAX_URLS", "1")
+    monkeypatch.setenv("CRAWL_REQUEST_MAX_URL_LENGTH", "40")
+    client = TestClient(create_app(str(tmp_path / "ingest.yaml"), service=svc))
+    assert client.post("/v1/crawl-requests", json={"urls": [
+        "https://example.com/a", "https://example.org/b",
+    ]}).status_code == 400
+    assert client.post("/v1/crawl-requests", json={"urls": [
+        "https://example.com/" + "a" * 30,
+    ]}).status_code == 400
+    assert not list((tmp_path / "pending").glob("*.json"))
+    assert client.post("/v1/crawl-requests", json={"urls": ["https://example.com/a"]}).status_code == 200
+
+
+@pytest.mark.parametrize("name,value", [
+    ("CRAWL_REQUEST_MAX_URLS", "0"),
+    ("CRAWL_REQUEST_MAX_URL_LENGTH", "0"),
+    ("CRAWL_REQUEST_MAX_URL_LENGTH", "2501"),
+])
+def test_invalid_limit_configuration_fails_at_startup(setup_api, monkeypatch, name, value):
+    _, svc, _, tmp_path = setup_api
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=name):
+        create_app(str(tmp_path / "ingest.yaml"), service=svc)

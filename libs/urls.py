@@ -8,14 +8,14 @@ from w3lib.url import canonicalize_url
 MAX_URL_LEN = 2500
 
 
-def validate_url(url: object) -> str:
+def validate_url(url: object, *, max_length: int = MAX_URL_LEN) -> str:
     """Return a canonical absolute HTTP(S) URL or raise ValueError.
 
     This is string validation only: no DNS lookup or HTTP request is made.
     The length limit applies before and after encoding/canonicalization.
     """
     try:
-        if not isinstance(url, str) or not url or len(url) > MAX_URL_LEN:
+        if not isinstance(url, str) or not url or len(url) > max_length:
             raise ValueError()
         # The library owns URL syntax, hostname, port, and IP validation.
         if validators.url(
@@ -30,7 +30,7 @@ def validate_url(url: object) -> str:
         if urlsplit(url).username is not None:
             raise ValueError()
         canonical = canonicalize_url(url)
-        if len(canonical) > MAX_URL_LEN:
+        if len(canonical) > max_length:
             raise ValueError()
     except (ValueError, UnicodeError):
         raise ValueError("Invalid HTTP(S) URL") from None

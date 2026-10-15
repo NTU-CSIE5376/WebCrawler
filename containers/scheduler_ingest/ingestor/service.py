@@ -68,11 +68,12 @@ class IngestService:
         link_recs = self.db.aggregate_links(
             [r for r in all_recs if r.get("status") == "new"]
         )
-        result_recs = [r for r in all_recs if r.get("status") != "new"]
+        result_recs = [r for r in all_recs if r.get("status") not in {"new", "crawl_request"}]
+        request_recs = [r for r in all_recs if r.get("status") == "crawl_request"]
 
         # Links before results: a url that appears as both discovery and crawl
         # result needs its domain_score set before the result UPSERT runs.
-        for batch_recs in (link_recs, result_recs):
+        for batch_recs in (link_recs, result_recs, request_recs):
             for i in range(0, len(batch_recs), BATCH_SIZE):
                 batch = batch_recs[i : i + BATCH_SIZE]
                 try:
@@ -90,6 +91,10 @@ class IngestService:
                     )
                     counters["error_count"] += len(batch)
                     counters["ingest_error"] += len(batch)
+                    if batch_recs is request_recs:
+                        # Do not checkpoint a folder with undelivered explicit
+                        # requests. Supervisor restart will retry the folder.
+                        raise
 
         domains.pop(None, None)
         self.stats.write(

@@ -1,13 +1,14 @@
 """Deliver accepted batches to ingestors; retain the batch on delivery failure."""
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import os
 from collections import defaultdict
 from pathlib import Path
 import time
+
+import click
 
 from libs.config.loader import load_yaml
 from libs.ipc.folder_reader import current_interval
@@ -64,12 +65,14 @@ class SubmissionDispatcher:
                 logger.exception("submission.delivery_failed", extra={"batch": str(batch)})
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
-    args = parser.parse_args()
+@click.command()
+@click.option("--config", "config_path", required=True,
+              type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Path to scheduler_ingest's YAML configuration.")
+def main(config_path: Path):
+    """Dispatch accepted crawl requests to ingestor queues."""
     configure(service="crawl_request_dispatcher")
-    config = load_yaml(args.config)
+    config = load_yaml(str(config_path))
     dispatcher = SubmissionDispatcher(config)
     while True:
         dispatcher.run_once()

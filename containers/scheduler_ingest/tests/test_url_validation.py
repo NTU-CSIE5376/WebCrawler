@@ -43,6 +43,17 @@ def test_url_length_limit_includes_canonical_encoding():
         validate_url(prefix + "中" * 400)
 
 
+def test_shared_url_length_limit_can_be_overridden_in_both_directions():
+    short = "https://example.com/a"
+    with pytest.raises(ValueError):
+        validate_url(short, max_length=len(short) - 1)
+    assert validate_url(short, max_length=len(short)) == short
+    long = "https://example.com/" + "a" * MAX_URL_LEN
+    assert validate_url(long, max_length=len(long)) == long
+    with pytest.raises(ValueError):
+        validate_url(long)
+
+
 def test_batch_validation_keeps_normalized_order_and_deduplicates():
     assert validate_urls({"urls": [
         "https://example.com/b#one", "https://example.com/a", "https://example.com/b#two",
