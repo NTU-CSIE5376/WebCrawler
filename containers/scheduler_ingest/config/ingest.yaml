@@ -33,6 +33,10 @@ extractor:
   stats_dir: "/data/ipc/stats"
   interval_minutes: 10
 
+api:
+  max_urls: 1000
+  max_content_length: 1048576
+
 stats:
   stats_dir: "/data/ipc/stats"
   bad_dir: "/data/ipc/stats/bad"
