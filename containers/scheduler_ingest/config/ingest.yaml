@@ -34,6 +34,7 @@ extractor:
   interval_minutes: 10
 
 api:
+  pending_dir: "/data/ipc/url_submission/pending"
   max_urls: 1000
   max_content_length: 1048576
 

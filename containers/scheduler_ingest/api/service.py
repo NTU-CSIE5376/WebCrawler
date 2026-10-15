@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-from collections import defaultdict
 from pathlib import Path
 from uuid import uuid4
 
@@ -11,9 +10,9 @@ from urllib.parse import urlsplit
 
 from libs.db.sharding.key import load_sharding_config
 from libs.db.sharding.router import ShardRouter
-from libs.ipc.folder_reader import current_interval
 from libs.ipc.new_link_record import DISCOVERY_SOURCE_UNKNOWN, build_new_link_record
 from containers.scheduler_ingest.router.domain_resolver import DomainResolver
+from .queue_lock import queue_lock
 
 
 MAX_URL_LEN = 2500
@@ -54,11 +53,16 @@ class SubmissionService:
         self.session_factory = session_factory
         self.config = config["router"]
         self.config_path = config_path
+        self.pending_dir = Path(config["api"]["pending_dir"])
 
     def submit(self, urls: list[str]) -> None:
+        with queue_lock(self.pending_dir):
+            self._submit_locked(urls)
+
+    def _submit_locked(self, urls: list[str]) -> None:
         file_tag = uuid4().hex
-        groups = defaultdict(list)
-        # Domains must commit before published files can be consumed.
+        records = []
+        # Domain writes commit before the entire batch becomes visible.
         with self.session_factory.begin() as session:
             conn = session.connection().connection
             overrides, split_subdomains = load_sharding_config(self.config_path, conn)
@@ -70,9 +74,9 @@ class SubmissionService:
             )
             resolver = DomainResolver(session)
             for url in urls:
-                domain, shard_id, ingestor_id = router.route(url)
+                domain, shard_id, _ = router.route(url)
                 domain_id, domain_score = resolver.ensure_and_get(domain, shard_id)
-                groups[ingestor_id].append(build_new_link_record(
+                records.append(build_new_link_record(
                     url=url,
                     shard_id=shard_id,
                     domain_id=domain_id,
@@ -83,32 +87,22 @@ class SubmissionService:
                     inlink_count_external=0,
                 ))
 
-        published_count = 0
+        # One rename is the acceptance boundary, regardless of shard count.
+        # No fallible work follows it: a returned storage error means no batch
+        # was published. The dispatcher handles downstream delivery separately.
+        self.pending_dir.mkdir(parents=True, exist_ok=True)
+        target = self.pending_dir / f"{file_tag}.json"
+        temporary = target.with_suffix(".json.tmp")
         try:
-            for ingestor_id, records in groups.items():
-                # Choose the current bucket at publication, not before DB work.
-                date, bucket = current_interval(int(self.config["interval_minutes"]))
-                directory = Path(self.config["ingestor_dir_template"].format(id=ingestor_id)) / date / bucket
-                directory.mkdir(parents=True, exist_ok=True)
-                target = directory / f"api_{file_tag}.jsonl"
-                temporary = target.with_suffix(".jsonl.tmp")
-                try:
-                    with temporary.open("x", encoding="utf-8") as handle:
-                        for record in records:
-                            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    os.replace(temporary, target)
-                finally:
-                    temporary.unlink(missing_ok=True)
-                published_count += len(records)
-        except OSError as exc:
-            # A multi-shard submission is not atomic. Expose partial publication
-            # instead of suggesting that a retry is idempotent.
-            raise PublicationError(published_count) from exc
-
-
-class PublicationError(Exception):
-    def __init__(self, published_count: int):
-        super().__init__("IPC publication failed")
-        self.published_count = published_count
+            with temporary.open("x", encoding="utf-8") as handle:
+                json.dump(records, handle, ensure_ascii=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+        except OSError:
+            # A leftover .tmp is never accepted or read by the dispatcher.
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import errno
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from unittest.mock import Mock
 
 import pytest
@@ -10,10 +13,13 @@ import yaml
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from containers.scheduler_ingest.api.app import create_app
 from containers.scheduler_ingest.api import service as service_module
 from containers.scheduler_ingest.api.service import SubmissionService
+from containers.scheduler_ingest.api.dispatcher import SubmissionDispatcher
+from containers.scheduler_ingest.api import dispatcher as dispatcher_module
 from libs.db.sharding import key
 from libs.ipc.jsonio import read_jsonl
 
@@ -29,7 +35,8 @@ def setup_api(tmp_path, monkeypatch):
             "domain_overrides": {"example.com": 37, "example.org": 98,
                                  "special.example.com": 65},
         },
-        "api": {"max_urls": 3, "max_content_length": 8192},
+        "api": {"max_urls": 3, "max_content_length": 8192,
+                "pending_dir": str(tmp_path / "pending")},
     }
     path = tmp_path / "ingest.yaml"
     path.write_text(yaml.safe_dump(config))
@@ -38,7 +45,7 @@ def setup_api(tmp_path, monkeypatch):
     monkeypatch.setattr(key.tldextract, "extract", tldextract.TLDExtract(
         suffix_list_urls=(), cache_dir=None,
     ))
-    engine = create_engine("sqlite://")
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     with engine.begin() as conn:
         conn.execute(text("""
             CREATE TABLE domain_state (
@@ -56,6 +63,7 @@ def setup_api(tmp_path, monkeypatch):
 
 
 def records_by_worker(tmp_path):
+    SubmissionDispatcher(yaml.safe_load((tmp_path / "ingest.yaml").read_text())).run_once()
     return {
         path.parent.parent.parent.name: read_jsonl(path)
         for path in (tmp_path / "ipc").rglob("*.jsonl")
@@ -71,6 +79,10 @@ def test_submission_routes_records_and_commits_domains(setup_api):
     ]})
     assert response.status_code == 200
     assert response.json == {"status": "ok"}
+    batches = list((tmp_path / "pending").glob("*.json"))
+    assert len(batches) == 1
+    assert len(json.loads(batches[0].read_text())) == 3
+    assert not list((tmp_path / "ipc").rglob("*.jsonl"))
     groups = records_by_worker(tmp_path)
     assert set(groups) == {"ingestor_02", "ingestor_06", "ingestor_04"}
     with engine.connect() as conn:
@@ -114,6 +126,7 @@ def test_existing_domain_is_reused_and_submissions_get_unique_files(setup_api):
     results = [client.post("/v1/urls", json={"urls": ["https://example.com/a"]}) for _ in range(2)]
     assert all(result.status_code == 200 for result in results)
     assert all(result.json == {"status": "ok"} for result in results)
+    records_by_worker(tmp_path)
     files = list(tmp_path.rglob("*.jsonl"))
     assert len(files) == 2
     assert all(read_jsonl(path)[0]["domain_id"] == 123 for path in files)
@@ -138,6 +151,7 @@ def test_invalid_batch_has_no_side_effects(setup_api, payload):
     assert response.status_code == 400
     assert "error" in response.json
     assert not list(tmp_path.rglob("*.jsonl"))
+    assert not list((tmp_path / "pending").glob("*.json"))
     with engine.connect() as conn:
         assert conn.scalar(text("SELECT COUNT(*) FROM domain_state")) == 0
 
@@ -155,7 +169,7 @@ def test_http_errors_are_json(setup_api, data, content_type, status):
 
 
 @pytest.mark.parametrize("error", [
-    OperationalError("query", {}, Exception("secret connection string")),
+    OperationalError("query", {}, psycopg2.OperationalError("secret connection string")),
     psycopg2.OperationalError("secret connection string"),
 ])
 def test_db_failure_returns_503_without_publishing(setup_api, monkeypatch, error):
@@ -167,6 +181,7 @@ def test_db_failure_returns_503_without_publishing(setup_api, monkeypatch, error
     assert response.status_code == 503
     assert "secret" not in response.text
     assert not list(tmp_path.rglob("*.jsonl"))
+    assert not list((tmp_path / "pending").glob("*.json"))
 
 
 def test_domain_failure_rolls_back_whole_transaction(setup_api, monkeypatch):
@@ -175,7 +190,7 @@ def test_domain_failure_rolls_back_whole_transaction(setup_api, monkeypatch):
 
     def fail_second(self, domain, shard_id):
         if domain == "example.org":
-            raise OperationalError("query", {}, Exception("database unavailable"))
+            raise OperationalError("query", {}, psycopg2.OperationalError("database unavailable"))
         return original(self, domain, shard_id)
 
     monkeypatch.setattr(service_module.DomainResolver, "ensure_and_get", fail_second)
@@ -184,12 +199,49 @@ def test_domain_failure_rolls_back_whole_transaction(setup_api, monkeypatch):
     ]})
     assert response.status_code == 503
     assert not list(tmp_path.rglob("*.jsonl"))
+    assert not list((tmp_path / "pending").glob("*.json"))
     with engine.connect() as conn:
         assert conn.scalar(text("SELECT COUNT(*) FROM domain_state")) == 0
 
 
-def test_partial_publication_is_reported_and_temporary_file_removed(setup_api, monkeypatch):
+@pytest.mark.parametrize("failure", ["rename", "flush"])
+def test_storage_failure_rejects_entire_multishard_batch(setup_api, monkeypatch, failure):
     client, _, _, tmp_path = setup_api
+    operation = "replace" if failure == "rename" else "fsync"
+    monkeypatch.setattr(service_module.os, operation, Mock(side_effect=OSError(errno.ENOSPC, "disk full")))
+    response = client.post("/v1/urls", json={"urls": [
+        "https://example.com/a", "https://example.org/b",
+    ]})
+    assert response.status_code == 503
+    assert response.json == {"error": "Submission unavailable; no URLs accepted"}
+    assert not list((tmp_path / "pending").glob("*.json"))
+    assert not list(tmp_path.rglob("*.jsonl"))
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_batch_is_published_with_one_rename_regardless_of_shards(setup_api, monkeypatch):
+    client, _, _, tmp_path = setup_api
+    original = service_module.os.replace
+    publish = Mock(side_effect=original)
+    monkeypatch.setattr(service_module.os, "replace", publish)
+    response = client.post("/v1/urls", json={"urls": [
+        "https://example.com/a", "https://example.org/b",
+    ]})
+    assert response.status_code == 200
+    assert publish.call_count == 1
+    batches = list((tmp_path / "pending").glob("*.json"))
+    assert len(batches) == 1
+    assert len(json.loads(batches[0].read_text())) == 2
+
+
+def test_delivery_failure_retains_accepted_batch_for_retry(setup_api, monkeypatch):
+    client, _, _, tmp_path = setup_api
+    response = client.post("/v1/urls", json={"urls": [
+        "https://example.com/a", "https://example.org/b",
+    ]})
+    assert response.status_code == 200
+    batch = next((tmp_path / "pending").glob("*.json"))
+    dispatcher = SubmissionDispatcher(yaml.safe_load((tmp_path / "ingest.yaml").read_text()))
     original_replace = service_module.os.replace
     count = 0
 
@@ -200,14 +252,91 @@ def test_partial_publication_is_reported_and_temporary_file_removed(setup_api, m
             raise OSError("disk full")
         original_replace(source, target)
 
-    monkeypatch.setattr(service_module.os, "replace", fail_second)
-    response = client.post("/v1/urls", json={"urls": [
-        "https://example.com/a", "https://example.org/b",
-    ]})
-    assert response.status_code == 503
-    assert response.json["published_count"] == 1
+    monkeypatch.setattr(dispatcher_module.os, "replace", fail_second)
+    monkeypatch.setattr(dispatcher_module, "current_interval", lambda minutes: ("20261015", "0010"))
+    with pytest.raises(OSError):
+        dispatcher.process_file(batch)
+    assert batch.exists()
+    assert len(json.loads(batch.read_text())) == 2
     assert len(list(tmp_path.rglob("*.jsonl"))) == 1
     assert not list(tmp_path.rglob("*.tmp"))
+    monkeypatch.setattr(dispatcher_module.os, "replace", original_replace)
+    monkeypatch.setattr(dispatcher_module, "current_interval", lambda minutes: ("20261015", "0030"))
+    # A fresh worker can resume an accepted batch left by a failed worker.
+    SubmissionDispatcher(yaml.safe_load((tmp_path / "ingest.yaml").read_text())).run_once()
+    assert not batch.exists()
+    assert len(list(tmp_path.glob("ipc/ingestor_*/20261015/0030/*.jsonl"))) == 2
+    groups = records_by_worker(tmp_path)
+    assert set(groups) == {"ingestor_02", "ingestor_06"}
+
+
+def test_dispatcher_ignores_unaccepted_temporary_files(setup_api):
+    _, _, _, tmp_path = setup_api
+    pending = tmp_path / "pending"
+    pending.mkdir()
+    (pending / "incomplete.json.tmp").write_text("incomplete")
+    dispatcher = SubmissionDispatcher(yaml.safe_load((tmp_path / "ingest.yaml").read_text()))
+    dispatcher.run_once()
+    assert not list(tmp_path.rglob("*.jsonl"))
+
+
+@pytest.mark.parametrize("error", [
+    PermissionError(errno.EACCES, "secret storage path"),
+    psycopg2.ProgrammingError("secret query"),
+    RuntimeError("secret internal state"),
+])
+def test_unexpected_failure_returns_500_and_accepts_nothing(setup_api, monkeypatch, error):
+    client, svc, _, tmp_path = setup_api
+    monkeypatch.setattr(svc, "_submit_locked", Mock(side_effect=error))
+    response = client.post("/v1/urls", json={"urls": ["https://example.com/a"]})
+    assert response.status_code == 500
+    assert response.json == {"error": "Submission failed; no URLs accepted"}
+    assert not list((tmp_path / "pending").glob("*.json"))
+
+
+def test_overlapping_api_requests_publish_complete_distinct_batches(setup_api):
+    client, _, engine, tmp_path = setup_api
+    start = Barrier(3)
+
+    def submit(path):
+        with client.application.test_client() as concurrent_client:
+            start.wait(timeout=5)
+            return concurrent_client.post("/v1/urls", json={"urls": [
+                f"https://example.com/{path}", f"https://example.org/{path}",
+            ]}).status_code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = [pool.submit(submit, path) for path in ("a", "b")]
+        start.wait(timeout=5)
+        assert [future.result(timeout=10) for future in responses] == [200, 200]
+    batches = list((tmp_path / "pending").glob("*.json"))
+    assert len(batches) == 2
+    assert all(len(json.loads(batch.read_text())) == 2 for batch in batches)
+    with engine.connect() as conn:
+        assert conn.scalar(text("SELECT COUNT(*) FROM domain_state")) == 2
+
+
+def test_overlapping_dispatchers_do_not_deliver_same_batch_twice(setup_api, monkeypatch):
+    client, _, _, tmp_path = setup_api
+    assert client.post("/v1/urls", json={"urls": ["https://example.com/a"]}).status_code == 200
+    batch = next((tmp_path / "pending").glob("*.json"))
+    dispatcher = SubmissionDispatcher(yaml.safe_load((tmp_path / "ingest.yaml").read_text()))
+    deliver = Mock(wraps=dispatcher._process_locked)
+    monkeypatch.setattr(dispatcher, "_process_locked", deliver)
+    start = Barrier(3)
+
+    def dispatch():
+        start.wait(timeout=5)
+        dispatcher.process_file(batch)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        workers = [pool.submit(dispatch) for _ in range(2)]
+        start.wait(timeout=5)
+        for worker in workers:
+            worker.result(timeout=10)
+    assert deliver.call_count == 1
+    assert len(list(tmp_path.rglob("*.jsonl"))) == 1
+    assert not batch.exists()
 
 
 def test_health_does_not_access_db(setup_api, monkeypatch):

@@ -1,17 +1,36 @@
 from __future__ import annotations
 
 import os
+import errno
 
 import psycopg2
 from flask import Flask, jsonify, request
 from sqlalchemy import create_engine
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import sessionmaker
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge, UnsupportedMediaType
 
 from libs.config.loader import load_yaml
 from libs.obslog import configure
-from .service import PublicationError, SubmissionService, validate_urls
+from .service import SubmissionService, validate_urls
+
+
+def temporary_storage_error(error: Exception) -> bool:
+    if isinstance(error, PoolTimeoutError):
+        return True
+    if isinstance(error, OSError):
+        return error.errno in {
+            errno.ENOSPC, errno.EDQUOT, errno.EMFILE, errno.ENFILE,
+            errno.EAGAIN, errno.EBUSY, errno.ETIMEDOUT,
+            errno.ECONNREFUSED, errno.ECONNRESET,
+        }
+    underlying = getattr(error, "orig", error)
+    code = getattr(underlying, "pgcode", None)
+    if code:
+        return code.startswith(("08", "53")) or code in {
+            "40001", "40P01", "55P03", "57014", "57P01", "57P02", "57P03",
+        }
+    return isinstance(underlying, (psycopg2.OperationalError, psycopg2.InterfaceError))
 
 
 def create_app(config_path: str | None = None, *, service=None) -> Flask:
@@ -48,15 +67,14 @@ def create_app(config_path: str | None = None, *, service=None) -> Flask:
         try:
             service.submit(urls)
             return jsonify(status="ok"), 200
-        except PublicationError as exc:
-            app.logger.exception("submission.publish_failed")
-            return jsonify(
-                error="IPC publication failed; some URLs may already be queued",
-                published_count=exc.published_count,
-            ), 503
-        except (SQLAlchemyError, psycopg2.Error, OSError):
-            app.logger.exception("submission.unavailable")
-            return jsonify(error="Submission storage unavailable"), 503
+        except (SQLAlchemyError, psycopg2.Error, OSError) as exc:
+            app.logger.exception("submission.storage_failed")
+            if temporary_storage_error(exc):
+                return jsonify(error="Submission unavailable; no URLs accepted"), 503
+            return jsonify(error="Submission failed; no URLs accepted"), 500
+        except Exception:
+            app.logger.exception("submission.failed")
+            return jsonify(error="Submission failed; no URLs accepted"), 500
 
     @app.errorhandler(BadRequest)
     def bad_json(error):
