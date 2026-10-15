@@ -5,17 +5,12 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
-from w3lib.url import canonicalize_url
-from urllib.parse import urlsplit
-
 from libs.db.sharding.key import load_sharding_config
 from libs.db.sharding.router import ShardRouter
 from libs.ipc.new_link_record import DISCOVERY_SOURCE_UNKNOWN, build_new_link_record
+from libs.urls import validate_url
 from containers.scheduler_ingest.router.domain_resolver import DomainResolver
 from .queue_lock import queue_lock
-
-
-MAX_URL_LEN = 2500
 
 
 def validate_urls(payload: object, max_urls: int) -> list[str]:
@@ -28,21 +23,8 @@ def validate_urls(payload: object, max_urls: int) -> list[str]:
     normalized = {}
     for index, url in enumerate(urls):
         try:
-            if not isinstance(url, str) or not url or len(url) > MAX_URL_LEN:
-                raise ValueError()
-            if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url):
-                raise ValueError()
-            parts = urlsplit(url)
-            if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
-                raise ValueError()
-            if parts.username is not None or parts.password is not None or "\\" in parts.netloc:
-                raise ValueError()
-            # Accessing port also validates malformed / out-of-range ports.
-            parts.port
-            canonical = canonicalize_url(url)
-            if len(canonical) > MAX_URL_LEN:
-                raise ValueError()
-        except (ValueError, UnicodeError):
+            canonical = validate_url(url)
+        except ValueError:
             raise ValueError(f"Invalid HTTP(S) URL at index {index}") from None
         normalized[canonical] = None
     return list(normalized)
