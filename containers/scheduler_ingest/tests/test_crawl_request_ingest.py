@@ -1,16 +1,19 @@
 """Database integration tests. CI supplies CRAWL_REQUEST_TEST_DSN."""
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, local
 import json
 import os
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import Boolean, Column, DateTime, DefaultClause, Integer, MetaData, SmallInteger, String, create_engine, text
+from sqlalchemy import Boolean, Column, DateTime, DefaultClause, Integer, MetaData, SmallInteger, String, create_engine, event, text
 from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import sessionmaker
 
 from containers.scheduler_ingest.ingestor.db_ops import IngestDB
 from containers.scheduler_ingest.api.dispatcher import SubmissionDispatcher
+from containers.scheduler_ingest.router.domain_resolver import DomainResolver
 from libs.ipc.new_link_record import build_new_link_record
 from libs.db.models.domain.state import DomainState
 from libs.db.sharding.table_factory import url_state_current_table, url_state_history_table, url_event_counter_table
@@ -116,7 +119,7 @@ def test_existing_fetch_result_handling_is_preserved(database, tmp_path, status)
     assert state(engine)["should_crawl"] is False
 
 
-def test_dispatch_failure_rolls_back_requeues_and_retains_batch(database, tmp_path):
+def test_failed_shard_retains_batch_while_other_shards_can_commit(database, tmp_path):
     db, engine = database
     db.process_batch([request_record()])
     with engine.begin() as conn:
@@ -124,7 +127,7 @@ def test_dispatch_failure_rolls_back_requeues_and_retains_batch(database, tmp_pa
         conn.execute(text("DROP TABLE url_state_current_004"))
     with pytest.raises(ProgrammingError, match="url_state_current_004"):
         dispatch(engine, tmp_path, [request_record(), request_record(shard=4)])
-    assert state(engine)["should_crawl"] is False
+    assert state(engine)["should_crawl"] is True
     assert (tmp_path / "pending" / "batch.json").exists()
     assert not list(tmp_path.rglob("*.jsonl"))
 
@@ -137,3 +140,53 @@ def test_repeated_request_can_requeue_again(database, tmp_path):
             conn.execute(text("UPDATE url_state_current_003 SET should_crawl=false"))
         dispatch(engine, tmp_path, [request_record()])
         assert state(engine)["should_crawl"] is True
+
+
+def test_concurrent_domain_creation_returns_the_same_committed_ids(database):
+    _, engine = database
+    first_lookup = Barrier(2)
+    worker_state = local()
+    domains = {"new-a.example": 3, "new-b.example": 4, "example.com": 3}
+
+    @event.listens_for(engine, "after_cursor_execute")
+    def synchronize_initial_lookup(conn, cursor, statement, parameters, context, executemany):
+        if "SELECT domain, domain_id" in statement and not getattr(worker_state, "looked_up", False):
+            worker_state.looked_up = True
+            first_lookup.wait(timeout=10)
+
+    def resolve(items):
+        with sessionmaker(bind=engine).begin() as session:
+            return DomainResolver(session).batch_ensure_and_get(dict(items))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        workers = [pool.submit(resolve, list(domains.items())),
+                   pool.submit(resolve, list(reversed(domains.items())))]
+        results = [worker.result(timeout=15) for worker in workers]
+    assert results[0] == results[1]
+    assert set(results[0]) == set(domains)
+    assert results[0]["example.com"][0] == 7
+    assert len({value[0] for value in results[0].values()}) == 3
+    with engine.connect() as conn:
+        assert conn.scalar(text("SELECT COUNT(*) FROM domain_state")) == 3
+
+
+def test_dispatcher_updates_different_postgres_shards_in_parallel(database, tmp_path):
+    _, engine = database
+    reached_update = Barrier(2)
+    records = [request_record(url=f"https://example.com/{shard}", shard=shard) for shard in (3, 4)]
+    with engine.begin() as conn:
+        for shard, record in zip((3, 4), records):
+            conn.execute(text(f"""
+                INSERT INTO url_state_current_{shard:03d} (url, domain_id, domain_score, should_crawl)
+                VALUES (:url, 7, 0, false)
+            """), {"url": record["url"]})
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def synchronize(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("UPDATE url_state_current_"):
+            reached_update.wait(timeout=10)
+
+    assert len(dispatch(engine, tmp_path, records)) == 2
+    with engine.connect() as conn:
+        for shard in (3, 4):
+            assert conn.scalar(text(f"SELECT should_crawl FROM url_state_current_{shard:03d}")) is True

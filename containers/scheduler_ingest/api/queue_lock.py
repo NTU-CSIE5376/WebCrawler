@@ -1,4 +1,4 @@
-"""Serialize infrequent submissions and delivery across worker processes."""
+"""Coordinate publication, batch ownership and shard updates across processes."""
 from contextlib import contextmanager, suppress
 import fcntl
 import os
@@ -19,5 +19,36 @@ def queue_lock(directory: Path):
         # must not turn an already accepted batch into a reported rejection.
         with suppress(OSError):
             fcntl.flock(descriptor, fcntl.LOCK_UN)
+        with suppress(OSError):
+            os.close(descriptor)
+
+
+@contextmanager
+def batch_claim(batch: Path):
+    """Claim an immutable accepted file without waiting for another worker.
+
+    Keep the file in pending until delivery finishes. Process death releases
+    ownership automatically, so another dispatcher can retry the same file.
+    """
+    try:
+        descriptor = os.open(batch, os.O_RDONLY)
+    except FileNotFoundError:
+        yield False
+        return
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        # A previous owner may have removed the file after we opened it.
+        try:
+            current = batch.stat()
+            opened = os.fstat(descriptor)
+            owned = (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino)
+        except FileNotFoundError:
+            owned = False
+        yield owned
+    finally:
         with suppress(OSError):
             os.close(descriptor)
