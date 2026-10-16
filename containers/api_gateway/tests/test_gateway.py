@@ -126,7 +126,7 @@ import sys
 connection = http.client.HTTPConnection('localhost', 80, timeout=10)
 if sys.argv[2] == 'gateway':
     connection.request('POST', sys.argv[1] + '/resources', body=b'', headers={
-        'Content-Type': 'application/json', 'Content-Length': str(20 * 1024 * 1024 + 1),
+        'Content-Type': 'application/json', 'Content-Length': str(300 * 1024 * 1024 + 1),
     })
 else:
     connection.request('GET', sys.argv[1] + '/too-large')

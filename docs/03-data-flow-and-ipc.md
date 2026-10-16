@@ -150,7 +150,7 @@ local base URL is `http://localhost:4000`; remote clients use the host address
 provided by the deployment. Authentication is not required.
 Interactive API documentation is available at `/scheduler_ingest/docs`.
 
-The gateway limits request bodies to 20 MiB. Oversized requests return
+The gateway limits request bodies to 300 MiB. Oversized requests return
 `413 Content Too Large` with a JSON body:
 
 ```json
