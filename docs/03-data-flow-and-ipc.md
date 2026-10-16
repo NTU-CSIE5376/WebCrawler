@@ -177,7 +177,7 @@ and schedule. The request must use `Content-Type: application/json`.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `urls` | Array of strings | Yes | Nonempty list of absolute HTTP or HTTPS URLs; default maximum 1,000 per request. |
+| `urls` | Array of strings | Yes | Nonempty list of absolute HTTP or HTTPS URLs; default maximum 10,000 per request. |
 
 The body must contain only `urls`. The default URL length limit is 2,500
 characters, checked both before and after normalization.

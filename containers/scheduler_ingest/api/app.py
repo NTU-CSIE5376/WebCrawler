@@ -54,7 +54,7 @@ def create_app(config_path: str | None = None, *, service=None) -> FastAPI:
     config = load_yaml(config_path)
     api_config = config.get("api", {})
     crawl_request_config = api_config.get("crawl_request", {})
-    max_urls = int(crawl_request_config.get("max_urls", 1000))
+    max_urls = int(crawl_request_config.get("max_urls", 10000))
     max_url_length = int(crawl_request_config.get("max_url_length", MAX_URL_LEN))
     if max_urls < 1:
         raise ValueError("api.crawl_request.max_urls must be positive")
