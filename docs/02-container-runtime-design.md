@@ -105,13 +105,13 @@ The container has an 8-CPU limit shared by 6 program families via `supervisord`:
 - `ingestor` x16
 - `feature_extractor` x16
 - `stats_aggregator` x1
-- `scheduler_ingest_api`: 1 Uvicorn parent process + 4 API worker processes (worker count configured by `api.workers` in `config/ingest.yaml`)
-- `crawl_request_dispatcher` x4 (each process uses up to 8 SQL threads)
+- `scheduler_ingest_api` x5 (1 Uvicorn parent + 4 API workers)
+- `crawl_request_dispatcher` x4 (each with 8 SQL threads)
 
 ### API Server
 
 `python -m containers.scheduler_ingest.api.server --config ...` reads the YAML
-worker count and starts Uvicorn. Each API worker loads the same configuration.
+worker count from `api.workers` and starts Uvicorn. Each API worker loads the same configuration.
 Requests validate and deduplicate the complete batch, resolve domains in bounded
 SQL batches, then stage a pending file. Domain writes and file staging run outside
 the publication lock; an atomic rename publishes the complete accepted batch.
