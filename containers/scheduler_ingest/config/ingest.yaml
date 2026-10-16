@@ -34,10 +34,17 @@ extractor:
   interval_minutes: 10
 
 api:
+  workers: 4
   crawl_request:
     pending_dir: "/data/ipc/crawl_request/pending"
     max_urls: 10000
     max_url_length: 2500
+    # SQL threads per dispatcher process; concurrent shards use separate locks.
+    dispatcher_workers: 8
+    # Coalesce pending requests within these bounds (one oversized request
+    # is still processed on its own).
+    dispatcher_max_urls: 100000
+    dispatcher_max_batches: 32
 
 stats:
   stats_dir: "/data/ipc/stats"

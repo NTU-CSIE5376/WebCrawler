@@ -97,6 +97,7 @@ services:
       context: .
       dockerfile: containers/scheduler_ingest/Dockerfile
     container_name: scheduler_ingest
+    cpus: 8
     expose:
       - "8080"
     init: true
