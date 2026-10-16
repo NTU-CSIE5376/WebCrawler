@@ -108,36 +108,33 @@ The container has an 8-CPU limit shared by 6 program families via `supervisord`:
 - `scheduler_ingest_api` x5 (1 Uvicorn parent + 4 API workers)
 - `crawl_request_dispatcher` x4 (each with 8 SQL threads)
 
-### API Server
+### API Server (x5)
 
-`python -m containers.scheduler_ingest.api.server --config ...` reads the YAML
-worker count from `api.workers` and starts Uvicorn. Each API worker loads the same configuration.
-Requests validate and deduplicate the complete batch, resolve domains in bounded
-SQL batches, then stage a pending file. Domain writes and file staging run outside
-the publication lock; an atomic rename publishes the complete accepted batch.
+Input: HTTP requests containing URL batches.
+
+Responsibilities:
+
+- Start 1 Uvicorn parent and 4 API workers using `api.workers` in `config/ingest.yaml`.
+- Validate and deduplicate the complete request before any database or file writes.
+- Resolve domains in bounded SQL batches and commit domain writes before publishing the batch.
+- Stage the complete pending file outside the publication lock, then publish it with an atomic rename under the lock.
+- Accept the entire batch for asynchronous processing, or return an error with no batch accepted.
 
 ### Crawl Request Dispatcher (x4)
 
-Each process claims pending files with a nonblocking file lock, so only one
-dispatcher handles a batch at a time. A batch remains pending until delivery
-finishes; process exit releases ownership so another dispatcher can retry it.
+Input: accepted batch files in `api.crawl_request.pending_dir`.
 
-Dispatchers combine pending requests by shard and update `should_crawl=TRUE`
-in parallel across shards. A persistent lock per shard serializes that shard's
-updates across all dispatcher processes; each shard commits independently before
-its lock is released. Accepted requests are published as one JSONL file per
-ingestor per request, preserving the existing ingestor input format.
+Responsibilities:
 
-If a shard update or file publication fails, the affected batch remains pending
-for retry. Other shards may already have committed, and retrying can request
-another crawl. Unrelated successful batches can still complete. This retry
-behavior applies after API acceptance; request acceptance remains all-or-nothing.
+- Claim pending files with nonblocking file locks so only one dispatcher handles each batch. Process exit releases ownership for retry.
+- Combine pending requests by shard, up to `dispatcher_max_urls: 100000` and `dispatcher_max_batches: 32`. An accepted batch above the URL bound is processed on its own.
+- Update `should_crawl=TRUE` across shards using `dispatcher_workers: 8` SQL threads per process. A persistent lock per shard serializes updates across dispatcher processes; each shard commits before releasing its lock.
+- Publish one JSONL file per ingestor per accepted request, preserving the existing ingestor input format, then remove the completed pending file.
+- Retain batches affected by failed shard updates or file publication for retry while allowing unrelated successful batches to complete. Other shards may already have committed, so a retry can request another crawl.
 
-The `api.crawl_request` settings in `config/ingest.yaml` control SQL threads per
-process (`dispatcher_workers: 8`) and coalescing bounds
-(`dispatcher_max_urls: 100000`, `dispatcher_max_batches: 32`). An accepted batch
-larger than the coalescing URL limit is processed on its own. The four dispatcher
-processes are configured in `supervisord.conf`.
+The four dispatcher processes are configured in `supervisord.conf`; SQL thread
+and coalescing settings live under `api.crawl_request` in `config/ingest.yaml`.
+Retries happen after API acceptance, which remains all-or-nothing.
 
 ### Router (x16)
 
