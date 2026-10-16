@@ -38,10 +38,6 @@ class SubmissionService:
         self.pending_dir = Path(config["api"]["crawl_request"]["pending_dir"])
 
     def submit(self, urls: list[str]) -> None:
-        with queue_lock(self.pending_dir):
-            self._submit_locked(urls)
-
-    def _submit_locked(self, urls: list[str]) -> None:
         file_tag = uuid4().hex
         records = []
         # Domain writes commit before the entire batch becomes visible.
@@ -55,9 +51,15 @@ class SubmissionService:
                 split_subdomains=split_subdomains,
             )
             resolver = DomainResolver(session)
+            routed = []
+            domain_shards = {}
             for url in urls:
                 domain, shard_id, _ = router.route(url)
-                domain_id, domain_score = resolver.ensure_and_get(domain, shard_id)
+                routed.append((url, domain, shard_id))
+                domain_shards.setdefault(domain, shard_id)
+            domains = resolver.batch_ensure_and_get(domain_shards)
+            for url, domain, shard_id in routed:
+                domain_id, domain_score = domains[domain]
                 records.append(build_new_link_record(
                     url=url,
                     shard_id=shard_id,
@@ -80,7 +82,10 @@ class SubmissionService:
                 json.dump(records, handle, ensure_ascii=False)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, target)
+            # Preparation is independent across requests. Only publication
+            # needs the queue lock; .tmp files are never dispatched.
+            with queue_lock(self.pending_dir):
+                os.replace(temporary, target)
         except OSError:
             # A leftover .tmp is never accepted or read by the dispatcher.
             try:

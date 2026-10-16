@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import errno
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, Event
 from unittest.mock import Mock
 
 import pytest
@@ -14,11 +14,11 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from containers.scheduler_ingest.api.app import create_app
 from containers.scheduler_ingest.api import service as service_module
 from containers.scheduler_ingest.api.service import SubmissionService
+from containers.scheduler_ingest.api.queue_lock import queue_lock
 from containers.scheduler_ingest.api.dispatcher import SubmissionDispatcher
 from containers.scheduler_ingest.api import dispatcher as dispatcher_module
 from libs.db.sharding import key
@@ -48,7 +48,7 @@ def setup_api(tmp_path, monkeypatch):
     monkeypatch.setattr(key.tldextract, "extract", tldextract.TLDExtract(
         suffix_list_urls=(), cache_dir=None,
     ))
-    engine = create_engine(config["postgres"]["dsn"], connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    engine = create_engine(config["postgres"]["dsn"], connect_args={"check_same_thread": False})
     with engine.begin() as conn:
         conn.execute(text("""
             CREATE TABLE domain_state (
@@ -115,6 +115,23 @@ def test_canonical_duplicates_are_deduplicated(setup_api):
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
     assert len(records_by_worker(tmp_path)["ingestor_02"]) == 1
+
+
+def test_submission_resolves_unique_domains_in_batch(setup_api, monkeypatch):
+    client, _, engine, tmp_path = setup_api
+    monkeypatch.setattr(service_module.DomainResolver, "ensure_and_get", Mock(
+        side_effect=AssertionError("Submission must use batch domain resolution"),
+    ))
+    urls = ["https://example.com/a", "https://example.org/b", "https://example.com/c"]
+    response = client.post("/v1/crawl-requests", json={"urls": urls})
+    assert response.status_code == 200
+    batch = next((tmp_path / "pending").glob("*.json"))
+    records = json.loads(batch.read_text())
+    assert [record["url"] for record in records] == urls
+    assert records[0]["domain_id"] == records[2]["domain_id"]
+    assert records[0]["domain_id"] != records[1]["domain_id"]
+    with engine.connect() as conn:
+        assert conn.scalar(text("SELECT COUNT(*) FROM domain_state")) == 2
 
 
 def test_routes_are_defined_without_gateway_prefix(setup_api):
@@ -197,14 +214,13 @@ def test_db_failure_returns_503_without_publishing(setup_api, monkeypatch, error
 
 def test_domain_failure_rolls_back_whole_transaction(setup_api, monkeypatch):
     client, _, engine, tmp_path = setup_api
-    original = service_module.DomainResolver.ensure_and_get
+    original = service_module.DomainResolver.batch_ensure_and_get
 
-    def fail_second(self, domain, shard_id):
-        if domain == "example.org":
-            raise OperationalError("query", {}, psycopg2.OperationalError("database unavailable"))
-        return original(self, domain, shard_id)
+    def fail_after_insert(self, domains):
+        original(self, domains)
+        raise OperationalError("query", {}, psycopg2.OperationalError("database unavailable"))
 
-    monkeypatch.setattr(service_module.DomainResolver, "ensure_and_get", fail_second)
+    monkeypatch.setattr(service_module.DomainResolver, "batch_ensure_and_get", fail_after_insert)
     response = client.post("/v1/crawl-requests", json={"urls": [
         "https://example.com/a", "https://example.org/b",
     ]})
@@ -298,7 +314,7 @@ def test_dispatcher_ignores_unaccepted_temporary_files(setup_api):
 ])
 def test_unexpected_failure_returns_500_and_accepts_nothing(setup_api, monkeypatch, error):
     client, svc, _, tmp_path = setup_api
-    monkeypatch.setattr(svc, "_submit_locked", Mock(side_effect=error))
+    monkeypatch.setattr(svc, "submit", Mock(side_effect=error))
     response = client.post("/v1/crawl-requests", json={"urls": ["https://example.com/a"]})
     assert response.status_code == 500
     assert response.json() == {"error": "Submission failed; no URLs accepted"}
@@ -325,6 +341,52 @@ def test_overlapping_api_requests_publish_complete_distinct_batches(setup_api):
     assert all(len(json.loads(batch.read_text())) == 2 for batch in batches)
     with engine.connect() as conn:
         assert conn.scalar(text("SELECT COUNT(*) FROM domain_state")) == 2
+
+
+def test_submission_prepares_while_dispatcher_holds_queue_lock(setup_api, monkeypatch):
+    _, svc, engine, tmp_path = setup_api
+    staged = Event()
+    original = service_module.os.fsync
+
+    def signal_staged(descriptor):
+        original(descriptor)
+        staged.set()
+
+    monkeypatch.setattr(service_module.os, "fsync", signal_staged)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with queue_lock(svc.pending_dir):
+            future = pool.submit(svc.submit, ["https://example.com/a"])
+            assert staged.wait(timeout=5), "Preparation must not wait for the queue lock"
+            assert not future.done()
+            assert not list(svc.pending_dir.glob("*.json"))
+            temporary = next(svc.pending_dir.glob("*.json.tmp"))
+            assert len(json.loads(temporary.read_text())) == 1
+            with engine.connect() as conn:
+                assert conn.scalar(text("SELECT COUNT(*) FROM domain_state")) == 1
+        future.result(timeout=5)
+    assert len(list(svc.pending_dir.glob("*.json"))) == 1
+    assert not list(svc.pending_dir.glob("*.tmp"))
+
+
+def test_overlapping_submissions_stage_in_parallel(setup_api, monkeypatch):
+    _, svc, _, _ = setup_api
+    staged = Barrier(2)
+    original = service_module.os.fsync
+
+    def wait_for_both_submissions(descriptor):
+        original(descriptor)
+        staged.wait(timeout=5)
+
+    monkeypatch.setattr(service_module.os, "fsync", wait_for_both_submissions)
+    urls = ["https://example.com/a", "https://example.org/b"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(svc.submit, [url]) for url in urls]
+        for future in futures:
+            future.result(timeout=10)
+    batches = list(svc.pending_dir.glob("*.json"))
+    assert len(batches) == 2
+    assert sorted(json.loads(batch.read_text())[0]["url"] for batch in batches) == urls
+    assert not list(svc.pending_dir.glob("*.tmp"))
 
 
 def test_overlapping_dispatchers_do_not_deliver_same_batch_twice(setup_api, monkeypatch):
