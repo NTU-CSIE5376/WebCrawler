@@ -362,7 +362,10 @@ Input: accepted job messages in `MANUAL_BULK_CRAWL_QUEUE_DIR`
 
 The existing `html_spider` workers also consume API jobs. The API resolves each
 URL to the crawler that owns its domain's shard, using read-only routing data.
-It neither inserts domains nor updates URL scheduling flags. API requests use
+The routing configuration is selected by `ingest_config_path` in
+`containers/api/config/config.yml`; PostgreSQL connection settings remain in
+that API configuration. It neither inserts domains nor updates URL scheduling
+flags. API requests use
 the same downloader, domain slots, robots.txt rules, retry policy and
 AutoThrottle settings as regular requests. Normal crawl requests have higher
 scheduler priority than API requests.

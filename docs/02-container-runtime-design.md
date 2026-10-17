@@ -163,29 +163,25 @@ Responsibilities:
 
 ## 2.5 `api` Container
 
-The API container replaces the Nginx gateway and runs Flask with Gunicorn.
-Compose binds host `127.0.0.1:4000` to container port `8080`; set
-`API_BIND_ADDRESS` and `API_PORT` to change the host binding.
+The `api` container hosts the system's external HTTP APIs using Flask and Gunicorn.
+It has an 8-CPU limit. Compose binds host `127.0.0.1:4000` to container port `8080`;
+set `API_BIND_ADDRESS` and `API_PORT` to change the host binding.
 
 ### API Server (x5)
 
-Input: HTTP requests under `/v1/manual-bulk-crawls`.
+Input: external HTTP requests.
 
 Responsibilities:
 
 - Run 1 Gunicorn master and 4 API workers, configured in `containers/api/config/config.yml`.
-- Validate and deduplicate the complete batch before accepting any URLs.
-- Publish one immutable job file with an atomic rename and return its job ID.
-- Report job status and serve completed HTML and metadata for download.
-- Apply the configured 300 MiB request body limit using Flask's built-in handling.
-- Read API paths and limits from `manual_bulk_crawl` in `containers/api/config/config.yml`.
-- Include the output root in each job message so crawlers need no API configuration.
+- Route requests to the registered Flask endpoint handlers.
+- Return JSON error responses and enforce the configured request body limit
+  (default 300 MiB) using Flask's built-in handling.
+- Load server and feature settings from `containers/api/config/config.yml`.
 
-The API has an 8-CPU limit and shares `/data/manual_bulk_crawls` with the existing
-crawler pool. It reads shard routing from the existing scheduler_ingest YAML
-selected by `ingest_config_path` in `containers/api/config/config.yml`;
-PostgreSQL connection settings remain in the API configuration.
-It does not submit ingestion records or change scheduler state.
+[Manual Bulk Crawl](03-data-flow-and-ipc.md#361-manual-bulk-crawl-api), under
+`/v1/manual-bulk-crawls`, is currently the only feature API. Additional features
+can register their own endpoints in the same server.
 
 See [Manual Bulk Crawl processing](03-data-flow-and-ipc.md#37-manual-bulk-crawl-processing)
-for queue ownership, resource limits and result publication.
+for its queue ownership, resource limits and result publication.
