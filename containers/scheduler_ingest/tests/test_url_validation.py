@@ -8,9 +8,10 @@ from libs.urls import MAX_URL_LEN, validate_url
     ("HTTPS://Example.COM/a?b=2&a=1#section", "https://example.com/a?a=1&b=2"),
     ("http://example.com", "http://example.com/"),
     ("https://example.com:8443/a", "https://example.com:8443/a"),
-    ("https://[::1]/a", "https://[::1]/a"),
+    ("https://[2606:4700:4700::1111]/a", "https://[2606:4700:4700::1111]/a"),
+    ("https://1.1.1.1/a", "https://1.1.1.1/a"),
     ("https://bücher.example/a", "https://xn--bcher-kva.example/a"),
-    ("http://localhost/a?flag", "http://localhost/a?flag="),
+    ("http://example.com/a?flag", "http://example.com/a?flag="),
     ("https://example.com./a", "https://example.com./a"),
 ])
 def test_validate_url_returns_canonical_fetch_url(url, expected):
@@ -27,6 +28,14 @@ def test_validate_url_returns_canonical_fetch_url(url, expected):
     "https://bad..example/a", "https://invalid_hostname.example/a",
     "https://256.256.256.256/a", "https://[::gg]/a",
     "https://example.com/a?q=\x00", "\x00https://example.com/a",
+    "http://127.0.0.1:8080/", "http://localhost/",
+    "http://169.254.169.254/latest/meta-data/", "http://10.0.0.5/admin",
+    "http://172.16.191.1:5432/", "http://scheduler-ingest:8080/healthz",
+    "http://[::1]/", "https://[::1]/a", "http://localhost/a?flag",
+    "http://LOCALHOST./", "http://sub.localhost/", "http://scheduler-ingest./",
+    "http://127.0.0.1./", "http://192.168.1.1/", "http://100.64.0.1/",
+    "http://0.0.0.0/", "http://192.0.2.1/",
+    "http://[::]/", "http://[fc00::1]/", "http://[fe80::1]/",
 ])
 def test_validate_url_rejects_invalid_input(url):
     with pytest.raises(ValueError, match="^Invalid HTTP\\(S\\) URL$"):

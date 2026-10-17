@@ -1,4 +1,5 @@
 """Shared validation and canonicalization for crawl URL submissions."""
+from ipaddress import ip_address
 from urllib.parse import urlsplit
 
 import validators
@@ -12,6 +13,7 @@ def validate_url(url: object, *, max_length: int = MAX_URL_LEN) -> str:
     """Return a canonical absolute HTTP(S) URL or raise ValueError.
 
     This is string validation only: no DNS lookup or HTTP request is made.
+    IP literals must be global; localhost and single-label hosts are rejected.
     The length limit applies before and after encoding/canonicalization.
     """
     try:
@@ -27,8 +29,18 @@ def validate_url(url: object, *, max_length: int = MAX_URL_LEN) -> str:
         # permissive URL parser would strip or accept them.
         if any(ord(char) < 32 or ord(char) == 127 for char in url):
             raise ValueError()
-        if urlsplit(url).username is not None:
+        parsed = urlsplit(url)
+        if parsed.username is not None:
             raise ValueError()
+        host = (parsed.hostname or "").rstrip(".")
+        try:
+            address = ip_address(host)
+        except ValueError:
+            if "." not in host or host == "localhost" or host.endswith(".localhost"):
+                raise ValueError()
+        else:
+            if not address.is_global:
+                raise ValueError()
         canonical = canonicalize_url(url)
         if len(canonical) > max_length:
             raise ValueError()
