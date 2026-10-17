@@ -18,6 +18,7 @@ from twisted.internet import task as twisted_task
 from crawler.items import PageItem
 from crawler.queue_consumer import QueueConsumer
 from crawler.youtube_extractor import extract_youtube_outlinks
+from crawler.manual_bulk_crawls import ManualBulkCrawlConsumer
 from libs.obslog import configure as configure_logging
 
 logger = logging.getLogger("crawler")
@@ -49,6 +50,7 @@ class HtmlSpider(scrapy.Spider):
 
         qtpl = crawler.settings["URL_QUEUE_TEMPLATE"]
         spider.queue = QueueConsumer(queue_dir=qtpl.format(id=spider.crawler_id))
+        spider.manual_bulk_crawls = ManualBulkCrawlConsumer(spider)
         spider.link_extractor = LinkExtractor(canonicalize=True)
 
         spider.domain_low_watermark = max(
@@ -278,6 +280,7 @@ class HtmlSpider(scrapy.Spider):
             self._maybe_top_up(reason=f"{reason}_low_watermark")
 
     def spider_opened(self, spider=None):
+        self.manual_bulk_crawls.start()
         settings = self.crawler.settings
         logger.info(
             "crawler.config",
@@ -310,6 +313,7 @@ class HtmlSpider(scrapy.Spider):
             self._heartbeat_task.start(self.heartbeat_interval_sec, now=False)
 
     def spider_closed(self, spider=None, reason: str | None = None):
+        self.manual_bulk_crawls.close()
         if self._heartbeat_task is not None and self._heartbeat_task.running:
             self._heartbeat_task.stop()
         self._heartbeat_task = None

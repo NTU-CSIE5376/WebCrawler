@@ -111,4 +111,11 @@ ITEM_PIPELINES = {
 
 URL_QUEUE_TEMPLATE = "/data/ipc/url_queue/crawler_{id:02d}"
 RESULT_DIR_TEMPLATE = "/data/ipc/crawl_result/crawler_{id:02d}"
+# Transport location and resource limits belong to the crawler. Per-job output
+# destinations arrive in the queue payload, without reading API configuration.
+MANUAL_BULK_CRAWL_QUEUE_DIR = os.getenv(
+    "CRAWLER_MANUAL_BULK_CRAWL_QUEUE_DIR", "/data/manual_bulk_crawls/pending",
+)
+MANUAL_BULK_CRAWL_PREFETCH_URLS = int(os.getenv("CRAWLER_MANUAL_BULK_CRAWL_PREFETCH_URLS", "256"))
+MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS = int(os.getenv("CRAWLER_MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS", "64"))
 INTERVAL_MINUTES = 10
