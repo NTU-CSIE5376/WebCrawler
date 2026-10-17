@@ -253,6 +253,7 @@ Follow the status response's `results_url` to list available files:
   "files": [
     {
       "name": "00000.html",
+      "url": "https://example.com/",
       "size_bytes": 12345,
       "download_url": "/v1/manual-bulk-crawls/ab12cd34ef56ab78cd90ef12ab34cd56/results/00000.html"
     }
@@ -261,7 +262,9 @@ Follow the status response's `results_url` to list available files:
 ```
 
 The list includes downloaded HTML, per-URL JSON metadata, `request.json` and
-`status.json`. Each entry gives its byte size and download URL.
+`status.json`. Each entry gives its byte size, download URL and original
+submitted URL in `url` (after validation and normalization, before redirects).
+Job-wide files (`request.json` and `status.json`) have `url: null`.
 
 `GET /v1/manual-bulk-crawls/{job_id}/results/{filename}`
 

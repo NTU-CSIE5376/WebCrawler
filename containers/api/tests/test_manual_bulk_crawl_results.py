@@ -48,6 +48,11 @@ def test_remote_client_follows_status_listing_and_download_links(job_api):
     assert listing.status_code == 200
     files = {file["name"]: file for file in listing.get_json()["files"]}
     assert set(files) == {"request.json", "status.json", "00000.html", "00000.json", "00001.json"}
+    assert files["00000.html"]["url"] == "https://example.com/a"
+    assert files["00000.json"]["url"] == "https://example.com/a"
+    assert files["00001.json"]["url"] == "https://example.com/b"
+    assert files["request.json"]["url"] is None
+    assert files["status.json"]["url"] is None
     html = api_get(client, files["00000.html"]["download_url"])
     assert html.data == (service.result_dir / job_id / "00000.html").read_bytes()
     assert files["00000.html"]["size_bytes"] == len(html.data)

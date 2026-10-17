@@ -103,8 +103,10 @@ class ManualBulkCrawlService:
 
     def result_files(self, job_id: str) -> list[dict]:
         directory = self._completed_directory(job_id)
+        urls = json.loads((directory / "request.json").read_text(encoding="utf-8"))["urls"]
         return [
-            {"name": path.name, "size_bytes": path.stat().st_size}
+            {"name": path.name, "size_bytes": path.stat().st_size,
+             "url": urls[int(path.stem)] if path.stem.isdecimal() else None}
             for path in sorted(directory.iterdir())
             if RESULT_FILENAME.fullmatch(path.name) and not path.is_symlink() and path.is_file()
         ]
