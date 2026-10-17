@@ -178,10 +178,3 @@ Responsibilities:
 - Return JSON error responses and enforce the configured request body limit
   (default 300 MiB) using Flask's built-in handling.
 - Load server and feature settings from `containers/api/config/config.yml`.
-
-[Manual Bulk Crawl](03-data-flow-and-ipc.md#361-manual-bulk-crawl-api), under
-`/v1/manual-bulk-crawls`, is currently the only feature API. Additional features
-can register their own endpoints in the same server.
-
-See [Manual Bulk Crawl processing](03-data-flow-and-ipc.md#37-manual-bulk-crawl-processing)
-for its queue ownership, resource limits and result publication.
