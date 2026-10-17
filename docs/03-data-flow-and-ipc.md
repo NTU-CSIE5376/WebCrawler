@@ -129,27 +129,6 @@ so the schema stays in sync with the ingestor's `_bulk_links` reader.
 }
 ```
 
-### Manual Bulk Crawl Job (`*.json`)
-
-The API atomically publishes a job in its pending directory. Crawler workers
-consume this IPC message without reading the API's configuration:
-
-```json
-{
-  "version": 1,
-  "urls": ["https://example.com/article"],
-  "crawler_ids": [0],
-  "result_dir": "/data/manual_bulk_crawls/results",
-  "created_at": "2026-10-17T10:00:00+00:00"
-}
-```
-
-The filename stem is the job ID. `crawler_ids` assigns each URL to its existing
-crawler worker. `result_dir` is an absolute output root supplied by the publisher;
-the complete job is published under `{result_dir}/{job_id}`. The crawler's own
-settings control queue discovery and resource limits. API and crawler containers
-must mount the output storage at the same path.
-
 ## 3.4 Processing Windows and Progress Tracking
 
 - Time bucket unit: `interval_minutes` (configured as 10).
