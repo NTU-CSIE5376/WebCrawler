@@ -3,7 +3,7 @@ import sys
 
 import pytest
 
-from containers.scheduler_ingest.api.queue_lock import batch_claim, queue_lock
+from libs.ipc.manual_bulk_crawl import batch_claim, queue_lock
 
 
 def locked_by_another_process(directory):
@@ -51,7 +51,7 @@ def test_batch_claim_is_recoverable_after_process_death(tmp_path):
     code = """
 from pathlib import Path
 import sys
-from containers.scheduler_ingest.api.queue_lock import batch_claim
+from libs.ipc.manual_bulk_crawl import batch_claim
 with batch_claim(Path(sys.argv[1])) as owned:
     print(owned, flush=True)
     sys.stdin.read()

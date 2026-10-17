@@ -1,4 +1,4 @@
-name: Container API tests
+name: Container tests
 
 on:
   push:
@@ -13,24 +13,10 @@ jobs:
     name: ${{ matrix.service }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: crawler
-          POSTGRES_PASSWORD: crawler
-          POSTGRES_DB: crawler_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U crawler -d crawler_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     strategy:
       fail-fast: false
       matrix:
-        service: [api_gateway, scheduler_ingest]
+        service: [api, scheduler_ingest, crawler]
     defaults:
       run:
         working-directory: containers/${{ matrix.service }}
@@ -45,6 +31,4 @@ jobs:
       - name: Install
         run: task install
       - name: Test
-        env:
-          CRAWL_REQUEST_TEST_DSN: postgresql+psycopg2://crawler:crawler@127.0.0.1:5432/crawler_test
         run: task test

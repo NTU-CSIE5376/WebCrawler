@@ -76,16 +76,19 @@ services:
       - OFFERER_STRATEGY=golden_discovery_ranker_v1
     logging: *loki-logging
 
-  api_gateway:
-    image: nginx:1.28-alpine
-    container_name: api_gateway
+  api:
+    build:
+      context: .
+      dockerfile: containers/api/Dockerfile
+    container_name: api
+    cpus: 8
+    init: true
     restart: unless-stopped
     ports:
-      - "${API_GATEWAY_BIND_ADDRESS:-127.0.0.1}:${API_GATEWAY_PORT:-4000}:80"
+      - "${API_BIND_ADDRESS:-127.0.0.1}:${API_PORT:-4000}:8080"
     volumes:
-      - ./containers/api_gateway/default.conf:/etc/nginx/conf.d/default.conf:ro
-    depends_on:
-      - scheduler_ingest
+      - ./:/app:ro
+      - ${MANUAL_BULK_CRAWL_DATA_DIR:-/data/manual_bulk_crawls}:/data/manual_bulk_crawls
     logging:
       driver: json-file
       options:
@@ -98,8 +101,6 @@ services:
       dockerfile: containers/scheduler_ingest/Dockerfile
     container_name: scheduler_ingest
     cpus: 8
-    expose:
-      - "8080"
     init: true
     restart: unless-stopped
     volumes:
@@ -122,6 +123,7 @@ services:
     volumes:
       - ./:/app
       - /data/ipc:/data/ipc
+      - ${MANUAL_BULK_CRAWL_DATA_DIR:-/data/manual_bulk_crawls}:/data/manual_bulk_crawls
     logging: *loki-logging
 
   sitemap_patroller:

@@ -1,0 +1,11 @@
+Flask==3.1.2
+gunicorn==23.0.0
+click==8.5.0
+w3lib==2.3.1
+validators==0.35.0
+pytest==8.4.2
+tldextract==5.1.1
+pyyaml==6.0.2
+sqlalchemy==2.0.44
+psycopg2-binary==2.9.11
+python-json-logger==2.0.7

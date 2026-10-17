@@ -129,6 +129,27 @@ so the schema stays in sync with the ingestor's `_bulk_links` reader.
 }
 ```
 
+### Manual Bulk Crawl Job (`*.json`)
+
+The API atomically publishes a job in its pending directory. Crawler workers
+consume this IPC message without reading the API's configuration:
+
+```json
+{
+  "version": 1,
+  "urls": ["https://example.com/article"],
+  "crawler_ids": [0],
+  "result_dir": "/data/manual_bulk_crawls/results",
+  "created_at": "2026-10-17T10:00:00+00:00"
+}
+```
+
+The filename stem is the job ID. `crawler_ids` assigns each URL to its existing
+crawler worker. `result_dir` is an absolute output root supplied by the publisher;
+the complete job is published under `{result_dir}/{job_id}`. The crawler's own
+settings control queue discovery and resource limits. API and crawler containers
+must mount the output storage at the same path.
+
 ## 3.4 Processing Windows and Progress Tracking
 
 - Time bucket unit: `interval_minutes` (configured as 10).
@@ -148,21 +169,21 @@ so the schema stays in sync with the ingestor's `_bulk_links` reader.
 The external API lets other services submit URLs for crawling. The default
 local base URL is `http://localhost:4000`; remote clients use the host address
 provided by the deployment. Authentication is not required.
-Interactive API documentation is available at `/scheduler_ingest/docs`.
 
-The gateway limits request bodies to 300 MiB. Oversized requests return
+The API limits request bodies to 300 MiB. Oversized requests return
 `413 Content Too Large` with a JSON body:
 
 ```json
 {"error":"Request body too large"}
 ```
 
-### 3.6.1 Crawl Request API
+### 3.6.1 Manual Bulk Crawl API
 
-`POST /scheduler_ingest/v1/crawl-requests`
+`POST /v1/manual-bulk-crawls`
 
-The `crawl-request-api` accepts one or more URLs for the crawler to discover
-and schedule. The request must use `Content-Type: application/json`.
+The `manual-bulk-crawl-api` creates an independent crawl job for one or more URLs.
+Jobs fetch the submitted pages and save their HTML in separate storage without
+updating scheduler state, discovering links or running feature extraction. The request must use `Content-Type: application/json`.
 
 **Request body**
 
@@ -191,31 +212,114 @@ entire request is rejected.
 `200 OK`
 
 ```json
-{"status":"ok"}
+{"job_id":"ab12cd34ef56ab78cd90ef12ab34cd56"}
 ```
 
 Submission is all-or-nothing: `200 OK` means the entire batch has been
 accepted for processing. It does not mean the URLs have already been
-crawled. Crawling is asynchronous and subject to
-scheduling priority and crawl policy. No completion time is guaranteed.
+crawled. Crawling is asynchronous, respects robots.txt and crawler politeness,
+and uses the existing crawler workers alongside normal crawling.
+API jobs share crawler capacity and domain politeness limits with regular work. No completion time is guaranteed.
 
-URLs are normalized before submission, and duplicates within the same
-request are collapsed. Already-known URLs are marked eligible for crawling
-again; new URLs follow the normal discovery process. A result from an ongoing crawl may
-satisfy a request without another crawl. This does not create duplicate URL
-records.
-Scheduling priority, domain pauses, and crawler politeness controls still
-apply. This endpoint does not return crawl results or provide submission-status
-tracking.
+URLs are normalized, and duplicates within the request are collapsed. Every
+job fetches its own submitted URLs, including previously crawled URLs. Requests
+from different jobs are independent.
 
-**Error responses**
+**Job status**
+
+`GET /v1/manual-bulk-crawls/{job_id}`
+
+```json
+{
+  "job_id": "ab12cd34ef56ab78cd90ef12ab34cd56",
+  "status": "completed",
+  "total_urls": 1000,
+  "completed_urls": 1000,
+  "succeeded_urls": 990,
+  "failed_urls": 10,
+  "html_files": 993,
+  "created_at": "2026-10-17T10:00:00+00:00",
+  "started_at": "2026-10-17T10:00:01+00:00",
+  "completed_at": "2026-10-17T10:01:00+00:00",
+  "result_dir": "/data/manual_bulk_crawls/results/ab12cd34ef56ab78cd90ef12ab34cd56",
+  "results_url": "/v1/manual-bulk-crawls/ab12cd34ef56ab78cd90ef12ab34cd56/results"
+}
+```
+
+`status` is `pending`, `running` or `completed`. Unknown job IDs return `404`.
+Counts refer to normalized, unique URLs. `completed` means every URL has a
+terminal result, including failures; it does not mean every fetch succeeded.
+`succeeded_urls` counts successful HTML responses; `failed_urls` includes HTTP
+errors, transport failures and non-HTML responses. `html_files` can exceed
+`succeeded_urls` because HTML error pages are also saved. `started_at` and
+`completed_at` are null until those events occur. `result_dir` is null until the
+entire result directory is available. `results_url` is also null until the job
+completes. Interrupted jobs resume from saved per-URL results; a fetch
+interrupted before its result was saved may run again.
+
+**Reading HTML results**
+
+Completed results are available over HTTP through the API.
+Clients on another machine can download them without mounting the server's
+filesystem. Use the API's reachable hostname and port as the base URL;
+all returned download URLs are relative to that origin.
+
+`GET /v1/manual-bulk-crawls/{job_id}/results`
+
+Follow the status response's `results_url` to list available files:
+
+```json
+{
+  "job_id": "ab12cd34ef56ab78cd90ef12ab34cd56",
+  "files": [
+    {
+      "name": "00000.html",
+      "size_bytes": 12345,
+      "download_url": "/v1/manual-bulk-crawls/ab12cd34ef56ab78cd90ef12ab34cd56/results/00000.html"
+    }
+  ]
+}
+```
+
+The list includes downloaded HTML, per-URL JSON metadata, `request.json` and
+`status.json`. Each entry gives its byte size and download URL.
+
+`GET /v1/manual-bulk-crawls/{job_id}/results/{filename}`
+
+Follow a file's `download_url` to download its original bytes. Files are served
+as attachments. Downloads support HTTP byte ranges for resuming transfers.
+A result-listing or file request returns `409` until the job completes, `404`
+for an unknown job or unavailable filename, or `503` if storage is unavailable.
+Errors use a JSON `error` field.
+
+Files are also accessible directly through the server's `result_dir`:
+
+```text
+{result_dir}/
+  request.json
+  status.json
+  00000.html
+  00000.json
+  00001.json
+  ...
+```
+
+`request.json` contains the normalized URL list in order. Each numbered JSON
+file identifies the original URL, final URL after redirects, HTTP status (null
+for transport failures), fetch time, error and HTML filename. A URL that did
+not return HTML has no `.html` file. HTML files contain the downloaded response
+bytes. The entire job directory becomes visible together after all URLs finish.
+Completed job files are retained until explicitly removed; there is currently
+no automatic expiration.
+
+**Submission error responses**
 
 | HTTP status | Meaning |
 |-------------|---------|
 | `400 Bad Request` | Malformed JSON, unexpected fields, an invalid URL, or a URL list outside the permitted size. |
 | `415 Unsupported Media Type` | Content type is not JSON. |
 | `500 Internal Server Error` | An unexpected internal failure prevented submission. The entire batch was rejected. |
-| `503 Service Unavailable` | A temporary service or resource availability problem prevented submission, such as a database connection outage. The entire batch was rejected. |
+| `503 Service Unavailable` | A temporary service or resource availability problem prevented submission, such as full temporary storage. The entire batch was rejected. |
 
 API errors use an `error` field, for example:
 
@@ -248,5 +352,5 @@ For `503`, the response is:
   encounter the same internal error.
 - After `400` or `415`, correct the request before resubmitting.
 - If the connection is lost without an HTTP response, acceptance is unknown.
-  Retrying may submit the batch again; URL records remain unique, but this
-  endpoint does not provide cross-request idempotency.
+  Retrying may create a second job and fetch the URLs again; this endpoint
+  does not provide cross-request idempotency.

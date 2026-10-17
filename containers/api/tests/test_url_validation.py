@@ -1,6 +1,6 @@
 import pytest
 
-from containers.scheduler_ingest.api.service import validate_urls
+from containers.api.service import validate_urls
 from libs.urls import MAX_URL_LEN, validate_url
 
 

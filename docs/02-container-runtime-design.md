@@ -97,44 +97,57 @@ Crawler worker behavior:
 5. For request errors: emit failure record with normalized reason (`HttpError`, `IgnoreRequest`, etc.).
 6. Write records as JSONL into `/data/ipc/crawl_result/crawler_{id:02d}/{YYYYMMDD}/{HHMM}/HHMM.jsonl`.
 
+### API Jobs in the Existing Crawler Pool
+
+Input: accepted job messages in `MANUAL_BULK_CRAWL_QUEUE_DIR`
+(default `/data/manual_bulk_crawls/pending`).
+
+The existing `html_spider` workers also consume API jobs. The API resolves each
+URL to the crawler that owns its domain's shard, using read-only routing data.
+It neither inserts domains nor updates URL scheduling flags. API requests use
+the same downloader, domain slots, robots.txt rules, retry policy and
+AutoThrottle settings as regular requests. Normal crawl requests have higher
+scheduler priority than API requests.
+
+Responsibilities:
+
+- Exclusively claim this worker's portions of multiple accepted jobs with
+  nonblocking file locks; different workers can process one job concurrently.
+- Bound scheduled API URLs with `MANUAL_BULK_CRAWL_PREFETCH_URLS` (default 256)
+  and claimed jobs with `MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS` (default 64),
+  both per worker in the crawler settings. Override them with the corresponding
+  `CRAWLER_MANUAL_BULK_CRAWL_PREFETCH_URLS` and
+  `CRAWLER_MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS` environment variables.
+  Refill as each URL completes so other jobs progress while slow fetches finish.
+- Fetch only submitted URLs. Dedicated callbacks save HTML and metadata without
+  emitting PageItems, discovering outlinks or entering the normal result pipeline.
+- Atomically update per-worker progress and aggregate it for job status.
+- Read the output root from each job message and publish under `result_dir/{job_id}`
+  only after every assigned worker finishes, then remove the pending file.
+- Resume interrupted jobs from durable per-URL records. Process exit releases
+  claims; a fetch interrupted before its record was saved may run again.
+- On a job failure, retain its claim until outstanding callbacks drain before
+  retrying. Other jobs can continue to publish their results.
+
+The API and normal crawler container share a separate host directory, configured
+by `MANUAL_BULK_CRAWL_DATA_DIR` in Compose (default `/data/manual_bulk_crawls`). The
+crawler does not read API configuration. The API publishes URLs, assigned crawler
+IDs and the output root in each job message. The crawler reads only its own
+settings; `CRAWLER_MANUAL_BULK_CRAWL_QUEUE_DIR` selects the input queue and must
+match the API publisher's `manual_bulk_crawl.pending_dir`. No new crawler processes or SQL dispatcher threads
+are started. API jobs share crawler capacity and politeness budgets, while their
+results stay outside `/data/ipc/crawl_result` and never enter ingestion or feature
+extraction. Completed HTML and status files currently have no automatic retention
+cleanup.
+
 ## 2.4 `scheduler_ingest` Container
 
-The container has an 8-CPU limit shared by 6 program families via `supervisord`:
+The container has an 8-CPU limit shared by 4 program families via `supervisord`:
 
 - `router` x16
 - `ingestor` x16
 - `feature_extractor` x16
 - `stats_aggregator` x1
-- `scheduler_ingest_api` x5 (1 Uvicorn parent + 4 API workers)
-- `crawl_request_dispatcher` x4 (each with 8 SQL threads)
-
-### API Server (x5)
-
-Input: HTTP requests containing URL batches.
-
-Responsibilities:
-
-- Start 1 Uvicorn parent and 4 API workers using `api.workers` in `config/ingest.yaml`.
-- Validate and deduplicate the complete request before any database or file writes.
-- Resolve domains in bounded SQL batches and commit domain writes before publishing the batch.
-- Stage the complete pending file outside the publication lock, then publish it with an atomic rename under the lock.
-- Accept the entire batch for asynchronous processing, or return an error with no batch accepted.
-
-### Crawl Request Dispatcher (x4)
-
-Input: accepted batch files in `api.crawl_request.pending_dir`.
-
-Responsibilities:
-
-- Claim pending files with nonblocking file locks so only one dispatcher handles each batch. Process exit releases ownership for retry.
-- Combine pending requests by shard, up to `dispatcher_max_urls: 100000` and `dispatcher_max_batches: 32`. An accepted batch above the URL bound is processed on its own.
-- Update `should_crawl=TRUE` across shards using `dispatcher_workers: 8` SQL threads per process. A persistent lock per shard serializes updates across dispatcher processes; each shard commits before releasing its lock.
-- Publish one JSONL file per ingestor per accepted request, preserving the existing ingestor input format, then remove the completed pending file.
-- Retain batches affected by failed shard updates or file publication for retry while allowing unrelated successful batches to complete. Other shards may already have committed, so a retry can request another crawl.
-
-The four dispatcher processes are configured in `supervisord.conf`; SQL thread
-and coalescing settings live under `api.crawl_request` in `config/ingest.yaml`.
-Retries happen after API acceptance, which remains all-or-nothing.
 
 ### Router (x16)
 
@@ -151,7 +164,7 @@ Responsibilities:
 
 ### Ingestor (x16)
 
-Input: router and dispatcher output folders `ingestor_{id}`.
+Input: router output folders `ingestor_{id}`.
 
 Responsibilities:
 
@@ -190,3 +203,29 @@ Responsibilities:
 - Aggregate `fail_reasons` JSONB maps via `jsonb_set` increments.
 - Move malformed/unprocessable files into `/data/ipc/stats/bad`.
 - Emit `stats_error` delta if aggregation fails.
+
+## 2.5 `api` Container
+
+The API container replaces the Nginx gateway and runs Flask with Gunicorn.
+Compose binds host `127.0.0.1:4000` to container port `8080`; set
+`API_BIND_ADDRESS` and `API_PORT` to change the host binding.
+
+### API Server (x5)
+
+Input: HTTP requests under `/v1/manual-bulk-crawls`.
+
+Responsibilities:
+
+- Run 1 Gunicorn master and 4 API workers, configured in `containers/api/config/config.yml`.
+- Validate and deduplicate the complete batch before accepting any URLs.
+- Publish one immutable job file with an atomic rename and return its job ID.
+- Report job status and serve completed HTML and metadata for download.
+- Apply the configured 300 MiB request body limit using Flask's built-in handling.
+- Read API paths and limits from `manual_bulk_crawl` in `containers/api/config/config.yml`.
+- Include the output root in each job message so crawlers need no API configuration.
+
+The API has an 8-CPU limit and shares `/data/manual_bulk_crawls` with the existing
+crawler pool. It reads shard routing from the existing scheduler_ingest YAML
+selected by `ingest_config_path` in `containers/api/config/config.yml`;
+PostgreSQL connection settings remain in the API configuration.
+It does not submit ingestion records or change scheduler state.

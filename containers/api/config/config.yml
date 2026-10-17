@@ -1,0 +1,16 @@
+workers: 4
+bind: "0.0.0.0:8080"
+max_content_length: 314572800  # 300 MiB
+
+# Reuse the existing shard layout and domain overrides.
+ingest_config_path: "containers/scheduler_ingest/config/ingest.yaml"
+
+postgres:
+  dsn: "postgresql+psycopg2://crawler:crawler@172.16.191.1:5432/crawlerdb"
+
+manual_bulk_crawl:
+  # The API publishes result_dir in each job; the crawler reads no API config.
+  pending_dir: "/data/manual_bulk_crawls/pending"
+  result_dir: "/data/manual_bulk_crawls/results"
+  max_urls: 10000
+  max_url_length: 2500
