@@ -97,49 +97,6 @@ Crawler worker behavior:
 5. For request errors: emit failure record with normalized reason (`HttpError`, `IgnoreRequest`, etc.).
 6. Write records as JSONL into `/data/ipc/crawl_result/crawler_{id:02d}/{YYYYMMDD}/{HHMM}/HHMM.jsonl`.
 
-### API Jobs in the Existing Crawler Pool
-
-Input: accepted job messages in `MANUAL_BULK_CRAWL_QUEUE_DIR`
-(default `/data/manual_bulk_crawls/pending`).
-
-The existing `html_spider` workers also consume API jobs. The API resolves each
-URL to the crawler that owns its domain's shard, using read-only routing data.
-It neither inserts domains nor updates URL scheduling flags. API requests use
-the same downloader, domain slots, robots.txt rules, retry policy and
-AutoThrottle settings as regular requests. Normal crawl requests have higher
-scheduler priority than API requests.
-
-Responsibilities:
-
-- Exclusively claim this worker's portions of multiple accepted jobs with
-  nonblocking file locks; different workers can process one job concurrently.
-- Bound scheduled API URLs with `MANUAL_BULK_CRAWL_PREFETCH_URLS` (default 256)
-  and claimed jobs with `MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS` (default 64),
-  both per worker in the crawler settings. Override them with the corresponding
-  `CRAWLER_MANUAL_BULK_CRAWL_PREFETCH_URLS` and
-  `CRAWLER_MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS` environment variables.
-  Refill as each URL completes so other jobs progress while slow fetches finish.
-- Fetch only submitted URLs. Dedicated callbacks save HTML and metadata without
-  emitting PageItems, discovering outlinks or entering the normal result pipeline.
-- Atomically update per-worker progress and aggregate it for job status.
-- Read the output root from each job message and publish under `result_dir/{job_id}`
-  only after every assigned worker finishes, then remove the pending file.
-- Resume interrupted jobs from durable per-URL records. Process exit releases
-  claims; a fetch interrupted before its record was saved may run again.
-- On a job failure, retain its claim until outstanding callbacks drain before
-  retrying. Other jobs can continue to publish their results.
-
-The API and normal crawler container share a separate host directory, configured
-by `MANUAL_BULK_CRAWL_DATA_DIR` in Compose (default `/data/manual_bulk_crawls`). The
-crawler does not read API configuration. The API publishes URLs, assigned crawler
-IDs and the output root in each job message. The crawler reads only its own
-settings; `CRAWLER_MANUAL_BULK_CRAWL_QUEUE_DIR` selects the input queue and must
-match the API publisher's `manual_bulk_crawl.pending_dir`. No new crawler processes or SQL dispatcher threads
-are started. API jobs share crawler capacity and politeness budgets, while their
-results stay outside `/data/ipc/crawl_result` and never enter ingestion or feature
-extraction. Completed HTML and status files currently have no automatic retention
-cleanup.
-
 ## 2.4 `scheduler_ingest` Container
 
 The container has an 8-CPU limit shared by 4 program families via `supervisord`:
@@ -229,3 +186,6 @@ crawler pool. It reads shard routing from the existing scheduler_ingest YAML
 selected by `ingest_config_path` in `containers/api/config/config.yml`;
 PostgreSQL connection settings remain in the API configuration.
 It does not submit ingestion records or change scheduler state.
+
+See [Manual Bulk Crawl processing](03-data-flow-and-ipc.md#37-manual-bulk-crawl-processing)
+for queue ownership, resource limits and result publication.
