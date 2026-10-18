@@ -268,3 +268,39 @@ def test_job_message_selects_its_output_directory_without_api_configuration(queu
         assert not (root / "results/b").exists()
     finally:
         consumer.close()
+
+
+@pytest.mark.parametrize("expire", [False, True])
+def test_deleted_or_expired_job_stops_refill_and_discards_inflight_responses(queue, expire):
+    from datetime import datetime, timedelta, timezone
+    from containers.api.service import ManualBulkCrawlService
+
+    enqueue, factory, root = queue
+    job_id = "a" * 32
+    path = enqueue(job_id, 6)
+    consumer, requests = factory(prefetch_urls=2)
+    service = ManualBulkCrawlService(
+        {"pending_dir": str(path.parent), "result_dir": str(root / "results")}, route_urls=None,
+    )
+    try:
+        consumer.poll()
+        assert len(requests) == 2
+        if expire:
+            payload = consumer.jobs[job_id].batch.payload
+            payload["expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+            path.write_text(json.dumps(payload))
+        else:
+            service.delete(job_id)
+        consumer.poll()
+        assert len(requests) == 2
+        for request in list(requests):
+            complete(consumer, request)
+        assert len(requests) == 2
+        assert not consumer.jobs and not consumer.inflight
+        consumer.spider.logger.exception.assert_not_called()
+        if expire:
+            assert service.collect_expired() == 1
+        assert not (root / "results" / job_id).exists()
+        assert not (root / "results/.incomplete" / job_id).exists()
+    finally:
+        consumer.close()

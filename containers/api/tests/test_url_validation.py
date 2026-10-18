@@ -64,11 +64,11 @@ def test_shared_url_length_limit_can_be_overridden_in_both_directions():
 
 
 def test_batch_validation_keeps_normalized_order_and_deduplicates():
-    assert validate_urls({"urls": [
+    assert validate_urls([
         "https://example.com/b#one", "https://example.com/a", "https://example.com/b#two",
-    ]}, max_urls=3) == ["https://example.com/b", "https://example.com/a"]
+    ], max_urls=3) == ["https://example.com/b", "https://example.com/a"]
 
 
 def test_batch_validation_adds_zero_based_index_to_shared_error():
     with pytest.raises(ValueError, match="^Invalid HTTP\\(S\\) URL at index 1$"):
-        validate_urls({"urls": ["https://example.com/a", "invalid"]}, max_urls=3)
+        validate_urls(["https://example.com/a", "invalid"], max_urls=3)

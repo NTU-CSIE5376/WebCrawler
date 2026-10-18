@@ -13,7 +13,7 @@ from libs.obslog import configure
 from libs.urls import MAX_URL_LEN
 from .config_loader import api_config_path, load_api_config
 from .routing import ManualBulkCrawlRouter
-from .service import JobNotCompleted, ManualBulkCrawlService, validate_urls
+from .service import JobNotCompleted, ManualBulkCrawlService, validate_manual_bulk_crawl_request
 
 
 logger = logging.getLogger("api")
@@ -70,11 +70,11 @@ def create_app(config_path: str | None = None, *, service=None) -> Flask:
         # the entire batch before routing or publishing any work.
         payload = request.get_json()
         try:
-            urls = validate_urls(payload, max_urls, max_url_length)
+            urls, ttl_days = validate_manual_bulk_crawl_request(payload, max_urls, max_url_length)
         except ValueError as exc:
             return jsonify(error=str(exc)), 400
         try:
-            return {"job_id": service.submit(urls)}
+            return {"job_id": service.submit(urls, ttl_days=ttl_days)}
         except (OSError, SQLAlchemyError, psycopg2.Error) as exc:
             logger.exception("submission.storage_failed")
             if temporary_storage_error(exc):
@@ -83,6 +83,11 @@ def create_app(config_path: str | None = None, *, service=None) -> Flask:
         except Exception:
             logger.exception("submission.failed")
             return jsonify(error="Submission failed; no URLs accepted"), 500
+
+    @app.delete("/v1/manual-bulk-crawls/<job_id>")
+    def delete_manual_bulk_crawl(job_id):
+        service.delete(job_id)
+        return "", 204
 
     @app.get("/v1/manual-bulk-crawls/<job_id>")
     def manual_bulk_crawl_status(job_id):

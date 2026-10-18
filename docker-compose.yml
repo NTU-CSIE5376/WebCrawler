@@ -95,6 +95,22 @@ services:
         max-size: "50m"
         max-file: "5"
 
+  manual_bulk_crawl_gc:
+    build:
+      context: .
+      dockerfile: containers/api/Dockerfile
+    command: ["python", "-m", "containers.api.manual_bulk_crawl_gc"]
+    init: true
+    restart: unless-stopped
+    volumes:
+      - ./:/app:ro
+      - ${MANUAL_BULK_CRAWL_DATA_DIR:-/data/manual_bulk_crawls}:/data/manual_bulk_crawls
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
   scheduler_ingest:
     build:
       context: .

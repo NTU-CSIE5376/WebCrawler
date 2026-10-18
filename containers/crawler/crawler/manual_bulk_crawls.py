@@ -7,7 +7,7 @@ from time import monotonic
 import scrapy
 from twisted.internet.task import LoopingCall
 
-from libs.ipc.manual_bulk_crawl import ManualBulkCrawlBatch, claim_next
+from libs.ipc.manual_bulk_crawl import JobUnavailable, ManualBulkCrawlBatch, claim_next, is_expired
 
 
 @dataclass
@@ -61,6 +61,11 @@ class ManualBulkCrawlConsumer:
             self.finished.intersection_update(path.stem for path in self.pending_dir.glob("*.json"))
         except OSError:
             self.spider.logger.exception("manual_bulk_crawl.queue_failed")
+        for job_id, job in list(self.jobs.items()):
+            if not job.batch.path.exists() or is_expired(job.batch.payload):
+                job.pending.clear()
+                job.failed = True
+                self.release_if_drained(job_id, job)
         self.refill()
 
     def refill(self):
@@ -72,7 +77,8 @@ class ManualBulkCrawlConsumer:
                                 if deadline > monotonic()}
             while len(self.inflight) < self.prefetch_urls:
                 ready = next(((job_id, job) for job_id, job in self.jobs.items()
-                              if job.pending and not job.failed), None)
+                              if job.pending and not job.failed
+                              and job.batch.path.exists() and not is_expired(job.batch.payload)), None)
                 if ready is None:
                     if len(self.jobs) >= self.max_active_jobs:
                         break
@@ -134,6 +140,9 @@ class ManualBulkCrawlConsumer:
         try:
             if not job.failed:
                 job.batch.save(index, **result)
+        except JobUnavailable:
+            job.failed = True
+            job.pending.clear()
         except Exception:
             job.failed = True
             self.spider.logger.exception("manual_bulk_crawl.storage_failed")

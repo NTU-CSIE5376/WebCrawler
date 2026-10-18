@@ -3,11 +3,39 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from contextlib import contextmanager, suppress
 import fcntl
+
+
+DEFAULT_TTL_DAYS = 14
+MAX_TTL_DAYS = 60
+
+
+class JobUnavailable(Exception):
+    """The job was deleted or expired while a worker held it."""
+
+
+def validate_ttl_days(value):
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= MAX_TTL_DAYS:
+        raise ValueError('"ttl_days" must be an integer between 1 and 60')
+    return value
+
+
+def expiration(payload, *, fallback=None):
+    if payload.get("expires_at"):
+        return datetime.fromisoformat(payload["expires_at"])
+    created = payload.get("created_at")
+    if created:
+        return datetime.fromisoformat(created) + timedelta(days=DEFAULT_TTL_DAYS)
+    return fallback + timedelta(days=DEFAULT_TTL_DAYS) if fallback else None
+
+
+def is_expired(payload, *, now=None):
+    deadline = expiration(payload)
+    return deadline is not None and deadline <= (now or datetime.now(timezone.utc))
 
 
 @contextmanager
@@ -82,7 +110,10 @@ def job_status(job_id, payload, directory):
         "total_urls": len(payload["urls"]),
         **{key: sum(item[key] for item in progress) for key in
            ("completed_urls", "succeeded_urls", "failed_urls", "html_files")},
-        "created_at": payload.get("created_at"), "started_at": min(started) if started else None,
+        "created_at": payload.get("created_at"),
+        "ttl_days": payload.get("ttl_days", DEFAULT_TTL_DAYS),
+        "expires_at": expiration(payload).isoformat() if expiration(payload) else None,
+        "started_at": min(started) if started else None,
         "completed_at": None, "result_dir": None,
     }
 
@@ -111,6 +142,8 @@ class ManualBulkCrawlBatch:
         with queue_lock(self.locks):
             if self.target.exists():
                 return
+            if not self.path.exists() or is_expired(self.payload):
+                raise JobUnavailable(self.path.stem)
             self.staging.mkdir(parents=True, exist_ok=True)
             write_json(self.staging / "request.json", self.payload)
             self.progress = {
@@ -140,6 +173,12 @@ class ManualBulkCrawlBatch:
         self.progress["html_files"] += int(item["html_file"] is not None)
 
     def save(self, index, *, final_url, status_code, body=None, error=None):
+        with queue_lock(self.locks):
+            if not self.path.exists() or is_expired(self.payload):
+                raise JobUnavailable(self.path.stem)
+            self._save(index, final_url=final_url, status_code=status_code, body=body, error=error)
+
+    def _save(self, index, *, final_url, status_code, body=None, error=None):
         if index not in self.remaining:
             raise ValueError("URL already completed or outside this worker's part")
         filename = f"{index:05d}.html" if body is not None else None
@@ -153,23 +192,28 @@ class ManualBulkCrawlBatch:
         self.remaining.remove(index)
         self._count(item)
         write_json(self.progress_path, self.progress)
-        self.finish_if_complete()
+        self._finish_if_complete()
 
     def finish_if_complete(self):
+        with queue_lock(self.locks):
+            self._finish_if_complete()
+
+    def _finish_if_complete(self):
         if self.remaining:
             return
-        with queue_lock(self.locks):
-            if self.target.exists():
-                self.path.unlink(missing_ok=True)
-                return
-            status = job_status(self.path.stem, self.payload, self.staging)
-            if status["completed_urls"] != len(self.urls):
-                return
-            status.update(status="completed", completed_at=datetime.now(timezone.utc).isoformat(),
-                          result_dir=str(self.target))
-            write_json(self.staging / "status.json", status)
-            os.replace(self.staging, self.target)
+        if self.target.exists():
             self.path.unlink(missing_ok=True)
+            return
+        if not self.path.exists() or is_expired(self.payload):
+            raise JobUnavailable(self.path.stem)
+        status = job_status(self.path.stem, self.payload, self.staging)
+        if status["completed_urls"] != len(self.urls):
+            return
+        status.update(status="completed", completed_at=datetime.now(timezone.utc).isoformat(),
+                      result_dir=str(self.target))
+        write_json(self.staging / "status.json", status)
+        os.replace(self.staging, self.target)
+        self.path.unlink(missing_ok=True)
 
     def close(self):
         self.claim.__exit__(None, None, None)
@@ -189,6 +233,8 @@ def claim_next(pending_dir: Path, crawler_id: int = 0, *,
                 or not isinstance(payload.get("result_dir"), str)
                 or not Path(payload["result_dir"]).is_absolute()):
             raise ValueError("Invalid crawl request batch")
+        if is_expired(payload):
+            continue
         if (Path(payload["result_dir"]) / path.stem).exists():
             path.unlink(missing_ok=True)
             continue
@@ -205,7 +251,7 @@ def claim_next(pending_dir: Path, crawler_id: int = 0, *,
         try:
             try:
                 batch = ManualBulkCrawlBatch(path, payload, claim, crawler_id)
-            except FileNotFoundError:
+            except (FileNotFoundError, JobUnavailable):
                 claim.__exit__(None, None, None)
                 continue
         except Exception:
