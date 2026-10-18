@@ -181,7 +181,7 @@ updating scheduler state, discovering links or running feature extraction. The r
 | `urls` | Array of strings | Yes | Nonempty list of absolute HTTP or HTTPS URLs; default maximum 10,000 per request. |
 | `ttl_days` | Integer | No | Retention from submission, 1–60 days inclusive; defaults to 14 days. |
 
-The body may contain only `urls` and `ttl_days`. The default URL length limit is 2,500
+The default URL length limit is 2,500
 characters, checked both before and after normalization.
 Deployments may configure a smaller length limit or a different per-request
 URL count limit. Each URL must have a valid hostname and port and contain no
@@ -382,27 +382,4 @@ settings; `CRAWLER_MANUAL_BULK_CRAWL_QUEUE_DIR` selects the input queue and must
 match the API publisher's `manual_bulk_crawl.pending_dir`. No new crawler processes or SQL dispatcher threads
 are started. API jobs share crawler capacity and politeness budgets, while their
 results stay outside `/data/ipc/crawl_result` and never enter ingestion or feature
-extraction. Completed HTML and status files currently have no automatic retention
-cleanup.
-
-
-### Job expiration, deletion, and garbage collection
-
-Status responses include `ttl_days` and the UTC `expires_at` timestamp. The TTL
-starts at submission and applies to pending jobs, active jobs, and completed
-results. Expired jobs return `404` from status and result endpoints, and workers
-stop feeding them and discard late responses.
-
-`DELETE /v1/manual-bulk-crawls/{job_id}` removes the queued request, partial
-output, and completed results. It returns `204 No Content`, or `404` for an
-unknown or already deleted job. Requests already submitted to the downloader
-may finish; their responses cannot recreate deleted output.
-
-Compose runs `manual_bulk_crawl_gc` as a separate service using the API image
-and shared storage. It collects only expired manual bulk crawl API jobs at startup and every
-`manual_bulk_crawl.gc_interval_sec` (default 3600). Run a single pass with
-`python -m containers.api.manual_bulk_crawl_gc --once` (optionally `--config PATH`). Existing jobs
-without TTL metadata expire 14 days after `created_at`; legacy files without a
-creation timestamp use their request-file modification time for GC.
-Coordination lock files remain to keep worker and deletion locks stable; they
-contain no request URLs or results.
+extraction.

@@ -84,24 +84,9 @@ services:
     cpus: 8
     init: true
     restart: unless-stopped
+    stop_grace_period: 140s
     ports:
       - "${API_BIND_ADDRESS:-127.0.0.1}:${API_PORT:-4000}:8080"
-    volumes:
-      - ./:/app:ro
-      - ${MANUAL_BULK_CRAWL_DATA_DIR:-/data/manual_bulk_crawls}:/data/manual_bulk_crawls
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "5"
-
-  manual_bulk_crawl_gc:
-    build:
-      context: .
-      dockerfile: containers/api/Dockerfile
-    command: ["python", "-m", "containers.api.manual_bulk_crawl_gc"]
-    init: true
-    restart: unless-stopped
     volumes:
       - ./:/app:ro
       - ${MANUAL_BULK_CRAWL_DATA_DIR:-/data/manual_bulk_crawls}:/data/manual_bulk_crawls
