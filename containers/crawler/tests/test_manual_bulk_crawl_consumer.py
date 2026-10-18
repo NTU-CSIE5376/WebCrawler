@@ -273,15 +273,13 @@ def test_job_message_selects_its_output_directory_without_api_configuration(queu
 @pytest.mark.parametrize("expire", [False, True])
 def test_deleted_or_expired_job_stops_refill_and_discards_inflight_responses(queue, expire):
     from datetime import datetime, timedelta, timezone
-    from containers.api.service import ManualBulkCrawlService
+    import shutil
 
     enqueue, factory, root = queue
     job_id = "a" * 32
     path = enqueue(job_id, 6)
     consumer, requests = factory(prefetch_urls=2)
-    service = ManualBulkCrawlService(
-        {"pending_dir": str(path.parent), "result_dir": str(root / "results")}, route_urls=None,
-    )
+    staging = root / "results/.incomplete" / job_id
     try:
         consumer.poll()
         assert len(requests) == 2
@@ -290,7 +288,10 @@ def test_deleted_or_expired_job_stops_refill_and_discards_inflight_responses(que
             payload["expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
             path.write_text(json.dumps(payload))
         else:
-            service.delete(job_id)
+            # Simulate the shared files disappearing after API deletion.
+            # The consumer must not depend on the API service or its packages.
+            path.unlink()
+            shutil.rmtree(staging)
         consumer.poll()
         assert len(requests) == 2
         for request in list(requests):
@@ -298,9 +299,12 @@ def test_deleted_or_expired_job_stops_refill_and_discards_inflight_responses(que
         assert len(requests) == 2
         assert not consumer.jobs and not consumer.inflight
         consumer.spider.logger.exception.assert_not_called()
-        if expire:
-            assert service.collect_expired() == 1
         assert not (root / "results" / job_id).exists()
-        assert not (root / "results/.incomplete" / job_id).exists()
+        if expire:
+            # Cleanup belongs to API GC; the consumer must leave no late output.
+            assert path.exists()
+            assert not list(staging.glob("[0-9]*"))
+        else:
+            assert not staging.exists()
     finally:
         consumer.close()
