@@ -221,13 +221,22 @@ class ManualBulkCrawlBatch:
 
 def claim_next(pending_dir: Path, crawler_id: int = 0, *,
                exclude_job_ids: set[str] | None = None) -> ManualBulkCrawlBatch | None:
-    for path in sorted(pending_dir.glob("*.json")):
+    """Claim the oldest eligible submission for this worker."""
+    queued = []
+    for path in pending_dir.glob("*.json"):
         if exclude_job_ids and path.stem in exclude_job_ids:
             continue
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
+            created_at = payload.get("created_at")
+            submitted_at = (datetime.fromisoformat(created_at).timestamp()
+                            if created_at else path.stat().st_mtime)
         except FileNotFoundError:
             continue
+        queued.append((submitted_at, path, payload))
+    # UUID filenames are unrelated to submission order. Break timestamp ties
+    # by filename so all workers see the same order; legacy jobs use mtime.
+    for _, path, payload in sorted(queued, key=lambda item: (item[0], item[1])):
         if (payload.get("version") != 1 or not isinstance(payload.get("urls"), list)
                 or len(payload.get("crawler_ids", [])) != len(payload["urls"])
                 or not isinstance(payload.get("result_dir"), str)

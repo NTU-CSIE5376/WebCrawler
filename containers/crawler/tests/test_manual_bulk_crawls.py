@@ -97,6 +97,38 @@ def test_temporary_files_are_never_claimed(tmp_path):
     assert claim_next(pending) is None
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+def test_jobs_are_claimed_fifo_regardless_of_uuid_order(tmp_path, legacy):
+    for name, timestamp in (("f" * 32, 4070908800), ("a" * 32, 4070908801)):
+        path = enqueue(tmp_path, name=name)
+        if legacy:
+            os.utime(path, (timestamp, timestamp))
+        else:
+            payload = json.loads(path.read_text())
+            payload["created_at"] = f"2099-01-01T00:00:0{timestamp - 4070908800}+00:00"
+            path.write_text(json.dumps(payload))
+            # Creation metadata takes precedence over filesystem times.
+            os.utime(path, (2 * 4070908800 - timestamp,) * 2)
+    pending = tmp_path / "pending"
+    first = claim_next(pending)
+    try:
+        assert first.path.stem == "f" * 32
+        # Another claimant can take the next job while the oldest is owned.
+        second = claim_next(pending)
+        try:
+            assert second.path.stem == "a" * 32
+        finally:
+            second.close()
+    finally:
+        first.close()
+    # Releasing an unfinished older job preserves its position on retry.
+    retry = claim_next(pending)
+    try:
+        assert retry.path.stem == "f" * 32
+    finally:
+        retry.close()
+
+
 def test_job_waits_for_all_assigned_crawlers_before_publication(tmp_path):
     path = enqueue(tmp_path, urls=["https://example.com/a", "https://example.org/b"], crawler_ids=[0, 1])
     first = claim_next(path.parent, 0)
