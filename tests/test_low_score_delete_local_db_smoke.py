@@ -1,8 +1,8 @@
 """Check scripts/oneoff_delete_low_score.py's DELETE against a real local PostgreSQL.
 
-Runs delete_shard on a throwaway schema: only source=0 pending rows at or below
-the threshold that are not golden URLs may go; a paused run resumes to the same
-result; resuming with another threshold is refused.
+Runs delete_shard on a throwaway schema: only never-scheduled, never-fetched
+source=0 pending rows at or below the threshold that are not golden URLs may go;
+a paused run resumes to the same result; resuming with another threshold is refused.
 
     LOW_SCORE_DELETE_LOCAL_DB_SMOKE_DSN=postgresql://postgres@/postgres?host=/path/to/socket \\
         python -m pytest tests/test_low_score_delete_local_db_smoke.py
@@ -56,7 +56,8 @@ class LowScoreDeleteSmoke(unittest.TestCase):
             cur.execute("DROP TABLE IF EXISTS url_state_current_000")
             cur.execute("""CREATE TABLE url_state_current_000 (
                 url VARCHAR PRIMARY KEY, should_crawl BOOLEAN NOT NULL,
-                source SMALLINT NOT NULL DEFAULT 0, url_score DOUBLE PRECISION, pad TEXT)""")
+                source SMALLINT NOT NULL DEFAULT 0, url_score DOUBLE PRECISION, pad TEXT,
+                last_scheduled TIMESTAMPTZ, last_fetch_ok TIMESTAMPTZ)""")
             rows = [
                 ("https://a.com/low", True, 0, 0.001),          # delete
                 ("https://a.com/at-t", True, 0, T),              # delete (<= T)
@@ -70,9 +71,14 @@ class LowScoreDeleteSmoke(unittest.TestCase):
                 (GOLDEN[0], True, 0, 0.001),                     # organic golden
                 (GOLDEN[1], True, 0, 0.9),
             ]
+            # pending again after an earlier schedule / fetch: kept
+            seen = [("https://a.com/scheduled", "now()", "NULL"), ("https://a.com/fetched-ok", "NULL", "now()")]
             cur.executemany("INSERT INTO url_state_current_000 VALUES (%s,%s,%s,%s, "
                             "(SELECT string_agg(md5(random()::text || n), '') FROM generate_series(1, 60) n))",
                             rows)
+            for url, sched, ok in seen:
+                cur.execute(f"INSERT INTO url_state_current_000 (url, should_crawl, source, url_score, "
+                            f"last_scheduled, last_fetch_ok) VALUES (%s, TRUE, 0, 0.001, {sched}, {ok})", (url,))
             # incompressible ~1.9 KB pad (under the TOAST threshold) puts ~4 rows on a heap page,
             # so the filler spans many pages and batching crosses page boundaries
             cur.execute("INSERT INTO url_state_current_000 "
@@ -108,7 +114,8 @@ class LowScoreDeleteSmoke(unittest.TestCase):
         self.assertTrue(st.d["done"])
         self.assertEqual(st.d["deleted"], len(gone))
         for kept in ("https://a.com/golden1", "https://a.com/pageview", "https://a.com/patrol",
-                     "https://a.com/fetched", "https://a.com/null", GOLDEN[0]):
+                     "https://a.com/fetched", "https://a.com/null", "https://a.com/scheduled",
+                     "https://a.com/fetched-ok", GOLDEN[0]):
             self.assertIn(kept, after)
 
     def test_pause_and_resume_gives_same_result(self):

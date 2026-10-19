@@ -2,7 +2,8 @@
 """
 One-off: delete the lowest-scored pending URLs (about --target rows, default 2e9).
 
-Deletes rows with should_crawl = TRUE AND source = 0 AND url_score <= T. Golden
+Deletes rows with should_crawl = TRUE AND source = 0 AND url_score <= T that were
+never scheduled or fetched (last_scheduled IS NULL AND last_fetch_ok IS NULL). Golden
 URLs are kept: every injected row has source <> 0, and organically discovered
 golden URLs (source = 0) are excluded by exact match against metricdb
 `metric_url`, routed to their shard with the crawler's ShardRouter.
@@ -51,7 +52,11 @@ DEFAULT_SAMPLE_PCT = 0.05
 DEFAULT_TARGET = 2_000_000_000
 _stop = False
 
-ELIGIBLE = f"{{a}}.should_crawl AND {{a}}.source = {SOURCE_NATURAL} AND NOT ({{a}}.url = ANY(%(golden)s))"
+# Never-scheduled, never-fetched natural pending rows that are not golden URLs. Such rows have
+# no url_event_counter / content_feature_current rows, so only url_state_current is touched.
+ELIGIBLE = (f"{{a}}.should_crawl AND {{a}}.source = {SOURCE_NATURAL} "
+            f"AND {{a}}.last_scheduled IS NULL AND {{a}}.last_fetch_ok IS NULL "
+            f"AND NOT ({{a}}.url = ANY(%(golden)s))")
 
 DELETE_SQL = f"""
 DELETE FROM {{table}} t
@@ -133,7 +138,7 @@ def dry_run(shards: list[int], golden: dict[int, list[str]], target: float, pct:
         n_del = bisect.bisect_right(per_shard[s], t)
         print(f"{s:>5} {len(per_shard[s]) * scale:>14,.0f} {n_del * scale:>13,.0f}")
     print(f"\nestimate from TABLESAMPLE SYSTEM ({pct}%), {len(scores):,} sampled rows")
-    print(f"  eligible pending (source=0, not golden): {eligible:,.0f}")
+    print(f"  eligible pending (source=0, never scheduled or fetched, not golden): {eligible:,.0f}")
     print(f"  target: {target:,.0f}")
     print(f"  threshold T (url_score <= T): {t!r}")
     print(f"  would delete: {bisect.bisect_right(scores, t) * scale:,.0f}")
