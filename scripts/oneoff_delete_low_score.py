@@ -172,7 +172,8 @@ class ShardState:
 
 
 def delete_shard(conn, tbl: str, threshold: float, golden: list[str], st: ShardState,
-                 batch_pages: int, budget: list[float], sleep: float = 0.0) -> None:
+                 batch_pages: int, budget: list[float], sleep: float = 0.0, before_batch=None) -> None:
+    """before_batch: optional callable run before every batch (e.g. wait for disk space)."""
     cur = conn.cursor()
     cur.execute("SELECT pg_relation_size(%s::regclass) / current_setting('block_size')::int", (tbl,))
     nblocks = cur.fetchone()[0]
@@ -180,6 +181,10 @@ def delete_shard(conn, tbl: str, threshold: float, golden: list[str], st: ShardS
     sql = DELETE_SQL.format(table=tbl)
     t0, start_deleted = time.time(), st.d["deleted"]
     while st.d["next_block"] < nblocks and not _stop and budget[0] > 0:
+        if before_batch is not None:
+            before_batch()
+            if _stop:
+                break
         lo = st.d["next_block"]
         hi = lo + batch_pages
         try:
