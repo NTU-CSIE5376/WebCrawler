@@ -163,7 +163,7 @@ Responsibilities:
 
 ## 2.5 `api` Container
 
-The `api` container hosts the system's external HTTP APIs using Flask and Gunicorn.
+The `api` container hosts the system's external HTTP APIs using FastAPI and Uvicorn.
 It has an 8-CPU limit. Compose binds host `127.0.0.1:4000` to container port `8080`;
 set `API_BIND_ADDRESS` and `API_PORT` to change the host binding.
 
@@ -173,8 +173,8 @@ Input: external HTTP requests.
 
 Responsibilities:
 
-- Run 1 Gunicorn master and 4 API workers, configured in `containers/api/config/config.yml`.
-- Route requests to the registered Flask endpoint handlers.
+- Run 1 Uvicorn parent and 4 API workers, configured in `containers/api/config/config.yml`.
+- Route requests to the registered FastAPI endpoint handlers.
 - Return JSON error responses and enforce the configured request body limit
-  (default 300 MiB) using Flask's built-in handling.
+  (default 300 MiB), including streamed uploads.
 - Load server and feature settings from `containers/api/config/config.yml`.

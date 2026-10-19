@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import errno
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Event
 from unittest.mock import Mock
 
 import pytest
+from fastapi.testclient import TestClient
 import psycopg2
 import yaml
 
@@ -29,7 +31,7 @@ def setup_api(tmp_path, monkeypatch):
     path.write_text(yaml.safe_dump({"manual_bulk_crawl": config}))
     monkeypatch.setenv("API_CONFIG_PATH", str(path))
     svc = ManualBulkCrawlService(config, route_urls=lambda urls: [0] * len(urls))
-    with create_app(str(path), service=svc).test_client() as client:
+    with TestClient(create_app(str(path), service=svc)) as client:
         yield client, svc, None, tmp_path
 
 
@@ -39,7 +41,7 @@ def test_submission_queues_urls_without_database_writes_or_ingestor_records(setu
         "https://example.com/a#one", "https://example.com/a#two", "https://example.org/b",
     ]})
     assert response.status_code == 200
-    assert len(response.get_json()["job_id"]) == 32
+    assert len(response.json()["job_id"]) == 32
     batches = list((root / "pending").glob("*.json"))
     assert len(batches) == 1
     payload = json.loads(batches[0].read_text())
@@ -54,7 +56,7 @@ def test_submission_queues_urls_without_database_writes_or_ingestor_records(setu
 def test_default_app_uses_read_only_routing(setup_api, monkeypatch):
     _, _, _, root = setup_api
     monkeypatch.setattr(app_module, "ManualBulkCrawlRouter", lambda *args: lambda urls: [0] * len(urls))
-    with create_app(str(root / "config.yml")).test_client() as client:
+    with TestClient(create_app(str(root / "config.yml"))) as client:
         assert client.post("/v1/manual-bulk-crawls", json={"urls": ["https://example.com"]}).status_code == 200
 
 
@@ -63,22 +65,22 @@ def test_job_status_tracks_pending_running_and_completed_results(setup_api):
     response = client.post("/v1/manual-bulk-crawls", json={"urls": [
         "https://example.com/a", "https://example.com/b",
     ]})
-    job_id = response.get_json()["job_id"]
+    job_id = response.json()["job_id"]
     endpoint = f"/v1/manual-bulk-crawls/{job_id}"
-    status = client.get(endpoint).get_json()
+    status = client.get(endpoint).json()
     assert status["status"] == "pending"
     assert "result_dir" not in status
     assert status["total_urls"] == 2
     assert status["completed_urls"] == 0
     batch = claim_next(svc.pending_dir)
     try:
-        assert client.get(endpoint).get_json()["status"] == "running"
+        assert client.get(endpoint).json()["status"] == "running"
         batch.save(0, final_url=batch.urls[0], status_code=200, body=b"<html>saved</html>")
-        status = client.get(endpoint).get_json()
+        status = client.get(endpoint).json()
         assert status["completed_urls"] == status["succeeded_urls"] == status["html_files"] == 1
         assert "result_dir" not in status
         batch.save(1, final_url=batch.urls[1], status_code=None, error="TimeoutError")
-        status = client.get(endpoint).get_json()
+        status = client.get(endpoint).json()
         assert status["status"] == "completed"
         assert status["completed_urls"] == 2
         assert status["succeeded_urls"] == status["failed_urls"] == 1
@@ -98,27 +100,27 @@ def test_unknown_or_invalid_job_returns_404(setup_api, job_id):
 
 def test_completion_is_not_reported_before_result_directory_is_published(setup_api, monkeypatch):
     client, svc, *_ = setup_api
-    job_id = client.post("/v1/manual-bulk-crawls", json={"urls": ["https://example.com"]}).get_json()["job_id"]
+    job_id = client.post("/v1/manual-bulk-crawls", json={"urls": ["https://example.com"]}).json()["job_id"]
     batch = claim_next(svc.pending_dir)
     from libs.ipc import manual_bulk_crawl as storage
     original = storage.os.replace
     def check_boundary(source, target):
         if target == batch.target:
-            status = client.get(f"/v1/manual-bulk-crawls/{job_id}").get_json()
+            status = client.get(f"/v1/manual-bulk-crawls/{job_id}").json()
             assert status["status"] == "running"
             assert "result_dir" not in status
         return original(source, target)
     monkeypatch.setattr(storage.os, "replace", check_boundary)
     try:
         batch.save(0, final_url=batch.urls[0], status_code=200, body=b"html")
-        assert client.get(f"/v1/manual-bulk-crawls/{job_id}").get_json()["status"] == "completed"
+        assert client.get(f"/v1/manual-bulk-crawls/{job_id}").json()["status"] == "completed"
     finally:
         batch.close()
 
 
 def test_routes_are_defined_at_api_root(setup_api):
     client, *_ = setup_api
-    paths = {route.rule for route in client.application.url_map.iter_rules()}
+    paths = {route.path for route in client.app.routes}
     assert "/v1/manual-bulk-crawls" in paths
     assert all(not path.startswith("/scheduler_ingest/") for path in paths)
 
@@ -146,9 +148,9 @@ def test_old_generic_urls_route_is_not_exposed(setup_api):
 ])
 def test_invalid_batch_has_no_side_effects(setup_api, payload):
     client, _, engine, tmp_path = setup_api
-    response = client.post("/v1/manual-bulk-crawls", data=json.dumps(payload), headers={"Content-Type": "application/json"})
+    response = client.post("/v1/manual-bulk-crawls", content=json.dumps(payload), headers={"Content-Type": "application/json"})
     assert response.status_code == 400
-    assert "error" in response.get_json()
+    assert "error" in response.json()
     assert not list(tmp_path.rglob("*.jsonl"))
     assert not list((tmp_path / "pending").glob("*.json"))
 
@@ -159,7 +161,7 @@ def test_invalid_batch_has_no_side_effects(setup_api, payload):
 ])
 def test_http_errors_are_json(setup_api, data, content_type, status):
     client, *_ = setup_api
-    response = client.post("/v1/manual-bulk-crawls", data=data, headers={"Content-Type": content_type})
+    response = client.post("/v1/manual-bulk-crawls", content=data, headers={"Content-Type": content_type})
     assert response.status_code == status
     assert response.headers["content-type"].startswith("application/json")
 
@@ -177,7 +179,7 @@ def test_storage_failure_rejects_entire_multishard_batch(setup_api, monkeypatch,
         "https://example.com/a", "https://example.org/b",
     ]})
     assert response.status_code == 503
-    assert response.get_json() == {"error": "Submission unavailable; no URLs accepted"}
+    assert response.json() == {"error": "Submission unavailable; no URLs accepted"}
     assert not list((tmp_path / "pending").glob("*.json"))
     assert not list(tmp_path.rglob("*.jsonl"))
     assert not list(tmp_path.rglob("*.tmp"))
@@ -211,7 +213,7 @@ def test_unexpected_failure_returns_500_and_accepts_nothing(setup_api, monkeypat
     monkeypatch.setattr(svc, "submit", Mock(side_effect=error))
     response = client.post("/v1/manual-bulk-crawls", json={"urls": ["https://example.com/a"]})
     assert response.status_code == 500
-    assert response.get_json() == {"error": "Submission failed; no URLs accepted"}
+    assert response.json() == {"error": "Submission failed; no URLs accepted"}
     assert not list((tmp_path / "pending").glob("*.json"))
 
 
@@ -220,7 +222,7 @@ def test_overlapping_api_requests_publish_complete_distinct_batches(setup_api):
     start = Barrier(3)
 
     def submit(path):
-        with client.application.test_client() as concurrent_client:
+        with TestClient(client.app) as concurrent_client:
             start.wait(timeout=5)
             return concurrent_client.post("/v1/manual-bulk-crawls", json={"urls": [
                 f"https://example.com/{path}", f"https://example.org/{path}",
@@ -284,7 +286,32 @@ def test_overlapping_submissions_stage_in_parallel(setup_api, monkeypatch):
 def test_health_does_not_access_db(setup_api, monkeypatch):
     client, svc, *_ = setup_api
     monkeypatch.setattr(svc, "submit", Mock(side_effect=AssertionError("unexpected call")))
-    assert client.get("/healthz").get_json() == {"status": "ok"}
+    assert client.get("/healthz").json() == {"status": "ok"}
+
+
+def test_health_remains_available_while_submission_waits(setup_api, monkeypatch):
+    client, service, *_ = setup_api
+    started, release = Event(), Event()
+    original = service.submit
+
+    def blocked_submit(*args, **kwargs):
+        started.set()
+        assert release.wait(5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service, "submit", blocked_submit)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        submission = pool.submit(client.post, "/v1/manual-bulk-crawls",
+                                 json={"urls": ["https://example.com"]})
+        try:
+            assert started.wait(2)
+            health = pool.submit(client.get, "/healthz").result(timeout=2)
+            assert health.status_code == 200
+            assert health.json() == {"status": "ok"}
+            assert not submission.done()
+        finally:
+            release.set()
+        assert submission.result(timeout=5).status_code == 200
 
 
 
@@ -300,7 +327,7 @@ def test_manual_bulk_crawl_limits_are_loaded_from_yaml(setup_api):
     config = yaml.safe_load(config_path.read_text())
     config["manual_bulk_crawl"].update(max_urls=1, max_url_length=40)
     config_path.write_text(yaml.safe_dump(config))
-    client = create_app(str(tmp_path / "config.yml"), service=svc).test_client()
+    client = TestClient(create_app(str(tmp_path / "config.yml"), service=svc))
     assert client.post("/v1/manual-bulk-crawls", json={"urls": [
         "https://example.com/a", "https://example.org/b",
     ]}).status_code == 400
@@ -332,10 +359,9 @@ def test_api_accepts_bodies_larger_than_4_mib(setup_api, streamed):
     chunks = [b" " * (4 * 1024 * 1024), b'{"urls":["https://example.com/a"]}']
     content = b"".join(chunks)
     if streamed:
-        from io import BytesIO
-        options = {"input_stream": BytesIO(content), "content_length": len(content)}
+        options = {"content": iter(chunks)}
     else:
-        options = {"data": content}
+        options = {"content": content}
     response = client.post("/v1/manual-bulk-crawls", **options,
                            headers={"Content-Type": "application/json"})
     assert response.status_code == 200
@@ -353,22 +379,69 @@ def test_invalid_body_limit_fails_at_startup(setup_api, size):
         create_app(str(path), service=service)
 
 
-def test_oversized_body_returns_json_and_publishes_nothing(setup_api):
+@pytest.mark.parametrize("streamed", [False, True])
+def test_oversized_body_returns_json_and_publishes_nothing(setup_api, streamed):
     _, service, _, root = setup_api
     path = root / "config.yml"
     config = yaml.safe_load(path.read_text())
     config["max_content_length"] = 32
     path.write_text(yaml.safe_dump(config))
-    with create_app(str(path), service=service).test_client() as client:
-        response = client.post("/v1/manual-bulk-crawls", json={"urls": ["https://example.com/article"]})
+    with TestClient(create_app(str(path), service=service)) as client:
+        content = b'{"urls":["https://example.com/article"]}'
+        response = client.post("/v1/manual-bulk-crawls",
+                               content=iter([content[:20], content[20:]]) if streamed else content,
+                               headers={"Content-Type": "application/json"})
     assert response.status_code == 413
-    assert response.get_json() == {"error": "Request body too large"}
+    assert response.json() == {"error": "Request body too large"}
+    assert not list((root / "pending").glob("*.json"))
+
+
+def test_openapi_describes_submission_and_ttl(setup_api):
+    client, *_ = setup_api
+    schema = client.get("/openapi.json").json()
+    request = schema["components"]["schemas"]["ManualBulkCrawlRequest"]
+    assert request["required"] == ["urls"]
+    assert request["additionalProperties"] is False
+    assert request["properties"]["ttl_days"]["default"] == 14
+    assert request["properties"]["ttl_days"]["minimum"] == 1
+    assert request["properties"]["ttl_days"]["maximum"] == 60
+    assert client.get("/docs").status_code == 200
+
+
+def test_body_limit_stops_reading_chunked_upload(setup_api):
+    _, service, _, root = setup_api
+    path = root / "config.yml"
+    config = yaml.safe_load(path.read_text())
+    config["max_content_length"] = 32
+    path.write_text(yaml.safe_dump(config))
+    app = create_app(str(path), service=service)
+    chunks = iter([b" " * 32, b" " * 32, b'{"urls":["https://example.com"]}'])
+    received = []
+    sent = []
+
+    async def receive():
+        chunk = next(chunks)
+        received.append(chunk)
+        return {"type": "http.request", "body": chunk, "more_body": True}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+             "method": "POST", "scheme": "http", "path": "/v1/manual-bulk-crawls",
+             "query_string": b"", "root_path": "",
+             "headers": [(b"content-type", b"application/json")],
+             "server": ("testserver", 80), "client": ("127.0.0.1", 1234)}
+    asyncio.run(app(scope, receive, send))
+    assert sent[0]["status"] == 413
+    assert json.loads(sent[1]["body"]) == {"error": "Request body too large"}
+    assert len(received) == 2
     assert not list((root / "pending").glob("*.json"))
 
 
 def test_default_body_limit_preserves_300_mib(setup_api):
     client, *_ = setup_api
-    assert client.application.config["MAX_CONTENT_LENGTH"] == 300 * 1024 * 1024
+    assert client.app.state.max_content_length == 300 * 1024 * 1024
 
 
 
@@ -380,7 +453,7 @@ def test_app_routes_using_its_own_config(setup_api, monkeypatch):
     path.write_text(yaml.safe_dump(config))
     router_factory = Mock(return_value=lambda urls: [2] * len(urls))
     monkeypatch.setattr(app_module, "ManualBulkCrawlRouter", router_factory)
-    with create_app(str(path)).test_client() as client:
+    with TestClient(create_app(str(path))) as client:
         response = client.post("/v1/manual-bulk-crawls", json={"urls": ["https://example.com"]})
     assert response.status_code == 200
     router_factory.assert_called_once_with(config)

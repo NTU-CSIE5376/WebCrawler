@@ -1,5 +1,6 @@
-Flask==3.1.2
-gunicorn==23.0.0
+fastapi==0.146.0
+uvicorn==0.54.0
+httpx2==2.14.0
 click==8.5.0
 w3lib==2.3.1
 validators==0.35.0

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from threading import Event
 
 import pytest
+from fastapi.testclient import TestClient
 import yaml
 from click.testing import CliRunner
 
@@ -20,7 +21,7 @@ def lifecycle(tmp_path):
     path = tmp_path / "config.yml"
     path.write_text(yaml.safe_dump({"manual_bulk_crawl": config}))
     service = ManualBulkCrawlService(config, route_urls=lambda urls: [0] * len(urls))
-    return create_app(str(path), service=service).test_client(), service, path
+    return TestClient(create_app(str(path), service=service)), service, path
 
 
 def submit(client, **options):
@@ -30,14 +31,14 @@ def submit(client, **options):
 @pytest.mark.parametrize("ttl", [None, 1, 60])
 def test_retention_is_measured_from_submission(lifecycle, ttl):
     client, service, _ = lifecycle
-    job_id = submit(client, **({} if ttl is None else {"ttl_days": ttl})).json["job_id"]
-    status = client.get(f"/v1/manual-bulk-crawls/{job_id}").json
+    job_id = submit(client, **({} if ttl is None else {"ttl_days": ttl})).json()["job_id"]
+    status = client.get(f"/v1/manual-bulk-crawls/{job_id}").json()
     assert status["ttl_days"] == (14 if ttl is None else ttl)
     assert datetime.fromisoformat(status["expires_at"]) - datetime.fromisoformat(status["created_at"]) == timedelta(days=status["ttl_days"])
     batch = storage.claim_next(service.pending_dir)
     try:
         batch.save(0, final_url=batch.urls[0], status_code=200, body=b"html")
-        completed = client.get(f"/v1/manual-bulk-crawls/{job_id}").json
+        completed = client.get(f"/v1/manual-bulk-crawls/{job_id}").json()
         assert completed["expires_at"] == status["expires_at"]
     finally:
         batch.close()
@@ -54,7 +55,7 @@ def test_invalid_ttl_is_rejected_before_routing_or_writing(lifecycle, ttl):
 @pytest.mark.parametrize("state", ["pending", "running", "completed"])
 def test_delete_removes_all_job_data_and_late_responses_cannot_recreate_it(lifecycle, state):
     client, service, _ = lifecycle
-    job_id = submit(client).json["job_id"]
+    job_id = submit(client).json()["job_id"]
     endpoint = f"/v1/manual-bulk-crawls/{job_id}"
     batch = storage.claim_next(service.pending_dir) if state != "pending" else None
     try:
@@ -77,10 +78,10 @@ def test_delete_removes_all_job_data_and_late_responses_cannot_recreate_it(lifec
 
 def test_expiration_hides_results_and_gc_preserves_live_jobs(lifecycle, monkeypatch):
     client, service, _ = lifecycle
-    short = submit(client, ttl_days=1).json["job_id"]
-    long = submit(client, ttl_days=60).json["job_id"]
+    short = submit(client, ttl_days=1).json()["job_id"]
+    long = submit(client, ttl_days=60).json()["job_id"]
     batch = storage.claim_next(service.pending_dir)
-    # Claim order is UUID order, so complete both to test completed expiration.
+    # Complete both jobs to test completed expiration.
     while batch:
         try:
             batch.save(0, final_url=batch.urls[0], status_code=200, body=b"html")
@@ -107,7 +108,7 @@ def test_expiration_hides_results_and_gc_preserves_live_jobs(lifecycle, monkeypa
 @pytest.mark.parametrize("active", [False, True])
 def test_gc_expires_unfinished_jobs_and_blocks_late_writes(lifecycle, monkeypatch, active):
     client, service, _ = lifecycle
-    job_id = submit(client, ttl_days=1).json["job_id"]
+    job_id = submit(client, ttl_days=1).json()["job_id"]
     deadline = datetime.fromisoformat(service.status(job_id)["expires_at"])
     batch = storage.claim_next(service.pending_dir) if active else None
 
@@ -131,7 +132,7 @@ def test_gc_expires_unfinished_jobs_and_blocks_late_writes(lifecycle, monkeypatc
 
 def test_delete_serializes_with_result_publication(lifecycle, monkeypatch):
     client, service, _ = lifecycle
-    job_id = submit(client).json["job_id"]
+    job_id = submit(client).json()["job_id"]
     batch = storage.claim_next(service.pending_dir)
     writing, release, deleting = Event(), Event(), Event()
     original = storage.write_file
@@ -165,7 +166,7 @@ def test_delete_serializes_with_result_publication(lifecycle, monkeypatch):
 
 def test_gc_cli_collects_legacy_jobs_with_default_retention(lifecycle):
     client, service, path = lifecycle
-    job_id = submit(client).json["job_id"]
+    job_id = submit(client).json()["job_id"]
     pending = service.pending_dir / f"{job_id}.json"
     payload = json.loads(pending.read_text())
     payload.pop("ttl_days")
