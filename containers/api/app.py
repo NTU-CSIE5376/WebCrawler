@@ -93,6 +93,7 @@ def create_app(config_path: str | None = None, *, service=None) -> Flask:
     def manual_bulk_crawl_status(job_id):
         try:
             status = service.status(job_id)
+            status.pop("result_dir", None)
             status["results_url"] = (
                 url_for("list_manual_bulk_crawl_results", job_id=job_id)
                 if status["status"] == "completed" else None

@@ -67,6 +67,7 @@ def test_job_status_tracks_pending_running_and_completed_results(setup_api):
     endpoint = f"/v1/manual-bulk-crawls/{job_id}"
     status = client.get(endpoint).get_json()
     assert status["status"] == "pending"
+    assert "result_dir" not in status
     assert status["total_urls"] == 2
     assert status["completed_urls"] == 0
     batch = claim_next(svc.pending_dir)
@@ -75,14 +76,15 @@ def test_job_status_tracks_pending_running_and_completed_results(setup_api):
         batch.save(0, final_url=batch.urls[0], status_code=200, body=b"<html>saved</html>")
         status = client.get(endpoint).get_json()
         assert status["completed_urls"] == status["succeeded_urls"] == status["html_files"] == 1
-        assert status["result_dir"] is None
+        assert "result_dir" not in status
         batch.save(1, final_url=batch.urls[1], status_code=None, error="TimeoutError")
         status = client.get(endpoint).get_json()
         assert status["status"] == "completed"
         assert status["completed_urls"] == 2
         assert status["succeeded_urls"] == status["failed_urls"] == 1
         assert status["created_at"] and status["started_at"] and status["completed_at"]
-        assert status["result_dir"] == str(root / "results" / job_id)
+        assert "result_dir" not in status
+        assert status["results_url"] == f"{endpoint}/results"
         assert (root / "results" / job_id / "00000.html").read_bytes() == b"<html>saved</html>"
     finally:
         batch.close()
@@ -104,7 +106,7 @@ def test_completion_is_not_reported_before_result_directory_is_published(setup_a
         if target == batch.target:
             status = client.get(f"/v1/manual-bulk-crawls/{job_id}").get_json()
             assert status["status"] == "running"
-            assert status["result_dir"] is None
+            assert "result_dir" not in status
         return original(source, target)
     monkeypatch.setattr(storage.os, "replace", check_boundary)
     try:

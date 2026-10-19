@@ -222,7 +222,6 @@ from different jobs are independent.
   "created_at": "2026-10-17T10:00:00+00:00",
   "started_at": "2026-10-17T10:00:01+00:00",
   "completed_at": "2026-10-17T10:01:00+00:00",
-  "result_dir": "/data/manual_bulk_crawls/results/ab12cd34ef56ab78cd90ef12ab34cd56",
   "results_url": "/v1/manual-bulk-crawls/ab12cd34ef56ab78cd90ef12ab34cd56/results"
 }
 ```
@@ -233,8 +232,7 @@ terminal result, including failures; it does not mean every fetch succeeded.
 `succeeded_urls` counts successful HTML responses; `failed_urls` includes HTTP
 errors, transport failures and non-HTML responses. `html_files` can exceed
 `succeeded_urls` because HTML error pages are also saved. `started_at` and
-`completed_at` are null until those events occur. `result_dir` is null until the
-entire result directory is available. `results_url` is also null until the job
+`completed_at` are null until those events occur. `results_url` is null until the job
 completes. Interrupted jobs resume from saved per-URL results; a fetch
 interrupted before its result was saved may run again.
 
@@ -276,25 +274,11 @@ A result-listing or file request returns `409` until the job completes, `404`
 for an unknown job or unavailable filename, or `503` if storage is unavailable.
 Errors use a JSON `error` field.
 
-Files are also accessible directly through the server's `result_dir`:
-
-```text
-{result_dir}/
-  request.json
-  status.json
-  00000.html
-  00000.json
-  00001.json
-  ...
-```
-
 `request.json` contains the normalized URL list in order. Each numbered JSON
 file identifies the original URL, final URL after redirects, HTTP status (null
 for transport failures), fetch time, error and HTML filename. A URL that did
 not return HTML has no `.html` file. HTML files contain the downloaded response
-bytes. The entire job directory becomes visible together after all URLs finish.
-Completed job files are retained until explicitly removed; there is currently
-no automatic expiration.
+bytes. All results become available together after all URLs finish.
 
 **Submission error responses**
 
