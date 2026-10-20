@@ -113,6 +113,53 @@ def test_large_job_keeps_a_bounded_backlog_and_refills_on_completion(queue):
         consumer.close()
 
 
+def test_empty_queue_is_not_rescanned_by_each_outstanding_response(queue, monkeypatch):
+    from containers.crawler.crawler import manual_bulk_crawls as feeder
+
+    enqueue, factory, _ = queue
+    enqueue("a", 4)
+    # Unrelated jobs remain in the shared queue when this crawler is done.
+    other = enqueue("other-worker", 4)
+    payload = json.loads(other.read_text())
+    payload["crawler_ids"] = [1] * 4
+    other.write_text(json.dumps(payload))
+    monkeypatch.setattr(feeder, "monotonic", lambda: 100.0)
+    scan = Mock(wraps=feeder.iter_batches)
+    monkeypatch.setattr(feeder, "iter_batches", scan)
+    consumer, requests = factory(concurrency=8)
+    try:
+        consumer.poll()
+        assert scan.call_count == 1
+        for request in requests[:-1]:
+            complete(consumer, request)
+        assert scan.call_count == 1
+        complete(consumer, requests[-1])
+        # Finishing a job frees capacity and permits one new scan.
+        assert scan.call_count == 2
+        assert not consumer.inflight
+        consumer.poll()
+        assert scan.call_count == 3
+    finally:
+        consumer.close()
+
+
+def test_next_poll_discovers_new_jobs_while_an_old_response_is_outstanding(queue):
+    enqueue, factory, _ = queue
+    enqueue("a", 2)
+    consumer, requests = factory(concurrency=8)
+    try:
+        consumer.poll()
+        enqueue("b", 1)
+        complete(consumer, requests[0])
+        assert len(requests) == 2
+        consumer.poll()
+        assert len(requests) == 3
+        assert requests[-1].meta["manual_bulk_crawl_job_id"] == "b"
+        assert len(consumer.inflight) == 2
+    finally:
+        consumer.close()
+
+
 def test_active_job_limit_releases_capacity_without_waiting_for_other_jobs(queue):
     enqueue, factory, _ = queue
     for name in ("a", "b", "c"):
