@@ -1,5 +1,7 @@
 Scrapy>=2.13
 requests
+idna>=3.6
+pydantic>=2,<3
 tldextract
 PyYAML==6.0.2
 python-json-logger==2.0.7

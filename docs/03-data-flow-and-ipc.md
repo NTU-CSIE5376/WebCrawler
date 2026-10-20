@@ -101,7 +101,7 @@ Notes:
 ```
 
 `url_priority` / `source` are set only for crawler outlinks that carry a
-`priority` field. Today only `containers/crawler/crawler/youtube_extractor.py`
+`priority` field. Today only `containers/crawler/crawler/middlewares/youtube.py`
 sets it, as `priority = 1 + min(subscribers / 10M, 1)` for channels whose page
 shows a subscriber count of at least 10K; each such channel gets its uploads
 playlist (`/playlist?list=UU…`), home (`/channel/UC…`) and `/channel/UC…/playlists`

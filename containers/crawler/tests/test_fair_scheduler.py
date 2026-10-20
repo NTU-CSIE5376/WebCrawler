@@ -205,6 +205,11 @@ def test_unspecified_policy_defaults_to_manual_first(scheduler_factory):
 @pytest.mark.parametrize("policy", [None, "balanced", "manual_first", "normal_first"])
 def test_crawler_environment_sets_dispatch_policy(monkeypatch, policy):
     import runpy
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    monkeypatch.syspath_prepend(str(root))
+    monkeypatch.chdir(root)
 
     monkeypatch.setenv("CRAWLER_USE_AUTOTHROTTLE", "true")
     if policy is None:

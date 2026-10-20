@@ -7,7 +7,7 @@ import json
 import pytest
 from scrapy.http import HtmlResponse
 
-from containers.crawler.crawler.youtube_extractor import (
+from containers.crawler.crawler.middlewares.youtube import (
     channel_priority,
     extract_youtube_outlinks,
     normalize_youtube_url,

@@ -1,0 +1,187 @@
+# Domain rules apply to the registered domain and all its subdomains.
+# Loaded from config/site_policies.yml in the crawler's working directory.
+# Exact hostname rules override domain rules, one header at a time.
+# A null header suppresses it, including headers from DEFAULT_REQUEST_HEADERS.
+# middleware names the Python class to handle matching requests.
+# Exact host rules inherit the domain middleware; null disables it for that host.
+# Additional options: headers and download_timeout_sec (positive seconds).
+# crawler_mode and request_limits inherit default -> domain -> exact host.
+# Scrapy delay is calculated as 1 / max_qps; AutoThrottle may slow down further.
+default:
+  crawler_mode: autothrottle
+  request_limits:
+    max_qps: 4
+    max_concurrent_requests: 16
+
+domains:
+  wikipedia.org:
+    crawler_mode: autothrottle
+    middleware: crawler.middlewares.wikipedia.WikipediaMiddleware
+    request_limits:
+      download_slot: wikipedia
+      max_concurrent_requests: 10 # Per crawler process; no shared request budget.
+      max_qps: 15 # ref: https://wikitech.wikimedia.org/wiki/Robot_policy
+    headers:
+      User-Agent: "WebCrawlerBot/1.0 (+https://github.com/NTU-CSIE5376/WebCrawler)"
+      Sec-Fetch-Dest: null
+      Sec-Fetch-Mode: null
+      Sec-Fetch-Site: null
+      Sec-Fetch-User: null
+      Upgrade-Insecure-Requests: null
+
+  youtube.com:
+    middleware: crawler.middlewares.youtube.YouTubeMiddleware
+
+hosts:
+  01282.com:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  154.66.220.45:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  24.hu:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  2bdigital.eg:
+    request_limits:
+      max_qps: 0.75
+      max_concurrent_requests: 4
+  35.ru:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  5ch.io:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  accounts.google.com:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  biblehub.com:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  dic.academic.ru:
+    request_limits:
+      max_qps: 0.75
+      max_concurrent_requests: 4
+  elektroninen.365electric.com:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  entrepaginasdeblue.blogspot.com:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  floor.0731fdc.com:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  forum.3design.us:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  hdsupplysolutions.com:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  ipp.taobao.com:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  murmansk.1001tur.ru:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  music.163.com:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  online.1c.ru:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  ru.226248.com:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  voi.0101.co.jp:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  workspaceupdates-pt.googleblog.com:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  www.03.ru:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  www.0537f.cn:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  www.0537yz.com:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  www.11freunde.de:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  www.1800wxbrief.com:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  www.1905.com:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  www.1stdibs.com:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  www.5rb.com:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  www.90thbombgroup.org:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  www.able.co.jp:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  www.aboutyou.pl:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  www.abtl.hu:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  www.acbmedia.org:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  www.cna.com.tw:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  www.merriam-webster.com:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  www.youtube.com:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
+  xtpx.597.com:
+    request_limits:
+      max_qps: 3
+      max_concurrent_requests: 4
