@@ -10,7 +10,7 @@ from scrapy.settings import Settings
 
 from containers.crawler.crawler.manual_bulk_crawls import ManualBulkCrawlConsumer
 from libs.ipc import manual_bulk_crawl as storage
-from libs.ipc.manual_bulk_crawl import claim_next
+from libs.ipc.manual_bulk_crawl import next_batch, prepare_job, job_status
 
 
 @pytest.fixture
@@ -25,6 +25,7 @@ def queue(tmp_path):
                                    "max_concurrency_ratio": ratio,
                                    "crawler_ids": [0] * count,
                                    "result_dir": str(tmp_path / "results")}))
+        prepare_job(path, json.loads(path.read_text()))
         return path
 
     def consumer(concurrency=3, **limits):
@@ -111,13 +112,13 @@ def test_next_job_finishes_while_earlier_job_still_has_a_slow_url(queue):
         assert requests[-1].meta["manual_bulk_crawl_job_id"] == "b"
         assert len(consumer.inflight) == 2
         complete(consumer, requests[-1], body=b"job b")
-        assert not second.exists()
+        assert not (second.parent / "crawler_00" / second.name).exists()
         assert first.exists()
-        assert (root / "results/b/00000.html").read_bytes() == b"job b"
-        assert not (root / "results/a").exists()
+        assert (root / "results/b/crawler_00/00000.html").read_bytes() == b"job b"
+        assert json.loads((root / "results/a/crawler_00/progress.json").read_text())["completed_at"] is None
         complete(consumer, slow, body=b"job a")
-        assert not first.exists()
-        assert (root / "results/a/00000.html").read_bytes() == b"job a"
+        assert not (first.parent / "crawler_00" / first.name).exists()
+        assert (root / "results/a/crawler_00/00000.html").read_bytes() == b"job a"
         assert not consumer.inflight
     finally:
         consumer.close()
@@ -135,9 +136,9 @@ def test_large_job_keeps_a_bounded_backlog_and_refills_on_completion(queue):
             complete(consumer, requests[position])
             assert len(consumer.inflight) <= 2
         assert len(requests) == 6
-        assert not (root / "results/a").exists()
+        assert json.loads((root / "results/a/crawler_00/progress.json").read_text())["completed_at"] is None
         complete(consumer, requests[0])
-        status = json.loads((root / "results/a/status.json").read_text())
+        status = job_status("a", json.loads((root / "pending/a.json").read_text()), root / "results/a")
         assert status["completed_urls"] == 6
         assert len({(request.meta["manual_bulk_crawl_job_id"], request.meta["manual_bulk_crawl_index"])
                     for request in requests}) == 6
@@ -170,11 +171,11 @@ def test_storage_failure_retains_ownership_until_that_jobs_callbacks_drain(queue
         consumer.poll()
         monkeypatch.setattr(consumer.jobs["a"].batch, "save", Mock(side_effect=OSError("disk full")))
         complete(consumer, requests[0])
-        assert claim_next(path.parent) is None
+        assert "a" in consumer.jobs
         assert len(requests) == 2, "Unscheduled URLs must wait for the failed attempt to drain"
         complete(consumer, requests[1])
         assert not consumer.jobs
-        retry = claim_next(path.parent)
+        retry = next_batch(path.parent)
         try:
             assert retry.remaining == {0, 1, 2, 3}
         finally:
@@ -193,7 +194,7 @@ def test_failed_job_does_not_block_results_from_another_job(queue, monkeypatch):
         monkeypatch.setattr(consumer.jobs["a"].batch, "save", Mock(side_effect=OSError("disk full")))
         complete(consumer, requests[0])
         complete(consumer, requests[2], body=b"unrelated job")
-        assert (root / "results/b/00000.html").read_bytes() == b"unrelated job"
+        assert (root / "results/b/crawler_00/00000.html").read_bytes() == b"unrelated job"
         assert "a" in consumer.jobs
         assert len(consumer.inflight) == 1
     finally:
@@ -207,7 +208,7 @@ def test_publication_retry_resumes_saved_results_without_refetching(queue, monke
     original = storage.os.replace
 
     def fail_publication(source, target):
-        if target == root / "results/a":
+        if target == root / "results/a/crawler_00/progress.json":
             raise OSError("publication interrupted")
         return original(source, target)
 
@@ -219,9 +220,9 @@ def test_publication_retry_resumes_saved_results_without_refetching(queue, monke
         assert path.exists()
         consumer.retry_after.clear()
         consumer.poll()
-        assert not path.exists()
+        assert not (path.parent / "crawler_00" / path.name).exists()
         assert len(requests) == 1
-        assert (root / "results/a/00000.html").read_bytes() == b"<html>saved</html>"
+        assert (root / "results/a/crawler_00/00000.html").read_bytes() == b"<html>saved</html>"
     finally:
         consumer.close()
 
@@ -237,8 +238,8 @@ def test_shutdown_releases_every_job_and_ignores_stale_callbacks(queue):
     consumer.poll()
     assert len(requests) == 2
     assert not consumer.jobs
-    retry_a = claim_next(first.parent)
-    retry_b = claim_next(first.parent)
+    retry_a = next_batch(first.parent)
+    retry_b = next_batch(first.parent, exclude_job_ids={retry_a.path.stem})
     try:
         assert {retry_a.path.stem, retry_b.path.stem} == {"a", "b"}
     finally:
@@ -260,9 +261,9 @@ def test_scheduling_failure_does_not_release_an_inflight_request_claim(queue):
     try:
         consumer.poll()
         assert len(requests) == 1
-        assert claim_next(path.parent) is None
+        assert "a" in consumer.jobs
         complete(consumer, requests[0])
-        retry = claim_next(path.parent)
+        retry = next_batch(path.parent)
         assert retry is not None
         retry.close()
     finally:
@@ -310,15 +311,16 @@ def test_job_message_selects_its_output_directory_without_api_configuration(queu
     payload = json.loads(second.read_text())
     payload["result_dir"] = str(output)
     second.write_text(json.dumps(payload))
+    prepare_job(second, payload)
     consumer, requests = factory(concurrency=3)
     try:
         consumer.poll()
         complete(consumer, requests[1], body=b"upstream output")
         complete(consumer, requests[0], body=b"original output")
-        assert not first.exists() and not second.exists()
-        assert (root / "results/a/00000.html").read_bytes() == b"original output"
-        assert (output / "b/00000.html").read_bytes() == b"upstream output"
-        assert not (root / "results/b").exists()
+        assert not (first.parent / "crawler_00" / first.name).exists() and not (second.parent / "crawler_00" / second.name).exists()
+        assert (root / "results/a/crawler_00/00000.html").read_bytes() == b"original output"
+        assert (output / "b/crawler_00/00000.html").read_bytes() == b"upstream output"
+        assert not (root / "results/b/crawler_00/00000.html").exists()
     finally:
         consumer.close()
 
@@ -332,7 +334,7 @@ def test_deleted_or_expired_job_stops_refill_and_discards_inflight_responses(que
     job_id = "a" * 32
     path = enqueue(job_id, 6)
     consumer, requests = factory(concurrency=3)
-    staging = root / "results/.incomplete" / job_id
+    staging = root / "results" / job_id
     try:
         consumer.poll()
         assert len(requests) == 2
@@ -352,7 +354,7 @@ def test_deleted_or_expired_job_stops_refill_and_discards_inflight_responses(que
         assert len(requests) == 2
         assert not consumer.jobs and not consumer.inflight
         consumer.spider.logger.exception.assert_not_called()
-        assert not (root / "results" / job_id).exists()
+        assert not (staging / "crawler_00/00000.html").exists()
         if expire:
             # Cleanup belongs to API GC; the consumer must leave no late output.
             assert path.exists()

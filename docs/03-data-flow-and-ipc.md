@@ -325,8 +325,8 @@ For `503`, the response is:
 
 ## 3.7 Manual Bulk Crawl Processing
 
-Input: accepted job messages in `MANUAL_BULK_CRAWL_QUEUE_DIR`
-(default `/data/manual_bulk_crawls/pending`).
+Input: per-crawler job entries under `MANUAL_BULK_CRAWL_QUEUE_DIR/crawler_{id:02d}`
+(default `/data/manual_bulk_crawls/pending/crawler_{id:02d}`).
 
 The existing `html_spider` workers also consume API jobs. The API resolves each
 URL to the crawler that owns its domain's shard, using read-only routing data.
@@ -339,8 +339,9 @@ AutoThrottle settings as regular requests.
 
 Responsibilities:
 
-- Exclusively claim this worker's portions of multiple accepted jobs with
-  nonblocking file locks; different workers can process one job concurrently.
+- Consume only this crawler's queue partition. Run one live crawler process per
+  crawler ID, as with normal IPC. Different crawlers can process one job
+  concurrently without file locks.
 - Limit outstanding manual URLs across all jobs per crawler to
   `floor(CONCURRENT_REQUESTS × max_concurrency_ratio)`, including queued requests,
   retries and downloads. Configure `manual_bulk_crawl.max_concurrency_ratio` in
@@ -350,18 +351,35 @@ Responsibilities:
   existing requests drain before a lower limit takes effect. With concurrency 256,
   manual work is limited to 128 outstanding URLs. A rounded limit of zero pauses
   manual work. This limits concurrency, not CPU or bandwidth usage.
-  Claimed jobs remain bounded by `MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS` (default 64),
+  Active jobs remain bounded by `MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS` (default 64),
   overridable with `CRAWLER_MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS`.
   Refill as each URL completes so other jobs progress while slow fetches finish.
 - Fetch only submitted URLs. Dedicated callbacks save HTML and metadata without
   emitting PageItems, discovering outlinks or entering the normal result pipeline.
-- Atomically update per-worker progress and aggregate it for job status.
-- Read the output root from each job message and publish under `result_dir/{job_id}`
-  only after every assigned worker finishes, then remove the pending file.
-- Resume interrupted jobs from durable per-URL records. Process exit releases
-  claims; a fetch interrupted before its record was saved may run again.
-- On a job failure, retain its claim until outstanding callbacks drain before
-  retrying. Other jobs can continue to publish their results.
+- Write results and atomically replace progress only within
+  `result_dir/{job_id}/crawler_{id:02d}`. Each partition has one writer.
+- Remove only this crawler's queue entry after its completed progress is saved.
+  Resume unfinished entries from durable per-URL records after restart; a fetch
+  interrupted before its record was saved may run again.
+- On a job failure, drain its outstanding callbacks before retrying. Other jobs
+  and crawler partitions continue independently.
+
+The API creates output partitions and queue entries before atomically publishing
+an immutable job manifest. Entries without a manifest are ignored, so a failed
+submission cannot expose part of a batch. Concurrent API workers publish distinct
+jobs without sharing a mutable queue file.
+
+The API computes job status by summing each assigned crawler's progress. A job is
+completed only when every partition has a completion timestamp; result listing
+and downloads remain unavailable until then. No crawler publishes a shared final
+status or moves the whole result directory. Download filenames stay flat; the API
+resolves each numbered file to its owning crawler partition.
+
+Only the API and its GC process delete jobs. They atomically retire the manifest
+to hide the job, then move its output directory out of the visible namespace
+before removing it. Crawlers never create output directories, so late callbacks
+cannot recreate deleted results. GC retries interrupted cleanup and removes
+expired, uncommitted preparations too.
 
 The API and normal crawler container share a separate host directory, configured
 by `MANUAL_BULK_CRAWL_DATA_DIR` in Compose (default `/data/manual_bulk_crawls`). The

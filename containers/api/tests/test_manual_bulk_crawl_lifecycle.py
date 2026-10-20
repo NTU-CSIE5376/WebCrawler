@@ -35,7 +35,7 @@ def test_retention_is_measured_from_submission(lifecycle, ttl):
     status = client.get(f"/v1/manual-bulk-crawls/{job_id}").json()
     assert status["ttl_days"] == (14 if ttl is None else ttl)
     assert datetime.fromisoformat(status["expires_at"]) - datetime.fromisoformat(status["created_at"]) == timedelta(days=status["ttl_days"])
-    batch = storage.claim_next(service.pending_dir)
+    batch = storage.next_batch(service.pending_dir)
     try:
         batch.save(0, final_url=batch.urls[0], status_code=200, body=b"html")
         completed = client.get(f"/v1/manual-bulk-crawls/{job_id}").json()
@@ -57,7 +57,7 @@ def test_delete_removes_all_job_data_and_late_responses_cannot_recreate_it(lifec
     client, service, _ = lifecycle
     job_id = submit(client).json()["job_id"]
     endpoint = f"/v1/manual-bulk-crawls/{job_id}"
-    batch = storage.claim_next(service.pending_dir) if state != "pending" else None
+    batch = storage.next_batch(service.pending_dir) if state != "pending" else None
     try:
         if state == "completed":
             batch.save(0, final_url=batch.urls[0], status_code=200, body=b"html")
@@ -65,12 +65,12 @@ def test_delete_removes_all_job_data_and_late_responses_cannot_recreate_it(lifec
         assert client.get(endpoint).status_code == 404
         assert client.get(endpoint + "/results").status_code == 404
         assert client.delete(endpoint).status_code == 404
-        assert storage.claim_next(service.pending_dir) is None
+        assert storage.next_batch(service.pending_dir) is None
         if state == "running":
             with pytest.raises(storage.JobUnavailable):
                 batch.save(0, final_url=batch.urls[0], status_code=200, body=b"late")
         assert not (service.result_dir / job_id).exists()
-        assert not (service.result_dir / ".incomplete" / job_id).exists()
+        assert not (service.result_dir / job_id).exists()
     finally:
         if batch:
             batch.close()
@@ -80,14 +80,14 @@ def test_expiration_hides_results_and_gc_preserves_live_jobs(lifecycle, monkeypa
     client, service, _ = lifecycle
     short = submit(client, ttl_days=1).json()["job_id"]
     long = submit(client, ttl_days=60).json()["job_id"]
-    batch = storage.claim_next(service.pending_dir)
+    batch = storage.next_batch(service.pending_dir)
     # Complete both jobs to test completed expiration.
     while batch:
         try:
             batch.save(0, final_url=batch.urls[0], status_code=200, body=b"html")
         finally:
             batch.close()
-        batch = storage.claim_next(service.pending_dir)
+        batch = storage.next_batch(service.pending_dir)
     deadline = datetime.fromisoformat(service.status(short)["expires_at"])
 
     class Clock(datetime):
@@ -110,7 +110,7 @@ def test_gc_expires_unfinished_jobs_and_blocks_late_writes(lifecycle, monkeypatc
     client, service, _ = lifecycle
     job_id = submit(client, ttl_days=1).json()["job_id"]
     deadline = datetime.fromisoformat(service.status(job_id)["expires_at"])
-    batch = storage.claim_next(service.pending_dir) if active else None
+    batch = storage.next_batch(service.pending_dir) if active else None
 
     class Clock(datetime):
         @classmethod
@@ -119,21 +119,21 @@ def test_gc_expires_unfinished_jobs_and_blocks_late_writes(lifecycle, monkeypatc
 
     monkeypatch.setattr(storage, "datetime", Clock)
     try:
-        assert storage.claim_next(service.pending_dir) is None
+        assert storage.next_batch(service.pending_dir) is None
         if batch:
             with pytest.raises(storage.JobUnavailable):
                 batch.save(0, final_url=batch.urls[0], status_code=200, body=b"expired")
         assert service.collect_expired(now=deadline) == 1
-        assert not (service.result_dir / ".incomplete" / job_id).exists()
+        assert not (service.result_dir / job_id).exists()
     finally:
         if batch:
             batch.close()
 
 
-def test_delete_serializes_with_result_publication(lifecycle, monkeypatch):
+def test_delete_does_not_wait_for_result_writes_and_blocks_late_publication(lifecycle, monkeypatch):
     client, service, _ = lifecycle
     job_id = submit(client).json()["job_id"]
-    batch = storage.claim_next(service.pending_dir)
+    batch = storage.next_batch(service.pending_dir)
     writing, release, deleting = Event(), Event(), Event()
     original = storage.write_file
 
@@ -154,11 +154,12 @@ def test_delete_serializes_with_result_publication(lifecycle, monkeypatch):
             assert writing.wait(5)
             deletion = pool.submit(delete)
             assert deleting.wait(5)
-            release.set()
-            saving.result(timeout=5)
             deletion.result(timeout=5)
+            release.set()
+            with pytest.raises(storage.JobUnavailable):
+                saving.result(timeout=5)
         assert client.get(f"/v1/manual-bulk-crawls/{job_id}").status_code == 404
-        assert not batch.target.exists() and not batch.staging.exists()
+        assert not batch.directory.exists()
     finally:
         release.set()
         batch.close()

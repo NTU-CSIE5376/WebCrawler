@@ -8,7 +8,7 @@ import yaml
 
 from containers.api.app import create_app
 from containers.api.service import ManualBulkCrawlService
-from libs.ipc.manual_bulk_crawl import claim_next
+from libs.ipc.manual_bulk_crawl import next_batch
 
 
 @pytest.fixture
@@ -26,7 +26,7 @@ def job_api(tmp_path, monkeypatch):
 
 def complete_job(service):
     job_id = service.submit(["https://example.com/a", "https://example.com/b"])
-    batch = claim_next(service.pending_dir)
+    batch = next_batch(service.pending_dir)
     try:
         batch.save(0, final_url=batch.urls[0], status_code=200,
                    body=b"<html><script>alert('saved content')</script></html>")
@@ -55,7 +55,7 @@ def test_remote_client_follows_status_listing_and_download_links(job_api):
     assert files["request.json"]["url"] is None
     assert files["status.json"]["url"] is None
     html = api_get(client, files["00000.html"]["download_url"])
-    assert html.content == (service.result_dir / job_id / "00000.html").read_bytes()
+    assert html.content == (service.result_dir / job_id / "crawler_00" / "00000.html").read_bytes()
     assert files["00000.html"]["size_bytes"] == len(html.content)
     assert html.headers["content-disposition"] == 'attachment; filename="00000.html"'
     assert html.headers["content-type"] == "application/octet-stream"
@@ -65,13 +65,16 @@ def test_remote_client_follows_status_listing_and_download_links(job_api):
     assert client.get(f"/v1/manual-bulk-crawls/{job_id}/results/00001.html").status_code == 404
 
 
-def test_download_supports_http_range_requests(job_api):
+@pytest.mark.parametrize("filename", ["00000.html", "status.json"])
+def test_download_supports_http_range_requests(job_api, filename):
     client, service = job_api
     job_id = complete_job(service)
-    response = client.get(f"/v1/manual-bulk-crawls/{job_id}/results/00000.html",
+    endpoint = f"/v1/manual-bulk-crawls/{job_id}/results/{filename}"
+    content = client.get(endpoint).content
+    response = client.get(endpoint,
                           headers={"Range": "bytes=0-5"})
     assert response.status_code == 206
-    assert response.content == b"<html>"
+    assert response.content == content[:6]
     assert response.headers["content-range"].startswith("bytes 0-5/")
 
 
@@ -81,7 +84,7 @@ def test_pending_and_running_jobs_do_not_expose_partial_files(job_api):
     endpoint = f"/v1/manual-bulk-crawls/{job_id}/results"
     assert client.get(f"/v1/manual-bulk-crawls/{job_id}").json()["results_url"] is None
     assert client.get(endpoint).status_code == 409
-    batch = claim_next(service.pending_dir)
+    batch = next_batch(service.pending_dir)
     try:
         batch.save(0, final_url=batch.urls[0], status_code=200, body=b"partial")
         assert client.get(endpoint + "/00000.html").status_code == 409
@@ -103,7 +106,7 @@ def test_symlinks_are_not_listed_or_downloaded(job_api, tmp_path):
     job_id = complete_job(service)
     secret = tmp_path / "secret"
     secret.write_text("outside result storage")
-    (service.result_dir / job_id / "99999.html").symlink_to(secret)
+    (service.result_dir / job_id / "crawler_00" / "99999.html").symlink_to(secret)
     listing = client.get(f"/v1/manual-bulk-crawls/{job_id}/results").json()
     assert "99999.html" not in [file["name"] for file in listing["files"]]
     assert client.get(f"/v1/manual-bulk-crawls/{job_id}/results/99999.html").status_code == 404

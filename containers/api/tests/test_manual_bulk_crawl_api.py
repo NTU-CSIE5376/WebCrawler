@@ -16,8 +16,7 @@ from containers.api.app import create_app
 from containers.api import service as service_module
 from containers.api import app as app_module
 from containers.api.service import ManualBulkCrawlService
-from libs.ipc.manual_bulk_crawl import queue_lock
-from libs.ipc.manual_bulk_crawl import claim_next
+from libs.ipc.manual_bulk_crawl import next_batch
 
 
 @pytest.fixture
@@ -51,7 +50,7 @@ def test_submission_queues_urls_without_database_writes_or_ingestor_records(setu
     assert payload["urls"] == ["https://example.com/a", "https://example.org/b"]
     assert payload["created_at"]
     assert not list(root.rglob("*.jsonl"))
-    assert not (root / "results").exists()
+    assert not list((root / "results").rglob("*.html"))
 
 
 def test_default_app_uses_read_only_routing(setup_api, monkeypatch):
@@ -82,7 +81,7 @@ def test_job_status_tracks_pending_running_and_completed_results(setup_api):
     assert "result_dir" not in status
     assert status["total_urls"] == 2
     assert status["completed_urls"] == 0
-    batch = claim_next(svc.pending_dir)
+    batch = next_batch(svc.pending_dir)
     try:
         assert client.get(endpoint).json()["status"] == "running"
         batch.save(0, final_url=batch.urls[0], status_code=200, body=b"<html>saved</html>")
@@ -97,7 +96,7 @@ def test_job_status_tracks_pending_running_and_completed_results(setup_api):
         assert status["created_at"] and status["started_at"] and status["completed_at"]
         assert "result_dir" not in status
         assert status["results_url"] == f"{endpoint}/results"
-        assert (root / "results" / job_id / "00000.html").read_bytes() == b"<html>saved</html>"
+        assert (root / "results" / job_id / "crawler_00" / "00000.html").read_bytes() == b"<html>saved</html>"
     finally:
         batch.close()
 
@@ -108,14 +107,14 @@ def test_unknown_or_invalid_job_returns_404(setup_api, job_id):
     assert client.get(f"/v1/manual-bulk-crawls/{job_id}").status_code == 404
 
 
-def test_completion_is_not_reported_before_result_directory_is_published(setup_api, monkeypatch):
+def test_completion_is_not_reported_before_worker_progress_is_published(setup_api, monkeypatch):
     client, svc, *_ = setup_api
     job_id = client.post("/v1/manual-bulk-crawls", json={"urls": ["https://example.com"]}).json()["job_id"]
-    batch = claim_next(svc.pending_dir)
+    batch = next_batch(svc.pending_dir)
     from libs.ipc import manual_bulk_crawl as storage
     original = storage.os.replace
     def check_boundary(source, target):
-        if target == batch.target:
+        if target == batch.progress_path:
             status = client.get(f"/v1/manual-bulk-crawls/{job_id}").json()
             assert status["status"] == "running"
             assert "result_dir" not in status
@@ -247,27 +246,17 @@ def test_overlapping_api_requests_publish_complete_distinct_batches(setup_api):
     assert all(len(json.loads(batch.read_text())["urls"]) == 2 for batch in batches)
 
 
-def test_submission_prepares_while_publication_lock_is_held(setup_api, monkeypatch):
-    _, svc, engine, tmp_path = setup_api
-    staged = Event()
-    original = service_module.os.fsync
-
-    def signal_staged(descriptor):
-        original(descriptor)
-        staged.set()
-
-    monkeypatch.setattr(service_module.os, "fsync", signal_staged)
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        with queue_lock(svc.pending_dir):
-            future = pool.submit(svc.submit, ["https://example.com/a"])
-            assert staged.wait(timeout=5), "Preparation must not wait for the queue lock"
-            assert not future.done()
-            assert not list(svc.pending_dir.glob("*.json"))
-            temporary = next(svc.pending_dir.glob("*.json.tmp"))
-            assert len(json.loads(temporary.read_text())["urls"]) == 1
-        future.result(timeout=5)
-    assert len(list(svc.pending_dir.glob("*.json"))) == 1
-    assert not list(svc.pending_dir.glob("*.tmp"))
+def test_partitions_are_invisible_until_manifest_publication(setup_api, monkeypatch):
+    _, svc, _, _ = setup_api
+    original = service_module.os.replace
+    def check_boundary(source, target):
+        if target.parent == svc.pending_dir:
+            assert list((svc.pending_dir / "crawler_00").glob("*.json"))
+            assert next_batch(svc.pending_dir) is None
+        return original(source, target)
+    monkeypatch.setattr(service_module.os, "replace", check_boundary)
+    job_id = svc.submit(["https://example.com/a"])
+    assert next_batch(svc.pending_dir).path.stem == job_id
 
 
 def test_overlapping_submissions_stage_in_parallel(setup_api, monkeypatch):

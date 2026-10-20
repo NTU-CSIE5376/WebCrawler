@@ -11,7 +11,7 @@ import time
 import pytest
 
 from libs.ipc import manual_bulk_crawl as storage
-from libs.ipc.manual_bulk_crawl import claim_next
+from libs.ipc.manual_bulk_crawl import next_batch, prepare_job, job_status
 
 
 def enqueue(root, name="batch", urls=None, crawler_ids=None):
@@ -21,84 +21,67 @@ def enqueue(root, name="batch", urls=None, crawler_ids=None):
     urls = urls or ["https://example.com/a"]
     path.write_text(json.dumps({"version": 1, "urls": urls, "crawler_ids": crawler_ids or [0] * len(urls),
                                 "result_dir": str(root / "results")}))
+    prepare_job(path, json.loads(path.read_text()))
     return path
 
 
-def test_only_one_worker_can_claim_batch_and_interrupted_owner_can_retry(tmp_path):
-    path = enqueue(tmp_path)
-    batch = claim_next(path.parent)
-    try:
-        assert claim_next(path.parent) is None
-        assert path.exists()
-    finally:
-        batch.close()
-    retry = claim_next(path.parent)
-    assert retry.urls == batch.urls
-    retry.close()
-
-
-def test_complete_batch_is_published_atomically_with_html_and_failures(tmp_path):
+def test_restart_resumes_only_unfinished_urls(tmp_path):
     path = enqueue(tmp_path, urls=["https://example.com/a", "https://example.com/b"])
-    batch = claim_next(path.parent)
-    try:
-        batch.save(0, final_url="https://example.com/a", status_code=200, body=b"<html>hello</html>")
-        assert not batch.target.exists()
-        assert path.exists()
-        batch.save(1, final_url="https://example.com/b", status_code=None, error="TimeoutError")
-        assert not path.exists()
-        assert (batch.target / "00000.html").read_bytes() == b"<html>hello</html>"
-        assert not (batch.target / "00001.html").exists()
-        assert json.loads((batch.target / "00001.json").read_text())["error"] == "TimeoutError"
-        assert len(json.loads((batch.target / "request.json").read_text())["urls"]) == 2
-    finally:
-        batch.close()
+    batch = next_batch(path.parent)
+    batch.save(0, final_url=batch.urls[0], status_code=200, body=b"saved")
+    batch.close()
+    retry = next_batch(path.parent)
+    assert retry.remaining == {1}
+    assert retry.progress["started_at"] == batch.progress["started_at"]
+    retry.save(1, final_url=retry.urls[1], status_code=None, error="TimeoutError")
+    assert next_batch(path.parent) is None
+    assert path.exists()  # Only API/GC removes the job manifest.
+    assert (retry.directory / "00000.html").read_bytes() == b"saved"
+    assert not (retry.directory / "00001.html").exists()
+    status = job_status(path.stem, retry.payload, tmp_path / "results" / path.stem)
+    assert status["status"] == "completed"
+    assert status["succeeded_urls"] == status["failed_urls"] == 1
 
 
-def test_storage_failure_retains_entire_batch_and_retry_replaces_partial_work(tmp_path, monkeypatch):
+def test_storage_failure_retries_without_losing_url_records(tmp_path, monkeypatch):
     path = enqueue(tmp_path)
-    batch = claim_next(path.parent)
+    batch = next_batch(path.parent)
     with monkeypatch.context() as patch:
         patch.setattr(storage.os, "replace", lambda *args: (_ for _ in ()).throw(OSError("disk full")))
         with pytest.raises(OSError):
             batch.save(0, final_url=batch.urls[0], status_code=200, body=b"old")
-    assert path.exists()
-    assert not batch.target.exists()
-    batch.close()
-    retry = claim_next(path.parent)
-    try:
-        retry.save(0, final_url=retry.urls[0], status_code=200, body=b"new")
-        assert (retry.target / "00000.html").read_bytes() == b"new"
-    finally:
-        retry.close()
+    retry = next_batch(path.parent)
+    assert retry.remaining == {0}
+    retry.save(0, final_url=retry.urls[0], status_code=200, body=b"new")
+    assert (retry.directory / "00000.html").read_bytes() == b"new"
 
 
-def test_crash_after_publication_does_not_recrawl_completed_batch(tmp_path, monkeypatch):
+def test_restart_recovers_metadata_saved_before_progress_publication(tmp_path, monkeypatch):
     path = enqueue(tmp_path)
-    batch = claim_next(path.parent)
-    unlink = Path.unlink
+    batch = next_batch(path.parent)
+    original = storage.os.replace
+    def fail_progress(source, target):
+        if target == batch.progress_path:
+            raise OSError("interrupted")
+        return original(source, target)
     with monkeypatch.context() as patch:
-        def fail_unlink(self, *args, **kwargs):
-            if self == path:
-                raise OSError("interrupted")
-            return unlink(self, *args, **kwargs)
-        patch.setattr(Path, "unlink", fail_unlink)
+        patch.setattr(storage.os, "replace", fail_progress)
         with pytest.raises(OSError):
             batch.save(0, final_url=batch.urls[0], status_code=200, body=b"saved")
-    batch.close()
-    assert claim_next(path.parent) is None
-    assert not path.exists()
-    assert (batch.target / "00000.html").read_bytes() == b"saved"
+    assert next_batch(path.parent) is None
+    assert (batch.directory / "00000.html").read_bytes() == b"saved"
+    assert json.loads(batch.progress_path.read_text())["completed_at"]
 
 
 def test_temporary_files_are_never_claimed(tmp_path):
     pending = tmp_path / "pending"
     pending.mkdir()
     (pending / "incomplete.json.tmp").write_text("incomplete")
-    assert claim_next(pending) is None
+    assert next_batch(pending) is None
 
 
 @pytest.mark.parametrize("legacy", [False, True])
-def test_jobs_are_claimed_fifo_regardless_of_uuid_order(tmp_path, legacy):
+def test_jobs_are_selected_fifo_regardless_of_uuid_order(tmp_path, legacy):
     for name, timestamp in (("f" * 32, 4070908800), ("a" * 32, 4070908801)):
         path = enqueue(tmp_path, name=name)
         if legacy:
@@ -107,64 +90,35 @@ def test_jobs_are_claimed_fifo_regardless_of_uuid_order(tmp_path, legacy):
             payload = json.loads(path.read_text())
             payload["created_at"] = f"2099-01-01T00:00:0{timestamp - 4070908800}+00:00"
             path.write_text(json.dumps(payload))
-            # Creation metadata takes precedence over filesystem times.
             os.utime(path, (2 * 4070908800 - timestamp,) * 2)
     pending = tmp_path / "pending"
-    first = claim_next(pending)
-    try:
-        assert first.path.stem == "f" * 32
-        # Another claimant can take the next job while the oldest is owned.
-        second = claim_next(pending)
-        try:
-            assert second.path.stem == "a" * 32
-        finally:
-            second.close()
-    finally:
-        first.close()
-    # Releasing an unfinished older job preserves its position on retry.
-    retry = claim_next(pending)
-    try:
-        assert retry.path.stem == "f" * 32
-    finally:
-        retry.close()
-
-
-def test_job_waits_for_all_assigned_crawlers_before_publication(tmp_path):
-    path = enqueue(tmp_path, urls=["https://example.com/a", "https://example.org/b"], crawler_ids=[0, 1])
-    first = claim_next(path.parent, 0)
-    second = claim_next(path.parent, 1)
-    try:
-        assert first.remaining == {0}
-        assert second.remaining == {1}
-        first.save(0, final_url=first.urls[0], status_code=200, body=b"first")
-        assert path.exists()
-        assert not first.target.exists()
-        assert claim_next(path.parent, 0) is None
-        second.save(1, final_url=second.urls[1], status_code=200, body=b"second")
-        status = json.loads((second.target / "status.json").read_text())
-        assert status["completed_urls"] == status["succeeded_urls"] == 2
-        assert (second.target / "00000.html").read_bytes() == b"first"
-        assert (second.target / "00001.html").read_bytes() == b"second"
-        assert not path.exists()
-    finally:
-        first.close()
-        second.close()
-
-
-def test_retry_resumes_completed_urls_without_refetching_them(tmp_path):
-    path = enqueue(tmp_path, urls=["https://example.com/a", "https://example.com/b"])
-    first = claim_next(path.parent)
-    first.save(0, final_url=first.urls[0], status_code=200, body=b"saved")
-    started = first.progress["started_at"]
+    first = next_batch(pending)
+    assert first.path.stem == "f" * 32
+    second = next_batch(pending, exclude_job_ids={first.path.stem})
+    assert second.path.stem == "a" * 32
     first.close()
-    retry = claim_next(path.parent)
-    try:
-        assert retry.remaining == {1}
-        assert retry.progress["started_at"] == started
-        retry.save(1, final_url=retry.urls[1], status_code=200, body=b"new")
-        assert (retry.target / "00000.html").read_bytes() == b"saved"
-    finally:
-        retry.close()
+    second.close()
+    assert next_batch(pending).path.stem == "f" * 32
+
+
+def test_workers_write_independent_partitions_and_api_aggregates(tmp_path):
+    path = enqueue(tmp_path, urls=["https://example.com/a", "https://example.org/b"], crawler_ids=[0, 1])
+    first = next_batch(path.parent, 0)
+    second = next_batch(path.parent, 1)
+    assert first.directory != second.directory
+    assert first.remaining == {0}
+    assert second.remaining == {1}
+    first.save(0, final_url=first.urls[0], status_code=200, body=b"first")
+    assert next_batch(path.parent, 0) is None
+    assert job_status(path.stem, first.payload, tmp_path / "results" / path.stem)["status"] == "running"
+    second.save(1, final_url=second.urls[1], status_code=200, body=b"second")
+    status = job_status(path.stem, first.payload, tmp_path / "results" / path.stem)
+    assert status["status"] == "completed"
+    assert status["completed_urls"] == 2
+    assert (first.directory / "00000.html").read_bytes() == b"first"
+    assert (second.directory / "00001.html").read_bytes() == b"second"
+    assert path.exists()
+    assert not list(tmp_path.rglob("*.lock"))
 
 
 def test_live_worker_crawls_only_requested_pages_and_never_emits_ingestor_results(tmp_path):
@@ -251,10 +205,10 @@ process.start()
                                      "API_CONFIG_PATH": str(tmp_path / "does-not-exist.yml")},
                                 capture_output=True, text=True, timeout=30)
         assert result.returncode == 0, result.stderr
-        assert not path.exists(), result.stderr
-        assert not other.exists(), result.stderr
-        assert (tmp_path / "results/another/00000.html").read_bytes().startswith(b"<html>")
-        output = tmp_path / "results/batch"
+        assert next_batch(path.parent) is None, result.stderr
+        assert next_batch(other.parent) is None, result.stderr
+        assert (tmp_path / "results/another/crawler_00/00000.html").read_bytes().startswith(b"<html>")
+        output = tmp_path / "results/batch/crawler_00"
         assert (output / "00000.html").read_bytes().startswith(b"<html>")
         first = json.loads((output / "00000.json").read_text())
         assert first["url"] == base + "/redirect"
@@ -281,6 +235,6 @@ def test_job_requires_an_absolute_output_destination_from_publisher(tmp_path, re
     payload["result_dir"] = result_dir
     path.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="Invalid crawl request batch"):
-        claim_next(path.parent)
+        next_batch(path.parent)
     assert path.exists()
-    assert not (tmp_path / "results").exists()
+    assert not list((tmp_path / "results").rglob("*.html"))

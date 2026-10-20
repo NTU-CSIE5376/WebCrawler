@@ -8,7 +8,7 @@ import scrapy
 from twisted.internet.task import LoopingCall
 
 from libs.ipc.manual_bulk_crawl import (
-    DEFAULT_MAX_CONCURRENCY_RATIO, JobUnavailable, ManualBulkCrawlBatch, claim_next, is_expired,
+    DEFAULT_MAX_CONCURRENCY_RATIO, JobUnavailable, ManualBulkCrawlBatch, next_batch, is_expired,
 )
 
 
@@ -62,10 +62,9 @@ class ManualBulkCrawlConsumer:
     def poll(self):
         if self.closed:
             return
-        # Keep only completed portions whose jobs are still waiting on other
-        # crawlers. Avoid reloading their URL metadata on every completion.
+        # Forget finished entries once this crawler has removed its queue marker.
         try:
-            self.finished.intersection_update(path.stem for path in self.pending_dir.glob("*.json"))
+            self.finished.intersection_update(path.stem for path in (self.pending_dir / f"crawler_{self.spider.crawler_id:02d}").glob("*.json"))
         except OSError:
             self.spider.logger.exception("manual_bulk_crawl.queue_failed")
         for job_id, job in list(self.jobs.items()):
@@ -90,7 +89,7 @@ class ManualBulkCrawlConsumer:
                     if len(self.jobs) >= self.max_active_jobs:
                         break
                     try:
-                        batch = claim_next(
+                        batch = next_batch(
                             self.pending_dir, self.spider.crawler_id,
                             exclude_job_ids=self.finished | self.jobs.keys() | self.retry_after.keys(),
                         )
@@ -168,7 +167,7 @@ class ManualBulkCrawlConsumer:
         job.batch.close()
         del self.jobs[job_id]
         if job.failed:
-            # Drain this job's callbacks before releasing ownership. Retry on
+            # Drain this job's callbacks before retrying its partition. Retry on
             # a later poll rather than spinning on a broken queue or disk.
             self.retry_after[job_id] = monotonic() + 1
         else:
