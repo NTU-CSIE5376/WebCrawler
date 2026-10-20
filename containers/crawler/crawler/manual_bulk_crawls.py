@@ -7,7 +7,9 @@ from time import monotonic
 import scrapy
 from twisted.internet.task import LoopingCall
 
-from libs.ipc.manual_bulk_crawl import JobUnavailable, ManualBulkCrawlBatch, claim_next, is_expired
+from libs.ipc.manual_bulk_crawl import (
+    DEFAULT_MAX_CONCURRENCY_RATIO, JobUnavailable, ManualBulkCrawlBatch, claim_next, is_expired,
+)
 
 
 @dataclass
@@ -23,15 +25,12 @@ class ManualBulkCrawlConsumer:
         self.spider = spider
         settings = spider.crawler.settings
         self.pending_dir = Path(settings["MANUAL_BULK_CRAWL_QUEUE_DIR"])
-        concurrency = settings.getint("CONCURRENT_REQUESTS", 64)
-        self.prefetch_urls = (settings["MANUAL_BULK_CRAWL_PREFETCH_URLS"]
-                              if "MANUAL_BULK_CRAWL_PREFETCH_URLS" in settings else concurrency * 2)
+        self.concurrency = settings.getint("CONCURRENT_REQUESTS", 64)
         self.max_active_jobs = (settings["MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS"]
                                 if "MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS" in settings else 64)
-        for name in ("prefetch_urls", "max_active_jobs"):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-                raise ValueError(f"MANUAL_BULK_CRAWL_{name.upper()} must be a positive integer")
+        if (isinstance(self.max_active_jobs, bool) or not isinstance(self.max_active_jobs, int)
+                or self.max_active_jobs < 1):
+            raise ValueError("MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS must be a positive integer")
         self.jobs: dict[str, _ActiveJob] = {}
         self.inflight: set[tuple[str, int]] = set()
         self.finished = set()
@@ -39,6 +38,14 @@ class ManualBulkCrawlConsumer:
         self.closed = False
         self.filling = False
         self.poller = LoopingCall(self.poll)
+
+    @property
+    def request_limit(self):
+        # One budget across all jobs, not one allowance per job. A lower limit
+        # on a newly claimed job drains existing requests before more admission.
+        ratio = min((job.batch.payload.get("max_concurrency_ratio", DEFAULT_MAX_CONCURRENCY_RATIO)
+                     for job in self.jobs.values()), default=DEFAULT_MAX_CONCURRENCY_RATIO)
+        return int(self.concurrency * ratio)
 
     def start(self):
         self.poller.start(1, now=False)
@@ -75,7 +82,7 @@ class ManualBulkCrawlConsumer:
         try:
             self.retry_after = {job_id: deadline for job_id, deadline in self.retry_after.items()
                                 if deadline > monotonic()}
-            while len(self.inflight) < self.prefetch_urls:
+            while not self.jobs or len(self.inflight) < self.request_limit:
                 ready = next(((job_id, job) for job_id, job in self.jobs.items()
                               if job.pending and not job.failed
                               and job.batch.path.exists() and not is_expired(job.batch.payload)), None)
@@ -97,6 +104,8 @@ class ManualBulkCrawlConsumer:
                     self.jobs[job_id] = job
                 else:
                     job_id, job = ready
+                if len(self.inflight) >= self.request_limit:
+                    break
                 index = job.pending.popleft()
                 job.inflight.add(index)
                 self.inflight.add((job_id, index))

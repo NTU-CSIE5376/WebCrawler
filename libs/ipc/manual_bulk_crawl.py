@@ -12,6 +12,13 @@ import fcntl
 
 DEFAULT_TTL_DAYS = 14
 MAX_TTL_DAYS = 60
+DEFAULT_MAX_CONCURRENCY_RATIO = 0.5
+
+
+def validate_max_concurrency_ratio(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 1:
+        raise ValueError("manual_bulk_crawl.max_concurrency_ratio must be a number greater than 0 and at most 1")
+    return value
 
 
 class JobUnavailable(Exception):
@@ -244,6 +251,7 @@ def claim_next(pending_dir: Path, crawler_id: int = 0, *,
             raise ValueError("Invalid crawl request batch")
         if is_expired(payload):
             continue
+        validate_max_concurrency_ratio(payload.get("max_concurrency_ratio", DEFAULT_MAX_CONCURRENCY_RATIO))
         if (Path(payload["result_dir"]) / path.stem).exists():
             path.unlink(missing_ok=True)
             continue

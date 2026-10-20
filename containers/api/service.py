@@ -11,7 +11,8 @@ from uuid import uuid4
 
 from libs.urls import MAX_URL_LEN, validate_url
 from libs.ipc.manual_bulk_crawl import (
-    DEFAULT_TTL_DAYS, expiration, is_expired, job_status, queue_lock, validate_ttl_days,
+    DEFAULT_TTL_DAYS, DEFAULT_MAX_CONCURRENCY_RATIO, expiration, is_expired, job_status,
+    queue_lock, validate_ttl_days, validate_max_concurrency_ratio,
 )
 
 
@@ -51,12 +52,15 @@ class ManualBulkCrawlService:
         self.pending_dir = Path(crawl_config["pending_dir"])
         self.result_dir = Path(crawl_config["result_dir"])
         self.route_urls = route_urls
+        self.max_concurrency_ratio = validate_max_concurrency_ratio(
+            crawl_config.get("max_concurrency_ratio", DEFAULT_MAX_CONCURRENCY_RATIO))
 
     def submit(self, urls: list[str], ttl_days: int = DEFAULT_TTL_DAYS) -> str:
         validate_ttl_days(ttl_days)
         created = datetime.now(timezone.utc)
         file_tag = uuid4().hex
         records = {"version": 1, "urls": urls,
+                   "max_concurrency_ratio": self.max_concurrency_ratio,
                    "crawler_ids": self.route_urls(urls),
                    "result_dir": str(self.result_dir.resolve()),
                    "created_at": created.isoformat(), "ttl_days": ttl_days,

@@ -46,6 +46,7 @@ def test_submission_queues_urls_without_database_writes_or_ingestor_records(setu
     assert len(batches) == 1
     payload = json.loads(batches[0].read_text())
     assert payload["version"] == 1
+    assert payload["max_concurrency_ratio"] == 0.5
     assert payload["result_dir"] == str(root / "results")
     assert payload["urls"] == ["https://example.com/a", "https://example.org/b"]
     assert payload["created_at"]
@@ -58,6 +59,15 @@ def test_default_app_uses_read_only_routing(setup_api, monkeypatch):
     monkeypatch.setattr(app_module, "ManualBulkCrawlRouter", lambda *args: lambda urls: [0] * len(urls))
     with TestClient(create_app(str(root / "config.yml"))) as client:
         assert client.post("/v1/manual-bulk-crawls", json={"urls": ["https://example.com"]}).status_code == 200
+
+
+def test_configured_concurrency_ratio_is_published_with_jobs(tmp_path):
+    config = {"pending_dir": str(tmp_path / "pending"), "result_dir": str(tmp_path / "results"),
+              "max_concurrency_ratio": 0.5}
+    service = ManualBulkCrawlService(config, route_urls=lambda urls: [0] * len(urls))
+    job_id = service.submit(["https://example.com/"])
+    job = json.loads((service.pending_dir / f"{job_id}.json").read_text())
+    assert job["max_concurrency_ratio"] == 0.5
 
 
 def test_job_status_tracks_pending_running_and_completed_results(setup_api):
@@ -342,6 +352,14 @@ def test_manual_bulk_crawl_limits_are_loaded_from_yaml(setup_api):
     ("max_urls", 0),
     ("max_url_length", 0),
     ("max_url_length", 2501),
+    ("max_concurrency_ratio", 0),
+    ("max_concurrency_ratio", -0.1),
+    ("max_concurrency_ratio", 1.1),
+    ("max_concurrency_ratio", True),
+    ("max_concurrency_ratio", "0.8"),
+    ("max_concurrency_ratio", None),
+    ("max_concurrency_ratio", float("nan")),
+    ("max_concurrency_ratio", float("inf")),
 ])
 def test_invalid_limit_configuration_fails_at_startup(setup_api, name, value):
     _, svc, _, tmp_path = setup_api

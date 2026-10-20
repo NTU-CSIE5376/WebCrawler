@@ -335,18 +335,23 @@ The routing configuration is selected by `ingest_config_path` in
 that API configuration. It neither inserts domains nor updates URL scheduling
 flags. API requests use
 the same downloader, domain slots, robots.txt rules, retry policy and
-AutoThrottle settings as regular requests. Normal crawl requests have higher
-scheduler priority than API requests.
+AutoThrottle settings as regular requests.
 
 Responsibilities:
 
 - Exclusively claim this worker's portions of multiple accepted jobs with
   nonblocking file locks; different workers can process one job concurrently.
-- Bound scheduled API URLs with `MANUAL_BULK_CRAWL_PREFETCH_URLS` (default 256)
-  and claimed jobs with `MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS` (default 64),
-  both per worker in the crawler settings. Override them with the corresponding
-  `CRAWLER_MANUAL_BULK_CRAWL_PREFETCH_URLS` and
-  `CRAWLER_MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS` environment variables.
+- Limit outstanding manual URLs across all jobs per crawler to
+  `floor(CONCURRENT_REQUESTS × max_concurrency_ratio)`, including queued requests,
+  retries and downloads. Configure `manual_bulk_crawl.max_concurrency_ratio` in
+  `containers/api/config/config.yml` (default `0.5`, range greater than 0 to 1).
+  The API publishes the ratio with each new job; crawlers read no API config.
+  Configuration changes apply to new jobs. Overlapping jobs use the lowest ratio;
+  existing requests drain before a lower limit takes effect. With concurrency 256,
+  manual work is limited to 128 outstanding URLs. A rounded limit of zero pauses
+  manual work. This limits concurrency, not CPU or bandwidth usage.
+  Claimed jobs remain bounded by `MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS` (default 64),
+  overridable with `CRAWLER_MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS`.
   Refill as each URL completes so other jobs progress while slow fetches finish.
 - Fetch only submitted URLs. Dedicated callbacks save HTML and metadata without
   emitting PageItems, discovering outlinks or entering the normal result pipeline.
