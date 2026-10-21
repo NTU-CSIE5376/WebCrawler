@@ -9,7 +9,6 @@ postgres:
   dsn: "postgresql+psycopg2://crawler:crawler@172.16.191.1:5432/crawlerdb"
 
 manual_bulk_crawl:
-  max_concurrency_ratio: 0.5  # Per-crawler share of concurrent requests; applied to new jobs.
   gc_interval_sec: 3600  # Expired manual bulk crawl jobs are removed hourly.
   # The API publishes result_dir in each job; the crawler reads no API config.
   pending_dir: "/data/manual_bulk_crawls/pending"

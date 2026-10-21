@@ -342,17 +342,17 @@ Responsibilities:
 - Consume only this crawler's queue partition. Run one live crawler process per
   crawler ID, as with normal IPC. Different crawlers can process one job
   concurrently without file locks.
-- Limit outstanding manual URLs across all jobs per crawler to
-  `floor(CONCURRENT_REQUESTS × max_concurrency_ratio)`, including queued requests,
-  retries and downloads. Configure `manual_bulk_crawl.max_concurrency_ratio` in
-  `containers/api/config/config.yml` (default `0.5`, range greater than 0 to 1).
-  The API publishes the ratio with each new job; crawlers read no API config.
-  Configuration changes apply to new jobs. Overlapping jobs use the lowest ratio;
-  existing requests drain before a lower limit takes effect. With concurrency 256,
-  manual work is limited to 128 outstanding URLs. A rounded limit of zero pauses
-  manual work. This limits concurrency, not CPU or bandwidth usage.
-  Active jobs remain bounded by `MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS` (default 64),
-  overridable with `CRAWLER_MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS`.
+- Dispatch normal and manual requests through one round-robin scheduler.
+  When both sources have queued requests, take one normal request and one manual
+  request in turn. Skip an empty source so the other uses all available dispatch
+  capacity; an arriving source receives the next turn. No dispatch ratio or manual
+  percentage concurrency cap is configured. Each source retains Scrapy's
+  downloader-aware domain selection and uses FIFO queues at equal priority,
+  including startup requests. Retries retain their source and priority so new
+  URLs cannot indefinitely overtake them.
+  Manual prefetch is bounded by `CONCURRENT_REQUESTS`; active jobs remain bounded
+  by `MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS` (default 64), overridable with
+  `CRAWLER_MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS`.
   Refill as each URL completes so other jobs progress while slow fetches finish.
 - Fetch only submitted URLs. Dedicated callbacks save HTML and metadata without
   emitting PageItems, discovering outlinks or entering the normal result pipeline.

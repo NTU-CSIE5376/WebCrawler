@@ -15,7 +15,7 @@ from starlette.exceptions import HTTPException
 from libs.obslog import configure
 from libs.urls import MAX_URL_LEN
 from libs.ipc.manual_bulk_crawl import (
-    DEFAULT_TTL_DAYS, MAX_TTL_DAYS, DEFAULT_MAX_CONCURRENCY_RATIO, validate_max_concurrency_ratio,
+    DEFAULT_TTL_DAYS, MAX_TTL_DAYS,
 )
 from .body_limit import RequestBodyLimitMiddleware
 from .config_loader import api_config_path, load_api_config
@@ -68,7 +68,6 @@ def create_app(config_path: str | None = None, *, service=None) -> FastAPI:
     app.state.max_content_length = max_content_length
     app.add_middleware(RequestBodyLimitMiddleware, max_bytes=max_content_length)
     crawl_config = config["manual_bulk_crawl"]
-    validate_max_concurrency_ratio(crawl_config.get("max_concurrency_ratio", DEFAULT_MAX_CONCURRENCY_RATIO))
     max_urls = int(crawl_config.get("max_urls", 10000))
     max_url_length = int(crawl_config.get("max_url_length", MAX_URL_LEN))
     if max_urls < 1:

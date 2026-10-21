@@ -8,7 +8,7 @@ import scrapy
 from twisted.internet.task import LoopingCall
 
 from libs.ipc.manual_bulk_crawl import (
-    DEFAULT_MAX_CONCURRENCY_RATIO, JobUnavailable, ManualBulkCrawlBatch, next_batch, is_expired,
+    JobUnavailable, ManualBulkCrawlBatch, next_batch, is_expired,
 )
 
 
@@ -38,14 +38,6 @@ class ManualBulkCrawlConsumer:
         self.closed = False
         self.filling = False
         self.poller = LoopingCall(self.poll)
-
-    @property
-    def request_limit(self):
-        # One budget across all jobs, not one allowance per job. A lower limit
-        # on a newly claimed job drains existing requests before more admission.
-        ratio = min((job.batch.payload.get("max_concurrency_ratio", DEFAULT_MAX_CONCURRENCY_RATIO)
-                     for job in self.jobs.values()), default=DEFAULT_MAX_CONCURRENCY_RATIO)
-        return int(self.concurrency * ratio)
 
     def start(self):
         self.poller.start(1, now=False)
@@ -81,7 +73,7 @@ class ManualBulkCrawlConsumer:
         try:
             self.retry_after = {job_id: deadline for job_id, deadline in self.retry_after.items()
                                 if deadline > monotonic()}
-            while not self.jobs or len(self.inflight) < self.request_limit:
+            while len(self.inflight) < self.concurrency:
                 ready = next(((job_id, job) for job_id, job in self.jobs.items()
                               if job.pending and not job.failed
                               and job.batch.path.exists() and not is_expired(job.batch.payload)), None)
@@ -103,8 +95,6 @@ class ManualBulkCrawlConsumer:
                     self.jobs[job_id] = job
                 else:
                     job_id, job = ready
-                if len(self.inflight) >= self.request_limit:
-                    break
                 index = job.pending.popleft()
                 job.inflight.add(index)
                 self.inflight.add((job_id, index))

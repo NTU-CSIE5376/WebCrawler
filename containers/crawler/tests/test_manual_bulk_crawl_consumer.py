@@ -18,17 +18,16 @@ def queue(tmp_path):
     pending = tmp_path / "pending"
     pending.mkdir()
 
-    def enqueue(job_id, count, ratio=0.8):
+    def enqueue(job_id, count):
         path = pending / f"{job_id}.json"
         path.write_text(json.dumps({"version": 1,
                                    "urls": [f"https://example.com/{job_id}/{i}" for i in range(count)],
-                                   "max_concurrency_ratio": ratio,
                                    "crawler_ids": [0] * count,
                                    "result_dir": str(tmp_path / "results")}))
         prepare_job(path, json.loads(path.read_text()))
         return path
 
-    def consumer(concurrency=3, **limits):
+    def consumer(concurrency=2, **limits):
         requests = []
         spider = SimpleNamespace(crawler_id=0, logger=Mock(), crawler=SimpleNamespace(
             settings=Settings({"CONCURRENT_REQUESTS": concurrency,
@@ -46,54 +45,19 @@ def complete(consumer, request, body=b"<html>saved</html>"):
                                 headers={"Content-Type": "text/html"}))
 
 
-@pytest.mark.parametrize("concurrency,ratio,expected", [(256, 0.5, 128), (256, 0.8, 204), (10, 0.5, 5), (1, 0.8, 0), (10, 1, 10)])
-def test_manual_capacity_is_shared_across_jobs_and_refills_within_limit(queue, concurrency, ratio, expected):
+@pytest.mark.parametrize("concurrency", [256, 10, 1])
+def test_manual_alone_can_fill_all_download_capacity(queue, concurrency):
     enqueue, factory, _ = queue
-    enqueue("a", 1, ratio=ratio)
-    enqueue("b", 300, ratio=ratio)
+    enqueue("a", 1)
+    enqueue("b", 300)
     consumer, requests = factory(concurrency=concurrency)
     try:
         consumer.poll()
-        consumer.poll()
-        assert len(requests) == expected
-        assert len(consumer.inflight) == expected
-        if expected:
-            complete(consumer, requests[0])
-            assert len(requests) == expected + 1
-            assert len(consumer.inflight) == expected
-    finally:
-        consumer.close()
-
-
-def test_lower_ratio_job_waits_for_existing_requests_to_drain(queue):
-    enqueue, factory, _ = queue
-    enqueue("a", 4, ratio=0.8)
-    consumer, requests = factory(concurrency=5)
-    try:
-        consumer.poll()
-        assert len(requests) == 4
-        enqueue("b", 10, ratio=0.4)
+        assert len(requests) == concurrency
+        assert len(consumer.inflight) == concurrency
         complete(consumer, requests[0])
-        assert len(requests) == 4
-        complete(consumer, requests[1])
-        assert len(requests) == 4
-        complete(consumer, requests[2])
-        assert len(requests) == 5
-        assert len(consumer.inflight) == 2
-    finally:
-        consumer.close()
-
-
-def test_legacy_job_defaults_to_fifty_percent_capacity(queue):
-    enqueue, factory, _ = queue
-    path = enqueue("a", 20)
-    payload = json.loads(path.read_text())
-    del payload["max_concurrency_ratio"]
-    path.write_text(json.dumps(payload))
-    consumer, requests = factory(concurrency=10)
-    try:
-        consumer.poll()
-        assert len(requests) == 5
+        assert len(requests) == concurrency + 1
+        assert len(consumer.inflight) == concurrency
     finally:
         consumer.close()
 
@@ -102,7 +66,7 @@ def test_next_job_finishes_while_earlier_job_still_has_a_slow_url(queue):
     enqueue, factory, root = queue
     first = enqueue("a", 2)
     second = enqueue("b", 1)
-    consumer, requests = factory(concurrency=3)
+    consumer, requests = factory(concurrency=2)
     try:
         consumer.poll()
         slow, fast = requests
@@ -127,7 +91,7 @@ def test_next_job_finishes_while_earlier_job_still_has_a_slow_url(queue):
 def test_large_job_keeps_a_bounded_backlog_and_refills_on_completion(queue):
     enqueue, factory, root = queue
     enqueue("a", 6)
-    consumer, requests = factory(concurrency=3)
+    consumer, requests = factory(concurrency=2)
     try:
         consumer.poll()
         assert len(requests) == 2
@@ -166,7 +130,7 @@ def test_active_job_limit_releases_capacity_without_waiting_for_other_jobs(queue
 def test_storage_failure_retains_ownership_until_that_jobs_callbacks_drain(queue, monkeypatch):
     enqueue, factory, root = queue
     path = enqueue("a", 4)
-    consumer, requests = factory(concurrency=3)
+    consumer, requests = factory(concurrency=2)
     try:
         consumer.poll()
         monkeypatch.setattr(consumer.jobs["a"].batch, "save", Mock(side_effect=OSError("disk full")))
@@ -188,7 +152,7 @@ def test_failed_job_does_not_block_results_from_another_job(queue, monkeypatch):
     enqueue, factory, root = queue
     enqueue("a", 2)
     enqueue("b", 1)
-    consumer, requests = factory(concurrency=4)
+    consumer, requests = factory(concurrency=3)
     try:
         consumer.poll()
         monkeypatch.setattr(consumer.jobs["a"].batch, "save", Mock(side_effect=OSError("disk full")))
@@ -204,7 +168,7 @@ def test_failed_job_does_not_block_results_from_another_job(queue, monkeypatch):
 def test_publication_retry_resumes_saved_results_without_refetching(queue, monkeypatch):
     enqueue, factory, root = queue
     path = enqueue("a", 1)
-    consumer, requests = factory(concurrency=3)
+    consumer, requests = factory(concurrency=2)
     original = storage.os.replace
 
     def fail_publication(source, target):
@@ -231,7 +195,7 @@ def test_shutdown_releases_every_job_and_ignores_stale_callbacks(queue):
     enqueue, factory, root = queue
     first = enqueue("a", 1)
     enqueue("b", 1)
-    consumer, requests = factory(concurrency=3)
+    consumer, requests = factory(concurrency=2)
     consumer.poll()
     consumer.close()
     complete(consumer, requests[0])
@@ -250,7 +214,7 @@ def test_shutdown_releases_every_job_and_ignores_stale_callbacks(queue):
 def test_scheduling_failure_does_not_release_an_inflight_request_claim(queue):
     enqueue, factory, root = queue
     path = enqueue("a", 2)
-    consumer, requests = factory(concurrency=3)
+    consumer, requests = factory(concurrency=2)
 
     def schedule(request):
         if requests:
@@ -312,7 +276,7 @@ def test_job_message_selects_its_output_directory_without_api_configuration(queu
     payload["result_dir"] = str(output)
     second.write_text(json.dumps(payload))
     prepare_job(second, payload)
-    consumer, requests = factory(concurrency=3)
+    consumer, requests = factory(concurrency=2)
     try:
         consumer.poll()
         complete(consumer, requests[1], body=b"upstream output")
@@ -333,7 +297,7 @@ def test_deleted_or_expired_job_stops_refill_and_discards_inflight_responses(que
     enqueue, factory, root = queue
     job_id = "a" * 32
     path = enqueue(job_id, 6)
-    consumer, requests = factory(concurrency=3)
+    consumer, requests = factory(concurrency=2)
     staging = root / "results" / job_id
     try:
         consumer.poll()

@@ -11,6 +11,15 @@ ROBOTSTXT_OBEY = True
 
 DUPEFILTER_CLASS = "scrapy.dupefilters.BaseDupeFilter" # Disable dupefilter
 
+# Share dispatch fairly between normal and manual work. FIFO keeps newly fed
+# requests from overtaking older ones at the same priority, including startup.
+SCHEDULER = "crawler.fair_scheduler.FairScheduler"
+SCHEDULER_MEMORY_QUEUE = "scrapy.squeues.FifoMemoryQueue"
+SCHEDULER_DISK_QUEUE = "scrapy.squeues.PickleFifoDiskQueue"
+SCHEDULER_START_MEMORY_QUEUE = None
+SCHEDULER_START_DISK_QUEUE = None
+RETRY_PRIORITY_ADJUST = 0
+
 # Default Scrapy headers trip Akamai / Cloudflare bot fingerprints (e.g.
 # wapo silently RSTs HTTP/2 streams that lack Sec-Fetch-*, surfacing as
 # TimeoutError rather than a 4xx). Match a real Chrome request.
