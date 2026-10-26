@@ -18,19 +18,22 @@ def queue(tmp_path):
     pending = tmp_path / "pending"
     pending.mkdir()
 
-    def enqueue(job_id, count):
+    def enqueue(job_id, count=0, *, urls=None):
+        urls = urls if urls is not None else [f"https://example.com/{job_id}/{i}" for i in range(count)]
         path = pending / f"{job_id}.json"
         path.write_text(json.dumps({"version": 1,
-                                   "urls": [f"https://example.com/{job_id}/{i}" for i in range(count)],
-                                   "crawler_ids": [0] * count,
+                                   "urls": urls,
+                                   "crawler_ids": [0] * len(urls),
                                    "result_dir": str(tmp_path / "results")}))
         prepare_job(path, json.loads(path.read_text()))
         return path
 
-    def consumer(concurrency=2, **limits):
+    def consumer(concurrency=2, *, domain_concurrency=None, slot_settings=None, **limits):
         requests = []
         spider = SimpleNamespace(crawler_id=0, logger=Mock(), crawler=SimpleNamespace(
             settings=Settings({"CONCURRENT_REQUESTS": concurrency,
+                               "CONCURRENT_REQUESTS_PER_DOMAIN": domain_concurrency or concurrency,
+                               "DOWNLOAD_SLOTS": slot_settings or {},
                                "MANUAL_BULK_CRAWL_QUEUE_DIR": str(pending),
                                **{f"MANUAL_BULK_CRAWL_{name.upper()}": value for name, value in limits.items()}}),
             engine=SimpleNamespace(crawl=requests.append),
@@ -325,5 +328,177 @@ def test_deleted_or_expired_job_stops_refill_and_discards_inflight_responses(que
             assert not list(staging.glob("[0-9]*"))
         else:
             assert not staging.exists()
+    finally:
+        consumer.close()
+
+
+def test_service_time_prioritizes_a_smaller_but_slower_domain(queue):
+    enqueue, factory, _ = queue
+    enqueue("fast", urls=[f"https://fast.example/{i}" for i in range(10)])
+    enqueue("slow", urls=[f"https://slow.example/{i}" for i in range(3)])
+    consumer, requests = factory(concurrency=1, slot_settings={
+        "fast.example": {"delay": 1, "concurrency": 1},
+        "slow.example": {"delay": 10, "concurrency": 1},
+    })
+    try:
+        consumer.poll()
+        assert requests[0].url == "https://slow.example/0", "30s of work outranks 10s"
+        complete(consumer, requests[0])
+        assert requests[1].url == "https://slow.example/1", "Keep the bottleneck supplied at its QPS"
+    finally:
+        consumer.close()
+
+
+def test_single_domain_prefix_cannot_hide_other_domains_in_same_job(queue):
+    enqueue, factory, _ = queue
+    enqueue("mixed", urls=[f"https://wiki.example/{i}" for i in range(100)]
+            + ["https://other.example/0", "https://third.example/0"])
+    consumer, requests = factory(concurrency=6, domain_concurrency=2)
+    try:
+        consumer.poll()
+        assert [request.url for request in requests] == [
+            "https://wiki.example/0", "https://wiki.example/1",
+            "https://other.example/0", "https://third.example/0"]
+        assert len(requests) == 4, "Only two wiki URLs should be admitted"
+        wiki = [request for request in requests if "wiki.example" in request.url]
+        complete(consumer, wiki[0])
+        assert requests[-1].url == "https://wiki.example/2", "Refill wiki immediately"
+        assert consumer.domains["wiki.example"].outstanding == 2
+    finally:
+        consumer.close()
+
+
+def test_later_jobs_supply_other_domains_without_draining_wiki_job(queue):
+    enqueue, factory, _ = queue
+    enqueue("wiki", urls=[f"https://wiki.example/{i}" for i in range(100)])
+    enqueue("other", urls=["https://other.example/0"])
+    consumer, requests = factory(concurrency=8, domain_concurrency=2)
+    try:
+        consumer.poll()
+        assert len(consumer.jobs) == 2
+        assert any(request.url == "https://other.example/0" for request in requests)
+        assert len(requests) == 3
+        assert len(consumer.jobs["wiki"].pending) == 98
+    finally:
+        consumer.close()
+
+
+def test_domain_cap_is_shared_across_jobs_and_failure_releases_it(queue):
+    from twisted.python.failure import Failure
+    from twisted.internet.error import TimeoutError
+
+    enqueue, factory, _ = queue
+    enqueue("a", 4)
+    enqueue("b", 4)
+    consumer, requests = factory(concurrency=8, domain_concurrency=2)
+    try:
+        consumer.poll()
+        assert len(requests) == 2
+        error = TimeoutError()
+        error.request = requests[0]
+        failure = Failure(error)
+        failure.request = requests[0]
+        consumer.fetch_failed(failure)
+        assert len(requests) == 3
+        assert consumer.domains["example.com"].outstanding == 2
+        for request in requests:
+            assert "download_slot" not in request.meta, "Do not pin redirect requests to original slots"
+    finally:
+        consumer.close()
+
+
+def test_remaining_service_time_aggregates_domains_across_jobs(queue):
+    enqueue, factory, _ = queue
+    enqueue("a", urls=[f"https://shared.example/a/{i}" for i in range(3)])
+    enqueue("b", urls=[f"https://shared.example/b/{i}" for i in range(3)])
+    enqueue("c", urls=[f"https://other.example/{i}" for i in range(5)])
+    consumer, requests = factory(concurrency=1)
+    try:
+        consumer.poll()
+        assert requests[0].url.startswith("https://shared.example/"), "6 URLs outrank 5"
+    finally:
+        consumer.close()
+
+
+def test_zero_delay_domains_use_concurrency_and_observed_latency(queue):
+    enqueue, factory, _ = queue
+    enqueue("a", urls=[f"https://serial.example/{i}" for i in range(10)])
+    enqueue("b", urls=[f"https://parallel.example/{i}" for i in range(20)])
+    consumer, requests = factory(concurrency=1, slot_settings={
+        "serial.example": {"delay": 0, "concurrency": 1},
+        "parallel.example": {"delay": 0, "concurrency": 10},
+    })
+    try:
+        consumer.poll()
+        assert requests[0].url.startswith("https://serial.example/")
+        requests[0].meta["download_latency"] = 5.0
+        complete(consumer, requests[0])
+        assert consumer.domains["serial.example"].latency == pytest.approx(1.8)
+        assert requests[1].url.startswith("https://serial.example/"), "The measured slower domain remains the bottleneck"
+    finally:
+        consumer.close()
+
+
+def test_live_slot_settings_override_static_config_and_refresh_on_poll(queue):
+    enqueue, factory, _ = queue
+    enqueue("a", urls=[f"https://a.example/{i}" for i in range(20)])
+    enqueue("b", urls=[f"https://b.example/{i}" for i in range(4)])
+    consumer, requests = factory(concurrency=4, slot_settings={
+        "a.example": {"delay": 100, "concurrency": 4},
+        "b.example": {"delay": 1, "concurrency": 4},
+    })
+    consumer.spider.crawler.engine.downloader = SimpleNamespace(
+        get_slot_key=lambda request: request.url.split("/")[2],
+        slots={"a.example": SimpleNamespace(concurrency=1, delay=0),
+               "b.example": SimpleNamespace(concurrency=0, delay=100)},
+    )
+    try:
+        consumer.poll()
+        assert len(requests) == 1
+        consumer.spider.crawler.engine.downloader.slots["b.example"].concurrency = 2
+        consumer.poll()
+        assert len(requests) == 3
+        assert all("b.example" in request.url for request in requests[1:])
+    finally:
+        consumer.close()
+
+
+def test_deleting_job_removes_its_domain_backlog_without_blocking_other_jobs(queue):
+    enqueue, factory, _ = queue
+    path = enqueue("a", urls=[f"https://a.example/{i}" for i in range(10)])
+    enqueue("b", urls=[f"https://b.example/{i}" for i in range(3)])
+    consumer, requests = factory(concurrency=2, domain_concurrency=1)
+    try:
+        consumer.poll()
+        path.unlink()
+        consumer.poll()
+        for request in list(requests):
+            complete(consumer, request)
+        assert all("b.example" in request.url for request in requests[2:])
+        position = 2
+        while position < len(requests):
+            complete(consumer, requests[position])
+            position += 1
+        assert not consumer.jobs and not consumer.domains and not consumer.inflight_domains
+    finally:
+        consumer.close()
+
+
+def test_resumed_job_keeps_original_result_indexes_after_domain_reordering(queue):
+    enqueue, factory, root = queue
+    path = enqueue("mixed", urls=["https://a.example/0", "https://a.example/1", "https://b.example/2"])
+    batch = next_batch(path.parent)
+    batch.save(0, final_url=batch.urls[0], status_code=200, body=b"already fetched")
+    batch.close()
+    consumer, requests = factory(concurrency=2, domain_concurrency=1)
+    try:
+        consumer.poll()
+        assert {request.meta["manual_bulk_crawl_index"] for request in requests} == {1, 2}
+        for request in requests:
+            complete(consumer, request)
+        output = root / "results/mixed/crawler_00"
+        assert (output / "00000.html").read_bytes() == b"already fetched"
+        assert json.loads((output / "00002.json").read_text())["url"] == "https://b.example/2"
+        assert not consumer.domains
     finally:
         consumer.close()

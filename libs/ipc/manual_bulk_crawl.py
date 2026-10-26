@@ -174,6 +174,12 @@ class ManualBulkCrawlBatch:
 def next_batch(pending_dir: Path, crawler_id: int = 0, *,
                exclude_job_ids: set[str] | None = None) -> ManualBulkCrawlBatch | None:
     """Select this crawler's oldest partition; its sole consumer retains it until done."""
+    return next(iter_batches(pending_dir, crawler_id, exclude_job_ids=exclude_job_ids), None)
+
+
+def iter_batches(pending_dir: Path, crawler_id: int = 0, *,
+                 exclude_job_ids: set[str] | None = None):
+    """Scan once and yield this crawler's unfinished partitions in submission order."""
     queued = []
     for path in (pending_dir / f"crawler_{crawler_id:02d}").glob("*.json"):
         if exclude_job_ids and path.stem in exclude_job_ids:
@@ -202,6 +208,6 @@ def next_batch(pending_dir: Path, crawler_id: int = 0, *,
         except (FileNotFoundError, JobUnavailable):
             continue
         if batch.remaining:
-            return batch
-        batch.close()
-    return None
+            yield batch
+        else:
+            batch.close()

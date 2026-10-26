@@ -353,7 +353,21 @@ Responsibilities:
   Manual prefetch is bounded by `CONCURRENT_REQUESTS`; active jobs remain bounded
   by `MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS` (default 64), overridable with
   `CRAWLER_MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS`.
-  Refill as each URL completes so other jobs progress while slow fetches finish.
+- Admit manual jobs in submission order up to the active-job limit, then group
+  their unfinished URLs by Scrapy downloader slot (normally hostname). Within a
+  slot, preserve submission order and original URL indexes. Across slots, prefer
+  the longest estimated remaining service time: remaining URLs divided by
+  estimated QPS. QPS is estimated as `1 / max(delay, latency / concurrency)`,
+  using live downloader slot settings when available, otherwise crawler settings
+  and `DOWNLOAD_SLOTS` overrides. Latency starts at one second and uses an
+  exponentially smoothed `download_latency` from responses (20% new sample).
+  Among slots below their prefetch cap, select the largest estimated remaining
+  service time; break equal scores by least-recent dispatch order.
+  Each slot's manual outstanding URLs (queued, downloading or retrying), across
+  all jobs, are capped at its configured concurrency. Refill immediately on
+  completion, and refresh live slot settings on each poll. These are prefetch
+  decisions; the shared downloader still enforces actual politeness for both
+  normal and manual work. Jobs outside the active window wait for admission.
 - Fetch only submitted URLs. Dedicated callbacks save HTML and metadata without
   emitting PageItems, discovering outlinks or entering the normal result pipeline.
 - Write results and atomically replace progress only within

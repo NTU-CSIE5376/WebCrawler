@@ -238,3 +238,164 @@ def test_job_requires_an_absolute_output_destination_from_publisher(tmp_path, re
         next_batch(path.parent)
     assert path.exists()
     assert not list((tmp_path / "results").rglob("*.html"))
+
+
+@pytest.mark.parametrize("include_diverse", [False, True], ids=["wiki_only", "wiki_and_diverse"])
+def test_domain_service_time_single_crawler_scenarios(tmp_path, include_diverse):
+    """Compare wiki alone with wiki plus diverse work; all DNS stays on localhost."""
+    hits = []
+    guard = Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            with guard:
+                hits.append((self.headers["Host"].split(":")[0], time.monotonic()))
+            body = b"<html>fixture</html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_port
+    wiki = enqueue(tmp_path, name="wiki", urls=[f"http://wiki.test:{port}/{i}" for i in range(1000)],
+                   crawler_ids=[0] * 1000)
+    paths = [wiki]
+    if include_diverse:
+        paths.append(enqueue(tmp_path, name="diverse", urls=[f"http://site{i:04d}.test:{port}/" for i in range(1000)],
+                             crawler_ids=[0] * 1000))
+    # Put wiki first even on filesystems with coarse timestamp resolution.
+    for index, path in enumerate(paths):
+        payload = json.loads(path.read_text())
+        payload["created_at"] = f"2099-01-01T00:00:0{index}+00:00"
+        path.write_text(json.dumps(payload))
+
+    root = Path(__file__).resolve().parents[3]
+    script = '''
+import json
+import sys
+from time import monotonic
+from pathlib import Path
+from twisted.internet import defer
+from scrapy.crawler import CrawlerProcess
+from scrapy.resolver import CachingThreadedResolver
+from scrapy.settings import Settings
+from scrapy.utils.reactor import install_reactor
+install_reactor("twisted.internet.asyncioreactor.AsyncioSelectorReactor")
+from twisted.internet.task import LoopingCall
+from crawler.spiders.spider import HtmlSpider
+
+class LocalResolver(CachingThreadedResolver):
+    def getHostByName(self, name, timeout=()):
+        return defer.succeed("127.0.0.1")
+
+class TestSpider(HtmlSpider):
+    def spider_opened(self, spider=None):
+        super().spider_opened(spider)
+        self.observation = {"crawler_id": self.crawler_id, "first_urls": [],
+                            "max_wiki_outstanding": 0, "max_manual_outstanding": 0,
+                            "job_completion_sec": {}}
+        consumer = self.manual_bulk_crawls
+        original = self.crawler.engine.crawl
+        def record(request):
+            self.observation.setdefault("first_dispatch_at", monotonic())
+            if len(self.observation["first_urls"]) < 3:
+                self.observation["first_urls"].append(request.url)
+            wiki = consumer.domains.get("wiki.test")
+            self.observation["max_wiki_outstanding"] = max(
+                self.observation["max_wiki_outstanding"], wiki.outstanding if wiki else 0)
+            self.observation["max_manual_outstanding"] = max(
+                self.observation["max_manual_outstanding"], len(consumer.inflight))
+            return original(request)
+        self.crawler.engine.crawl = record
+        self.monitor = LoopingCall(self.check_complete)
+        self.monitor.start(0.05, now=False)
+
+    def check_complete(self):
+        jobs = json.loads(sys.argv[2])
+        for job in jobs:
+            path = Path(sys.argv[1], "results", job, "crawler_00", "progress.json")
+            if path.exists() and json.loads(path.read_text()).get("completed_at"):
+                self.observation["job_completion_sec"].setdefault(
+                    job, monotonic() - self.observation["first_dispatch_at"])
+        if len(self.observation["job_completion_sec"]) == len(jobs):
+            self.observation["overall_completion_sec"] = max(self.observation["job_completion_sec"].values())
+            Path(sys.argv[1], "observation.json").write_text(json.dumps(self.observation))
+            self.monitor.stop()
+            self.crawler.engine.close_spider(self, "test_complete")
+
+settings = Settings()
+settings.setmodule("crawler.settings")
+settings.setdict({
+    "DNS_RESOLVER": LocalResolver,
+    "HTTPPROXY_ENABLED": False,
+    "ROBOTSTXT_OBEY": False,
+    "DOWNLOAD_DELAY": 0,
+    "RANDOMIZE_DOWNLOAD_DELAY": False,
+    "AUTOTHROTTLE_ENABLED": False,
+    "CONCURRENT_REQUESTS": 32,
+    "CONCURRENT_REQUESTS_PER_DOMAIN": 1,
+    "DOWNLOAD_SLOTS": {"wiki.test": {"delay": 0.02, "concurrency": 1}},
+    "LOG_LEVEL": "ERROR",
+    "OBSLOG_HEARTBEAT_SEC": 0,
+    "CLOSESPIDER_TIMEOUT": 60,
+    "MANUAL_BULK_CRAWL_QUEUE_DIR": sys.argv[1] + "/pending",
+    "URL_QUEUE_TEMPLATE": sys.argv[1] + "/normal_queue/crawler_{id:02d}",
+    "RESULT_DIR_TEMPLATE": sys.argv[1] + "/normal_results/crawler_{id:02d}",
+}, priority="cmdline")
+process = CrawlerProcess(settings)
+process.crawl(TestSpider, crawler_id=0)
+process.start()
+'''
+    try:
+        result = subprocess.run([sys.executable, "-c", script, str(tmp_path), json.dumps([path.stem for path in paths])],
+                                cwd=root / "containers/crawler",
+                                env={**os.environ, "PYTHONPATH": f"{root}:{root / 'containers/crawler'}",
+                                     "CRAWLER_USE_AUTOTHROTTLE": "true"},
+                                capture_output=True, text=True, timeout=75)
+        assert result.returncode == 0, result.stderr
+        assert (tmp_path / "observation.json").exists(), result.stderr[-8000:]
+        observation = json.loads((tmp_path / "observation.json").read_text())
+        assert observation["crawler_id"] == 0
+        assert "wiki.test" in observation["first_urls"][0]
+        assert ("site" if include_diverse else "wiki.test") in observation["first_urls"][1]
+        assert observation["max_wiki_outstanding"] == 1
+        assert observation["max_manual_outstanding"] == (32 if include_diverse else 1)
+        for path in paths:
+            payload = json.loads(path.read_text())
+            status = job_status(path.stem, payload, tmp_path / "results" / path.stem)
+            assert status["completed_urls"] == status["succeeded_urls"] == 1000
+            assert status["failed_urls"] == 0
+            assert len(list((tmp_path / "results" / path.stem / "crawler_00").glob("*.html"))) == 1000
+        wiki_times = [stamp for host, stamp in hits if host == "wiki.test"]
+        diverse_times = [stamp for host, stamp in hits if host != "wiki.test"]
+        assert len(wiki_times) == 1000, "No URL should be retried or lost"
+        assert len(diverse_times) == (1000 if include_diverse else 0)
+        if include_diverse:
+            assert len({host for host, _ in hits if host != "wiki.test"}) == 1000
+            assert wiki_times[0] < diverse_times[-1] < wiki_times[-1]
+            assert sum(stamp < diverse_times[-1] for stamp in wiki_times) > 1
+        assert not list((tmp_path / "normal_results").rglob("*.jsonl"))
+        start = min(stamp for _, stamp in hits)
+        summary = {
+            **observation,
+            "scenario": "B" if include_diverse else "A",
+            "wiki_completed": len(wiki_times), "diverse_completed": len(diverse_times),
+            "diverse_completion_sec": round(diverse_times[-1] - start, 3) if diverse_times else None,
+            "wiki_completion_sec": round(wiki_times[-1] - start, 3),
+            "wiki_completed_when_diverse_finished": sum(stamp <= diverse_times[-1] for stamp in wiki_times) if diverse_times else None,
+            "wiki_observed_qps": round(999 / (wiki_times[-1] - wiki_times[0]), 2),
+            "wiki_max_request_gap_sec": round(max(b - a for a, b in zip(wiki_times, wiki_times[1:])), 3),
+        }
+        (tmp_path / "summary.json").write_text(json.dumps(summary, indent=2))
+        print("\nScheduling scenario result: " + json.dumps(summary, sort_keys=True))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
