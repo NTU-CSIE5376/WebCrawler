@@ -45,6 +45,7 @@ def test_submission_queues_urls_without_database_writes_or_ingestor_records(setu
     assert len(batches) == 1
     payload = json.loads(batches[0].read_text())
     assert payload["version"] == 1
+    assert payload["scheduling_policy"] == "manual_first"
     assert payload["result_dir"] == str(root / "results")
     assert payload["urls"] == ["https://example.com/a", "https://example.org/b"]
     assert payload["created_at"]
@@ -445,7 +446,7 @@ def test_app_routes_using_its_own_config(setup_api, monkeypatch):
     with TestClient(create_app(str(path))) as client:
         response = client.post("/v1/manual-bulk-crawls", json={"urls": ["https://example.com"]})
     assert response.status_code == 200
-    config["manual_bulk_crawl"]["scheduling_policy"] = "balanced"
+    config["manual_bulk_crawl"]["scheduling_policy"] = "manual_first"
     router_factory.assert_called_once_with(config)
     job = json.loads(next((root / "pending").glob("*.json")).read_text())
     assert job["crawler_ids"] == [2]

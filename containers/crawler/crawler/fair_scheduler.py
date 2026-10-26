@@ -3,7 +3,7 @@ from pathlib import Path
 
 from scrapy.core.scheduler import BaseScheduler, Scheduler
 from scrapy.dupefilters import BaseDupeFilter
-from libs.ipc.manual_bulk_crawl import validate_scheduling_policy
+from libs.ipc.manual_bulk_crawl import DEFAULT_SCHEDULING_POLICY, validate_scheduling_policy
 
 
 class FairScheduler(BaseScheduler):
@@ -48,7 +48,7 @@ class FairScheduler(BaseScheduler):
     def enqueue_request(self, request):
         queue = self.normal
         if "manual_bulk_crawl_job_id" in request.meta:
-            policy = validate_scheduling_policy(request.meta.get("manual_bulk_crawl_scheduling_policy", "balanced"))
+            policy = validate_scheduling_policy(request.meta.get("manual_bulk_crawl_scheduling_policy", DEFAULT_SCHEDULING_POLICY))
             queue = self.manual_queues[policy]
         return queue.enqueue_request(request)
 

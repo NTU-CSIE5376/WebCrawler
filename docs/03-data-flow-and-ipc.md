@@ -346,7 +346,7 @@ Responsibilities:
   optionally overridden by `MANUAL_BULK_CRAWL_SCHEDULING_POLICY` on the API process
   (also passed through Compose). The API publishes the policy with each new job;
   crawlers read no API config. Existing jobs retain their original policy, and
-  jobs without the field default to `balanced`.
+  jobs without the field default to `manual_first` (API work first).
   In `balanced` mode, when both sources have queued requests, take one normal request and one manual
   request in turn. Skip an empty source so the other uses all available dispatch
   capacity; an arriving source receives the next turn. `manual_first` gives that

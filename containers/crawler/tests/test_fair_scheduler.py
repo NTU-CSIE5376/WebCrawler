@@ -46,6 +46,7 @@ def request(source, index, **kwargs):
     meta = kwargs.pop("meta", {})
     if source == "manual":
         meta["manual_bulk_crawl_job_id"] = "a" * 32
+        meta.setdefault("manual_bulk_crawl_scheduling_policy", "balanced")
     return Request(f"https://example.com/{source}/{index}", meta=meta, **kwargs)
 
 
@@ -176,3 +177,10 @@ def test_invalid_policy_is_rejected_before_enqueue(scheduler_factory):
     with pytest.raises(ValueError, match="scheduling_policy"):
         scheduler.enqueue_request(request("manual", 0, meta={"manual_bulk_crawl_scheduling_policy": "unknown"}))
     assert not scheduler.has_pending_requests()
+
+
+def test_unspecified_policy_defaults_to_manual_first(scheduler_factory):
+    scheduler = scheduler_factory()
+    scheduler.enqueue_request(request("normal", 0))
+    scheduler.enqueue_request(Request("https://example.com/manual/default", meta={"manual_bulk_crawl_job_id": "a" * 32}))
+    assert [source(scheduler.next_request()) for _ in range(2)] == ["manual", "normal"]

@@ -52,9 +52,9 @@ def test_scheduling_policy_yaml_and_default(tmp_path, monkeypatch):
     monkeypatch.delenv("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", raising=False)
     path = tmp_path / "config.yml"
     path.write_text("manual_bulk_crawl: {}\n")
-    assert load_api_config(path)["manual_bulk_crawl"]["scheduling_policy"] == "balanced"
-    path.write_text("manual_bulk_crawl:\n  scheduling_policy: manual_first\n")
     assert load_api_config(path)["manual_bulk_crawl"]["scheduling_policy"] == "manual_first"
+    path.write_text("manual_bulk_crawl:\n  scheduling_policy: balanced\n")
+    assert load_api_config(path)["manual_bulk_crawl"]["scheduling_policy"] == "balanced"
 
 
 @pytest.mark.parametrize("policy", ["unknown", "", "BALANCED"])

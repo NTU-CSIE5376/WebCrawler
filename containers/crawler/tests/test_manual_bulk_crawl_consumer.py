@@ -518,3 +518,14 @@ def test_job_scheduling_policy_travels_with_manual_requests(queue, policy):
         assert all(request.meta["manual_bulk_crawl_scheduling_policy"] == policy for request in requests)
     finally:
         consumer.close()
+
+
+def test_job_without_policy_defaults_to_manual_first(queue):
+    enqueue, factory, _ = queue
+    enqueue("a", 1)
+    consumer, requests = factory()
+    try:
+        consumer.poll()
+        assert requests[0].meta["manual_bulk_crawl_scheduling_policy"] == "manual_first"
+    finally:
+        consumer.close()

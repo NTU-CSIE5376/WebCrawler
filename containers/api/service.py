@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from libs.urls import MAX_URL_LEN, validate_url
 from libs.ipc.manual_bulk_crawl import (
-    DEFAULT_TTL_DAYS, expiration, is_expired, job_status,
+    DEFAULT_TTL_DAYS, DEFAULT_SCHEDULING_POLICY, expiration, is_expired, job_status,
     prepare_job, worker_directory, validate_ttl_days, validate_scheduling_policy,
 )
 
@@ -52,7 +52,7 @@ class ManualBulkCrawlService:
         self.pending_dir = Path(crawl_config["pending_dir"])
         self.result_dir = Path(crawl_config["result_dir"])
         self.route_urls = route_urls
-        self.scheduling_policy = validate_scheduling_policy(crawl_config.get("scheduling_policy", "balanced"))
+        self.scheduling_policy = validate_scheduling_policy(crawl_config.get("scheduling_policy", DEFAULT_SCHEDULING_POLICY))
 
     def submit(self, urls: list[str], ttl_days: int = DEFAULT_TTL_DAYS) -> str:
         validate_ttl_days(ttl_days)
