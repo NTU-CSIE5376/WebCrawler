@@ -134,3 +134,45 @@ def test_both_disk_partitions_resume_after_restart(scheduler_factory):
     assert [resumed.next_request().url for _ in range(6)] == [
         f"https://example.com/{flow}/{i}" for i in range(1, 4) for flow in ("normal", "manual")
     ]
+
+
+@pytest.mark.parametrize("policy,expected", [
+    ("balanced", ["normal", "manual"] * 3),
+    ("manual_first", ["manual"] * 3 + ["normal"] * 3),
+    ("normal_first", ["normal"] * 3 + ["manual"] * 3),
+])
+@pytest.mark.parametrize("disk", [False, True])
+def test_dispatch_policy_preserves_source_preference_across_storage(scheduler_factory, policy, expected, disk):
+    scheduler = scheduler_factory(disk=disk)
+    for i in range(3):
+        scheduler.enqueue_request(request("normal", i))
+        scheduler.enqueue_request(request("manual", i, meta={"manual_bulk_crawl_scheduling_policy": policy}))
+    assert [source(scheduler.next_request()) for _ in range(6)] == expected
+    assert not scheduler.has_pending_requests()
+
+
+def test_mixed_job_policies_do_not_override_each_other(scheduler_factory):
+    scheduler = scheduler_factory()
+    for policy in ("normal_first", "balanced", "manual_first"):
+        scheduler.enqueue_request(request("manual", policy, meta={"manual_bulk_crawl_scheduling_policy": policy}))
+    scheduler.enqueue_request(request("normal", 0))
+    assert [scheduler.next_request().url.rsplit("/", 1)[-1] for _ in range(4)] == [
+        "manual_first", "0", "balanced", "normal_first"]
+
+
+@pytest.mark.parametrize("policy", ["manual_first", "normal_first"])
+def test_priority_policy_survives_retry_and_restart(scheduler_factory, policy):
+    scheduler = scheduler_factory(disk=True)
+    original = request("manual", 0, meta={"manual_bulk_crawl_scheduling_policy": policy})
+    scheduler.enqueue_request(original.replace(url="https://example.com/retry"))
+    scheduler.enqueue_request(request("normal", 0))
+    resumed = scheduler_factory(disk=True, replace=scheduler)
+    expected = ["manual", "normal"] if policy == "manual_first" else ["normal", "manual"]
+    assert [source(resumed.next_request()) for _ in range(2)] == expected
+
+
+def test_invalid_policy_is_rejected_before_enqueue(scheduler_factory):
+    scheduler = scheduler_factory()
+    with pytest.raises(ValueError, match="scheduling_policy"):
+        scheduler.enqueue_request(request("manual", 0, meta={"manual_bulk_crawl_scheduling_policy": "unknown"}))
+    assert not scheduler.has_pending_requests()

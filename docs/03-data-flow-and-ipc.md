@@ -342,14 +342,23 @@ Responsibilities:
 - Consume only this crawler's queue partition. Run one live crawler process per
   crawler ID, as with normal IPC. Different crawlers can process one job
   concurrently without file locks.
-- Dispatch normal and manual requests through one round-robin scheduler.
-  When both sources have queued requests, take one normal request and one manual
+- Configure `manual_bulk_crawl.scheduling_policy` in `containers/api/config/config.yml`,
+  optionally overridden by `MANUAL_BULK_CRAWL_SCHEDULING_POLICY` on the API process
+  (also passed through Compose). The API publishes the policy with each new job;
+  crawlers read no API config. Existing jobs retain their original policy, and
+  jobs without the field default to `balanced`.
+  In `balanced` mode, when both sources have queued requests, take one normal request and one manual
   request in turn. Skip an empty source so the other uses all available dispatch
-  capacity; an arriving source receives the next turn. No dispatch ratio or manual
+  capacity; an arriving source receives the next turn. `manual_first` gives that
+  job's requests priority over normal and balanced work. `normal_first` dispatches
+  that job's requests only when the other queues have no request to dispatch.
+  These are dispatch preferences, not preemption of downloads or changes to QPS.
+  Priority modes can starve lower-priority queues under continuous load.
+  No dispatch ratio or manual
   percentage concurrency cap is configured. Each source retains Scrapy's
   downloader-aware domain selection and uses FIFO queues at equal priority,
   including startup requests. Retries retain their source and priority so new
-  URLs cannot indefinitely overtake them.
+  URLs within the same queue cannot indefinitely overtake them.
   Manual prefetch is bounded by `CONCURRENT_REQUESTS`; active jobs remain bounded
   by `MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS` (default 64), overridable with
   `CRAWLER_MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS`.

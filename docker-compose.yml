@@ -83,6 +83,8 @@ services:
     container_name: api
     cpus: 8
     init: true
+    environment:
+      - MANUAL_BULK_CRAWL_SCHEDULING_POLICY
     restart: unless-stopped
     stop_grace_period: 140s
     ports:

@@ -502,3 +502,19 @@ def test_resumed_job_keeps_original_result_indexes_after_domain_reordering(queue
         assert not consumer.domains
     finally:
         consumer.close()
+
+
+@pytest.mark.parametrize("policy", ["balanced", "manual_first", "normal_first"])
+def test_job_scheduling_policy_travels_with_manual_requests(queue, policy):
+    enqueue, factory, _ = queue
+    path = enqueue("a", 2)
+    payload = json.loads(path.read_text())
+    payload["scheduling_policy"] = policy
+    path.write_text(json.dumps(payload))
+    consumer, requests = factory()
+    try:
+        consumer.poll()
+        assert len(requests) == 2
+        assert all(request.meta["manual_bulk_crawl_scheduling_policy"] == policy for request in requests)
+    finally:
+        consumer.close()

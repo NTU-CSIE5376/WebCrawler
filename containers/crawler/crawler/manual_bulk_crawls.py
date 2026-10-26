@@ -200,7 +200,8 @@ class ManualBulkCrawlConsumer:
                     self.spider.crawler.engine.crawl(scrapy.Request(
                         job.batch.urls[index], callback=self.parse, errback=self.fetch_failed,
                         dont_filter=True,
-                        meta={"manual_bulk_crawl_job_id": job_id, "manual_bulk_crawl_index": index},
+                        meta={"manual_bulk_crawl_job_id": job_id, "manual_bulk_crawl_index": index,
+                              "manual_bulk_crawl_scheduling_policy": job.batch.payload.get("scheduling_policy", "balanced")},
                     ))
                 except Exception:
                     job.failed = True

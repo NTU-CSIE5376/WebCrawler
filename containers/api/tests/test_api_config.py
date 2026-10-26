@@ -38,3 +38,29 @@ def test_missing_api_config_file_fails(tmp_path, monkeypatch):
     monkeypatch.setenv("API_CONFIG_PATH", str(tmp_path / "missing.yaml"))
     with pytest.raises(FileNotFoundError):
         load_api_config()
+
+
+@pytest.mark.parametrize("policy", ["balanced", "manual_first", "normal_first"])
+def test_scheduling_policy_environment_overrides_yaml(tmp_path, monkeypatch, policy):
+    path = tmp_path / "config.yml"
+    path.write_text("manual_bulk_crawl:\n  scheduling_policy: normal_first\n")
+    monkeypatch.setenv("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", policy)
+    assert load_api_config(path)["manual_bulk_crawl"]["scheduling_policy"] == policy
+
+
+def test_scheduling_policy_yaml_and_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", raising=False)
+    path = tmp_path / "config.yml"
+    path.write_text("manual_bulk_crawl: {}\n")
+    assert load_api_config(path)["manual_bulk_crawl"]["scheduling_policy"] == "balanced"
+    path.write_text("manual_bulk_crawl:\n  scheduling_policy: manual_first\n")
+    assert load_api_config(path)["manual_bulk_crawl"]["scheduling_policy"] == "manual_first"
+
+
+@pytest.mark.parametrize("policy", ["unknown", "", "BALANCED"])
+def test_invalid_scheduling_policy_environment_fails(tmp_path, monkeypatch, policy):
+    path = tmp_path / "config.yml"
+    path.write_text("manual_bulk_crawl: {}\n")
+    monkeypatch.setenv("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", policy)
+    with pytest.raises(ValueError, match="scheduling_policy"):
+        load_api_config(path)

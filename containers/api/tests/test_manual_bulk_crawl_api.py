@@ -445,6 +445,33 @@ def test_app_routes_using_its_own_config(setup_api, monkeypatch):
     with TestClient(create_app(str(path))) as client:
         response = client.post("/v1/manual-bulk-crawls", json={"urls": ["https://example.com"]})
     assert response.status_code == 200
+    config["manual_bulk_crawl"]["scheduling_policy"] = "balanced"
     router_factory.assert_called_once_with(config)
     job = json.loads(next((root / "pending").glob("*.json")).read_text())
     assert job["crawler_ids"] == [2]
+
+
+@pytest.mark.parametrize("policy", ["balanced", "manual_first", "normal_first"])
+def test_api_publishes_configured_policy_with_each_job(setup_api, monkeypatch, policy):
+    _, _, _, root = setup_api
+    monkeypatch.setenv("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", policy)
+    monkeypatch.setattr(app_module, "ManualBulkCrawlRouter", lambda *args: lambda urls: [0] * len(urls))
+    with TestClient(create_app(str(root / "config.yml"))) as client:
+        response = client.post("/v1/manual-bulk-crawls", json={"urls": ["https://example.com/"]})
+    assert response.status_code == 200
+    payload = json.loads((root / "pending" / f'{response.json()["job_id"]}.json').read_text())
+    assert payload["scheduling_policy"] == policy
+    batch = next_batch(root / "pending")
+    try:
+        assert batch.payload["scheduling_policy"] == policy
+    finally:
+        batch.close()
+
+
+@pytest.mark.parametrize("policy", ["unknown", None, 1, True])
+def test_invalid_policy_fails_before_publishing_job(tmp_path, policy):
+    with pytest.raises(ValueError, match="scheduling_policy"):
+        ManualBulkCrawlService({"pending_dir": str(tmp_path / "pending"),
+                                "result_dir": str(tmp_path / "results"),
+                                "scheduling_policy": policy}, route_urls=lambda urls: [0] * len(urls))
+    assert not (tmp_path / "pending").exists()

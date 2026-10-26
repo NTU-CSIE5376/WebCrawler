@@ -11,7 +11,8 @@ ROBOTSTXT_OBEY = True
 
 DUPEFILTER_CLASS = "scrapy.dupefilters.BaseDupeFilter" # Disable dupefilter
 
-# Share dispatch fairly between normal and manual work. FIFO keeps newly fed
+# Balanced jobs alternate normal/manual dispatch; jobs can also request priority.
+# FIFO keeps newly fed
 # requests from overtaking older ones at the same priority, including startup.
 SCHEDULER = "crawler.fair_scheduler.FairScheduler"
 SCHEDULER_MEMORY_QUEUE = "scrapy.squeues.FifoMemoryQueue"

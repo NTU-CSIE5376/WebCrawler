@@ -12,7 +12,7 @@ from uuid import uuid4
 from libs.urls import MAX_URL_LEN, validate_url
 from libs.ipc.manual_bulk_crawl import (
     DEFAULT_TTL_DAYS, expiration, is_expired, job_status,
-    prepare_job, worker_directory, validate_ttl_days,
+    prepare_job, worker_directory, validate_ttl_days, validate_scheduling_policy,
 )
 
 
@@ -52,12 +52,14 @@ class ManualBulkCrawlService:
         self.pending_dir = Path(crawl_config["pending_dir"])
         self.result_dir = Path(crawl_config["result_dir"])
         self.route_urls = route_urls
+        self.scheduling_policy = validate_scheduling_policy(crawl_config.get("scheduling_policy", "balanced"))
 
     def submit(self, urls: list[str], ttl_days: int = DEFAULT_TTL_DAYS) -> str:
         validate_ttl_days(ttl_days)
         created = datetime.now(timezone.utc)
         file_tag = uuid4().hex
         records = {"version": 1, "urls": urls,
+                   "scheduling_policy": self.scheduling_policy,
                    "crawler_ids": self.route_urls(urls),
                    "result_dir": str(self.result_dir.resolve()),
                    "created_at": created.isoformat(), "ttl_days": ttl_days,
