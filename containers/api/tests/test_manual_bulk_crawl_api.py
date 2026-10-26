@@ -172,15 +172,31 @@ def test_http_errors_are_json(setup_api, data, content_type, status):
 
 @pytest.mark.parametrize("failure", ["rename", "flush"])
 def test_storage_failure_rejects_entire_multishard_batch(setup_api, monkeypatch, failure):
-    client, _, _, tmp_path = setup_api
+    client, service, _, tmp_path = setup_api
+    monkeypatch.setattr(service, "route_urls", Mock(return_value=[0, 1]))
     operation = "replace" if failure == "rename" else "fsync"
-    monkeypatch.setattr(service_module.os, operation, Mock(side_effect=OSError(errno.ENOSPC, "disk full")))
+
+    def fail_after_preparation(*args):
+        markers = list((tmp_path / "pending").glob("crawler_*/*.json"))
+        assert {path.parent.name for path in markers} == {"crawler_00", "crawler_01"}
+        assert len(markers) == 2
+        assert markers[0].name == markers[1].name
+        prepared = service.result_dir / markers[0].stem
+        assert json.loads((prepared / "request.json").read_text())["crawler_ids"] == [0, 1]
+        assert all((prepared / f"crawler_{worker:02d}").is_dir() for worker in (0, 1))
+        raise OSError(errno.ENOSPC, "disk full")
+
+    failed_operation = Mock(side_effect=fail_after_preparation)
+    monkeypatch.setattr(service_module.os, operation, failed_operation)
     response = client.post("/v1/manual-bulk-crawls", json={"urls": [
         "https://example.com/a", "https://example.org/b",
     ]})
     assert response.status_code == 503
     assert response.json() == {"error": "Submission unavailable; no URLs accepted"}
-    assert not list((tmp_path / "pending").glob("*.json"))
+    failed_operation.assert_called_once()
+    service.route_urls.assert_called_once()
+    assert not list((tmp_path / "pending").rglob("*.json"))
+    assert not list(service.result_dir.rglob("*"))
     assert not list(tmp_path.rglob("*.jsonl"))
     assert not list(tmp_path.rglob("*.tmp"))
 

@@ -246,13 +246,18 @@ def test_temporary_queue_scan_error_does_not_stop_processing(queue, monkeypatch)
 
     def fail_once(path, pattern, *args, **kwargs):
         nonlocal failed
-        if path == consumer.pending_dir and not failed:
+        if path == consumer.pending_dir / "crawler_00" and not failed:
             failed = True
             raise OSError("temporarily unavailable")
         return original(path, pattern, *args, **kwargs)
 
     monkeypatch.setattr(Path, "glob", fail_once)
     try:
+        consumer.refill()
+        assert failed, "The worker partition scan must exercise the injected error"
+        assert not requests
+        assert not consumer.jobs
+        consumer.spider.logger.exception.assert_called_once_with("manual_bulk_crawl.queue_failed")
         consumer.poll()
         assert len(requests) == 1
         complete(consumer, requests[0])

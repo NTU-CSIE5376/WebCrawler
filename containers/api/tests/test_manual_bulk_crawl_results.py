@@ -101,15 +101,24 @@ def test_internal_files_and_path_traversal_are_not_exposed(job_api, filename):
     assert response.status_code == 404
 
 
-def test_symlinks_are_not_listed_or_downloaded(job_api, tmp_path):
+@pytest.mark.parametrize("filename", ["00000.html", "00000.json"])
+def test_symlinks_are_not_listed_or_downloaded(job_api, tmp_path, filename):
     client, service = job_api
     job_id = complete_job(service)
     secret = tmp_path / "secret"
     secret.write_text("outside result storage")
-    (service.result_dir / job_id / "crawler_00" / "99999.html").symlink_to(secret)
-    listing = client.get(f"/v1/manual-bulk-crawls/{job_id}/results").json()
-    assert "99999.html" not in [file["name"] for file in listing["files"]]
-    assert client.get(f"/v1/manual-bulk-crawls/{job_id}/results/99999.html").status_code == 404
+    endpoint = f"/v1/manual-bulk-crawls/{job_id}/results"
+    assert client.get(f"{endpoint}/{filename}").status_code == 200
+    assert filename in [file["name"] for file in client.get(endpoint).json()["files"]]
+    result = service.result_dir / job_id / "crawler_00" / filename
+    result.unlink()
+    result.symlink_to(secret)
+    response = client.get(endpoint)
+    assert response.status_code == 200
+    names = [file["name"] for file in response.json()["files"]]
+    assert filename not in names
+    assert "00001.json" in names
+    assert client.get(f"{endpoint}/{filename}").status_code == 404
 
 
 def test_unknown_jobs_and_unavailable_storage_return_json(job_api, monkeypatch):
