@@ -342,16 +342,15 @@ Responsibilities:
 - Consume only this crawler's queue partition. Run one live crawler process per
   crawler ID, as with normal IPC. Different crawlers can process one job
   concurrently without file locks.
-- Configure `manual_bulk_crawl.scheduling_policy` in `containers/api/config/config.yml`,
-  optionally overridden by `MANUAL_BULK_CRAWL_SCHEDULING_POLICY` on the API process
-  (also passed through Compose). The API publishes the policy with each new job;
-  crawlers read no API config. Existing jobs retain their original policy, and
-  jobs without the field default to `manual_first` (API work first).
-  In `balanced` mode, when both sources have queued requests, take one normal request and one manual
-  request in turn. Skip an empty source so the other uses all available dispatch
-  capacity; an arriving source receives the next turn. `manual_first` gives that
-  job's requests priority over normal and balanced work. `normal_first` dispatches
-  that job's requests only when the other queues have no request to dispatch.
+- Configure `MANUAL_BULK_CRAWL_SCHEDULING_POLICY` on the crawler (also passed
+  through Compose); restart crawlers after changing it. The default is
+  `manual_first`. This crawler-wide setting applies to all jobs, including
+  already queued requests; jobs and requests carry no dispatch policy.
+  Each crawler has two scheduler queues: normal and manual.
+  In `balanced` mode, dispatch one normal request and one manual request in turn,
+  skipping an empty queue so the other uses all available dispatch capacity.
+  `manual_first` drains available manual requests before normal requests;
+  `normal_first` drains available normal requests before manual requests.
   These are dispatch preferences, not preemption of downloads or changes to QPS.
   Priority modes can starve lower-priority queues under continuous load.
   No dispatch ratio or manual

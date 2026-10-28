@@ -11,7 +11,8 @@ ROBOTSTXT_OBEY = True
 
 DUPEFILTER_CLASS = "scrapy.dupefilters.BaseDupeFilter" # Disable dupefilter
 
-# Balanced jobs alternate normal/manual dispatch; jobs can also request priority.
+# One dispatch policy for all jobs on this crawler; balanced alternates sources.
+MANUAL_BULK_CRAWL_SCHEDULING_POLICY = os.getenv("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", "manual_first")
 # FIFO keeps newly fed
 # requests from overtaking older ones at the same priority, including startup.
 SCHEDULER = "crawler.fair_scheduler.FairScheduler"

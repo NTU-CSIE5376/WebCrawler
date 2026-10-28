@@ -510,7 +510,7 @@ def test_resumed_job_keeps_original_result_indexes_after_domain_reordering(queue
 
 
 @pytest.mark.parametrize("policy", ["balanced", "manual_first", "normal_first"])
-def test_job_scheduling_policy_travels_with_manual_requests(queue, policy):
+def test_legacy_job_policy_is_not_propagated_to_requests(queue, policy):
     enqueue, factory, _ = queue
     path = enqueue("a", 2)
     payload = json.loads(path.read_text())
@@ -520,17 +520,17 @@ def test_job_scheduling_policy_travels_with_manual_requests(queue, policy):
     try:
         consumer.poll()
         assert len(requests) == 2
-        assert all(request.meta["manual_bulk_crawl_scheduling_policy"] == policy for request in requests)
+        assert all("manual_bulk_crawl_scheduling_policy" not in request.meta for request in requests)
     finally:
         consumer.close()
 
 
-def test_job_without_policy_defaults_to_manual_first(queue):
+def test_job_without_policy_does_not_add_request_policy(queue):
     enqueue, factory, _ = queue
     enqueue("a", 1)
     consumer, requests = factory()
     try:
         consumer.poll()
-        assert requests[0].meta["manual_bulk_crawl_scheduling_policy"] == "manual_first"
+        assert "manual_bulk_crawl_scheduling_policy" not in requests[0].meta
     finally:
         consumer.close()

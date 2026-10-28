@@ -11,7 +11,7 @@ from scrapy.utils.httpobj import urlparse_cached
 from twisted.internet.task import LoopingCall
 
 from libs.ipc.manual_bulk_crawl import (
-    DEFAULT_SCHEDULING_POLICY, JobUnavailable, ManualBulkCrawlBatch, iter_batches, is_expired,
+    JobUnavailable, ManualBulkCrawlBatch, iter_batches, is_expired,
 )
 
 
@@ -200,8 +200,7 @@ class ManualBulkCrawlConsumer:
                     self.spider.crawler.engine.crawl(scrapy.Request(
                         job.batch.urls[index], callback=self.parse, errback=self.fetch_failed,
                         dont_filter=True,
-                        meta={"manual_bulk_crawl_job_id": job_id, "manual_bulk_crawl_index": index,
-                              "manual_bulk_crawl_scheduling_policy": job.batch.payload.get("scheduling_policy", DEFAULT_SCHEDULING_POLICY)},
+                        meta={"manual_bulk_crawl_job_id": job_id, "manual_bulk_crawl_index": index},
                     ))
                 except Exception:
                     job.failed = True

@@ -9,14 +9,6 @@ from pathlib import Path
 
 DEFAULT_TTL_DAYS = 14
 MAX_TTL_DAYS = 60
-SCHEDULING_POLICIES = ("balanced", "manual_first", "normal_first")
-DEFAULT_SCHEDULING_POLICY = "manual_first"
-
-
-def validate_scheduling_policy(value):
-    if value not in SCHEDULING_POLICIES:
-        raise ValueError("manual_bulk_crawl.scheduling_policy must be balanced, manual_first or normal_first")
-    return value
 
 
 class JobUnavailable(Exception):
@@ -202,7 +194,6 @@ def iter_batches(pending_dir: Path, crawler_id: int = 0, *,
             continue
         queued.append((submitted_at, path, payload))
     for _, path, payload in sorted(queued, key=lambda item: (item[0], item[1])):
-        validate_scheduling_policy(payload.get("scheduling_policy", DEFAULT_SCHEDULING_POLICY))
         if (payload.get("version") != 1 or not isinstance(payload.get("urls"), list)
                 or len(payload.get("crawler_ids", [])) != len(payload["urls"])
                 or not isinstance(payload.get("result_dir"), str)

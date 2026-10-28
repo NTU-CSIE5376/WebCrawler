@@ -14,7 +14,7 @@ from containers.crawler.crawler.fair_scheduler import FairScheduler
 def scheduler_factory(tmp_path):
     schedulers = []
 
-    def factory(disk=False, replace=None):
+    def factory(disk=False, replace=None, policy="balanced"):
         if replace is not None:
             replace.close("restart")
             schedulers.remove(replace)
@@ -25,6 +25,8 @@ def scheduler_factory(tmp_path):
             "SCHEDULER_START_MEMORY_QUEUE": None,
             "SCHEDULER_START_DISK_QUEUE": None,
         })
+        if policy is not None:
+            settings.set("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", policy)
         if disk:
             settings.set("JOBDIR", str(tmp_path / "job"))
         downloader = SimpleNamespace(slots={}, get_slot_key=lambda request: urlsplit(request.url).hostname)
@@ -46,7 +48,6 @@ def request(source, index, **kwargs):
     meta = kwargs.pop("meta", {})
     if source == "manual":
         meta["manual_bulk_crawl_job_id"] = "a" * 32
-        meta.setdefault("manual_bulk_crawl_scheduling_policy", "balanced")
     return Request(f"https://example.com/{source}/{index}", meta=meta, **kwargs)
 
 
@@ -144,43 +145,71 @@ def test_both_disk_partitions_resume_after_restart(scheduler_factory):
 ])
 @pytest.mark.parametrize("disk", [False, True])
 def test_dispatch_policy_preserves_source_preference_across_storage(scheduler_factory, policy, expected, disk):
-    scheduler = scheduler_factory(disk=disk)
+    scheduler = scheduler_factory(disk=disk, policy=policy)
     for i in range(3):
         scheduler.enqueue_request(request("normal", i))
-        scheduler.enqueue_request(request("manual", i, meta={"manual_bulk_crawl_scheduling_policy": policy}))
+        scheduler.enqueue_request(request("manual", i))
     assert [source(scheduler.next_request()) for _ in range(6)] == expected
     assert not scheduler.has_pending_requests()
 
 
-def test_mixed_job_policies_do_not_override_each_other(scheduler_factory):
-    scheduler = scheduler_factory()
-    for policy in ("normal_first", "balanced", "manual_first"):
-        scheduler.enqueue_request(request("manual", policy, meta={"manual_bulk_crawl_scheduling_policy": policy}))
-    scheduler.enqueue_request(request("normal", 0))
-    assert [scheduler.next_request().url.rsplit("/", 1)[-1] for _ in range(4)] == [
-        "manual_first", "0", "balanced", "normal_first"]
+@pytest.mark.parametrize("policy,expected", [
+    ("balanced", ["normal", "manual"] * 3),
+    ("manual_first", ["manual"] * 3 + ["normal"] * 3),
+    ("normal_first", ["normal"] * 3 + ["manual"] * 3),
+])
+def test_request_metadata_cannot_override_crawler_policy(scheduler_factory, policy, expected):
+    scheduler = scheduler_factory(policy=policy)
+    for i, old_policy in enumerate(("normal_first", "balanced", "manual_first")):
+        scheduler.enqueue_request(request("manual", i, meta={"manual_bulk_crawl_scheduling_policy": old_policy}))
+        scheduler.enqueue_request(request("normal", i))
+    assert len(scheduler.manual) == 3
+    assert len(scheduler.normal) == 3
+    assert [source(scheduler.next_request()) for _ in range(6)] == expected
 
 
 @pytest.mark.parametrize("policy", ["manual_first", "normal_first"])
 def test_priority_policy_survives_retry_and_restart(scheduler_factory, policy):
-    scheduler = scheduler_factory(disk=True)
-    original = request("manual", 0, meta={"manual_bulk_crawl_scheduling_policy": policy})
+    scheduler = scheduler_factory(disk=True, policy=policy)
+    original = request("manual", 0)
     scheduler.enqueue_request(original.replace(url="https://example.com/retry"))
     scheduler.enqueue_request(request("normal", 0))
-    resumed = scheduler_factory(disk=True, replace=scheduler)
+    resumed = scheduler_factory(disk=True, replace=scheduler, policy=policy)
     expected = ["manual", "normal"] if policy == "manual_first" else ["normal", "manual"]
     assert [source(resumed.next_request()) for _ in range(2)] == expected
 
 
-def test_invalid_policy_is_rejected_before_enqueue(scheduler_factory):
-    scheduler = scheduler_factory()
-    with pytest.raises(ValueError, match="scheduling_policy"):
-        scheduler.enqueue_request(request("manual", 0, meta={"manual_bulk_crawl_scheduling_policy": "unknown"}))
-    assert not scheduler.has_pending_requests()
+@pytest.mark.parametrize("policy", ["unknown", "", 1, True])
+def test_invalid_crawler_policy_is_rejected_at_startup(scheduler_factory, policy):
+    with pytest.raises(ValueError, match="MANUAL_BULK_CRAWL_SCHEDULING_POLICY"):
+        scheduler_factory(policy=policy)
+
+
+@pytest.mark.parametrize("policy", ["balanced", "manual_first", "normal_first"])
+def test_restart_applies_current_policy_to_already_queued_requests(scheduler_factory, policy):
+    scheduler = scheduler_factory(disk=True, policy="manual_first")
+    scheduler.enqueue_request(request("manual", 0))
+    scheduler.enqueue_request(request("normal", 0))
+    resumed = scheduler_factory(disk=True, replace=scheduler, policy=policy)
+    expected = ["manual", "normal"] if policy == "manual_first" else ["normal", "manual"]
+    assert [source(resumed.next_request()) for _ in range(2)] == expected
 
 
 def test_unspecified_policy_defaults_to_manual_first(scheduler_factory):
-    scheduler = scheduler_factory()
+    scheduler = scheduler_factory(policy=None)
     scheduler.enqueue_request(request("normal", 0))
     scheduler.enqueue_request(Request("https://example.com/manual/default", meta={"manual_bulk_crawl_job_id": "a" * 32}))
     assert [source(scheduler.next_request()) for _ in range(2)] == ["manual", "normal"]
+
+
+@pytest.mark.parametrize("policy", [None, "balanced", "manual_first", "normal_first"])
+def test_crawler_environment_sets_dispatch_policy(monkeypatch, policy):
+    import runpy
+
+    monkeypatch.setenv("CRAWLER_USE_AUTOTHROTTLE", "true")
+    if policy is None:
+        monkeypatch.delenv("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", raising=False)
+    else:
+        monkeypatch.setenv("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", policy)
+    settings = runpy.run_module("containers.crawler.crawler.settings")
+    assert settings["MANUAL_BULK_CRAWL_SCHEDULING_POLICY"] == (policy or "manual_first")
