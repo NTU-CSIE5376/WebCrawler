@@ -695,10 +695,14 @@ class GoldenDiscoveryIngestInlineScoringTest(unittest.TestCase):
 
         self.assertEqual(result, [(0, True)])
         self.assertEqual(ranker.calls, [])
-        # The frozen-domain guard still runs; but with the inline timeout at 0
-        # the scoring path is skipped, so there is no existing-URL lookup.
-        self.assertEqual(len(cursor.executed), 1)
+        # The frozen-domain guard still runs; with the inline timeout at 0 the
+        # scoring path's own existing-URL lookup is skipped, but _bulk_links
+        # always runs its own pre-upsert existing-URL check (xmax=0 isn't
+        # available on YSQL, so "newly inserted" is determined this way
+        # instead of via RETURNING ... xmax) — that's the second call.
+        self.assertEqual(len(cursor.executed), 2)
         self.assertIn("discovery_frozen = TRUE", cursor.executed[0][0])
+        self.assertIn("SELECT url FROM", cursor.executed[1][0])
         current_rows = execute_values_calls[0][1]
         self.assertEqual(current_rows[0][3], 0.0)
         self.assertIsNone(current_rows[0][4])
@@ -729,10 +733,14 @@ class GoldenDiscoveryIngestInlineScoringTest(unittest.TestCase):
             result = db._bulk_links(cur=cursor, shard_id=3, items=records)
 
         self.assertEqual(result, [(0, True)])
-        # No inline ranker, so scoring is skipped and no existing-URL lookup
-        # runs — only the frozen-domain guard touches the cursor.
-        self.assertEqual(len(cursor.executed), 1)
+        # No inline ranker, so the scoring path's own existing-URL lookup is
+        # skipped, but _bulk_links always runs its own pre-upsert
+        # existing-URL check (xmax=0 isn't available on YSQL, so "newly
+        # inserted" is determined this way instead of via RETURNING ...
+        # xmax) — so the cursor sees the frozen-domain guard plus that check.
+        self.assertEqual(len(cursor.executed), 2)
         self.assertIn("discovery_frozen = TRUE", cursor.executed[0][0])
+        self.assertIn("SELECT url FROM", cursor.executed[1][0])
         current_rows = execute_values_calls[0][1]
         self.assertEqual(current_rows[0][3], 0.0)
         self.assertIsNone(current_rows[0][4])
