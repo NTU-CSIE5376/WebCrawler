@@ -7,12 +7,12 @@ from pathlib import Path
 from time import monotonic
 
 import scrapy
-from scrapy.utils.httpobj import urlparse_cached
 from twisted.internet.task import LoopingCall
 
 from libs.ipc.manual_bulk_crawl import (
     JobUnavailable, ManualBulkCrawlBatch, iter_batches, is_expired,
 )
+from libs.urls import host_of
 
 
 @dataclass
@@ -90,12 +90,6 @@ class ManualBulkCrawlConsumer:
         self.next_job_scan = 0.0
         self.refill()
 
-    def _slot_key(self, url):
-        request = scrapy.Request(url)
-        downloader = getattr(self.spider.crawler.engine, "downloader", None)
-        return (downloader.get_slot_key(request) if downloader is not None
-                else urlparse_cached(request).hostname)
-
     def _domain_limits(self, key, domain):
         settings = self.spider.crawler.settings
         downloader = getattr(self.spider.crawler.engine, "downloader", None)
@@ -158,7 +152,8 @@ class ManualBulkCrawlConsumer:
                 job_id = batch.path.stem
                 self.jobs[job_id] = _ActiveJob(batch=batch, pending=set(batch.remaining))
                 for index in sorted(batch.remaining):
-                    key = self._slot_key(batch.urls[index])
+                    # Use the hostname as the downloader slot key.
+                    key = host_of(batch.urls[index])
                     self.domains.setdefault(key, _DomainQueue()).pending.append((job_id, index))
                     touched.add(key)
         except Exception:

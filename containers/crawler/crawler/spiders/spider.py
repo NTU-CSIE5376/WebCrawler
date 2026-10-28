@@ -6,7 +6,6 @@ import tldextract
 from w3lib.url import canonicalize_url
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import urlparse
 
 import scrapy
 from scrapy import signals
@@ -20,6 +19,7 @@ from crawler.queue_consumer import QueueConsumer
 from crawler.youtube_extractor import extract_youtube_outlinks
 from crawler.manual_bulk_crawls import ManualBulkCrawlConsumer
 from libs.obslog import configure as configure_logging
+from libs.urls import host_of
 
 logger = logging.getLogger("crawler")
 
@@ -398,7 +398,7 @@ class HtmlSpider(scrapy.Spider):
                 "anchor": (link.text or "").strip()[:200]
             })
 
-        host = urlparse(response.url).hostname or ""
+        host = host_of(response.url)
         if host == "youtube.com" or host.endswith(".youtube.com"):
             extract_youtube_outlinks(response, outlinks)
 
@@ -467,7 +467,7 @@ class HtmlSpider(scrapy.Spider):
         yield item
 
     def _host(self, url: str) -> str:
-        return (urlparse(url).hostname or "").lower()
+        return host_of(url)
 
     def req_scheduled(self, request):
         logger.info(

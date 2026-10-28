@@ -1,12 +1,18 @@
-"""Shared validation and canonicalization for crawl URL submissions."""
+"""Shared URL hostname extraction, validation and canonicalization."""
 from ipaddress import ip_address
 from urllib.parse import urlsplit
 
-import validators
-from w3lib.url import canonicalize_url
-
 
 MAX_URL_LEN = 2500
+
+
+def host_of(url: str | None) -> str:
+    """Return the lowercase hostname without credentials, port or IPv6 brackets.
+
+    This extracts a hostname only; it does not validate or canonicalize the URL.
+    Empty input returns an empty string; malformed URLs may raise ValueError.
+    """
+    return (urlsplit(url).hostname or "").lower() if url else ""
 
 
 def validate_url(url: object, *, max_length: int = MAX_URL_LEN) -> str:
@@ -16,6 +22,10 @@ def validate_url(url: object, *, max_length: int = MAX_URL_LEN) -> str:
     IP literals must be global; localhost and single-label hosts are rejected.
     The length limit applies before and after encoding/canonicalization.
     """
+    # Hostname-only callers need no validation dependencies.
+    import validators
+    from w3lib.url import canonicalize_url
+
     try:
         if not isinstance(url, str) or not url or len(url) > max_length:
             raise ValueError()

@@ -534,3 +534,23 @@ def test_job_without_policy_does_not_add_request_policy(queue):
         assert "manual_bulk_crawl_scheduling_policy" not in requests[0].meta
     finally:
         consumer.close()
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("https://EXAMPLE.com:8443?x=1", "example.com"),
+    ("https://[2606:4700:4700::1111]:8443/a", "2606:4700:4700::1111"),
+    ("https://xn--bcher-kva.example/a", "xn--bcher-kva.example"),
+])
+def test_loading_job_groups_by_hostname_without_allocating_requests(queue, monkeypatch, url, expected):
+    enqueue, factory, _ = queue
+    enqueue("a", urls=[url])
+    consumer, _ = factory()
+    request = Mock(side_effect=AssertionError("Hostname extraction must not create a Request"))
+    monkeypatch.setattr("containers.crawler.crawler.manual_bulk_crawls.scrapy.Request", request)
+    try:
+        consumer._load_jobs()
+        assert set(consumer.domains) == {expected}
+        assert list(consumer.domains[expected].pending) == [("a", 0)]
+        request.assert_not_called()
+    finally:
+        consumer.close()

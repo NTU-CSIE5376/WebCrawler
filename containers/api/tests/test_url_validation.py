@@ -1,7 +1,7 @@
 import pytest
 
 from containers.api.service import validate_urls
-from libs.urls import MAX_URL_LEN, validate_url
+from libs.urls import MAX_URL_LEN, host_of, validate_url
 
 
 @pytest.mark.parametrize("url,expected", [
@@ -72,3 +72,26 @@ def test_batch_validation_keeps_normalized_order_and_deduplicates():
 def test_batch_validation_adds_zero_based_index_to_shared_error():
     with pytest.raises(ValueError, match="^Invalid HTTP\\(S\\) URL at index 1$"):
         validate_urls(["https://example.com/a", "invalid"], max_urls=3)
+
+
+@pytest.mark.parametrize("url,expected", [
+    (None, ""),
+    ("", ""),
+    ("/relative", ""),
+    ("https://User:password@EXAMPLE.com:8443?x=1", "example.com"),
+    ("https://[2606:4700:4700::1111]:8443/a", "2606:4700:4700::1111"),
+    ("https://1.1.1.1:8080/a", "1.1.1.1"),
+    ("https://EXAMPLE.com./a", "example.com."),
+    ("https://bücher.example/a", "bücher.example"),
+])
+def test_host_of_extracts_hostname_without_validation(url, expected):
+    assert host_of(url) == expected
+
+
+def test_host_of_uses_canonical_hostname_after_validation():
+    assert host_of(validate_url("https://bücher.example/a")) == "xn--bcher-kva.example"
+
+
+def test_host_of_reports_malformed_ipv6():
+    with pytest.raises(ValueError):
+        host_of("https://[broken/a")
