@@ -361,9 +361,10 @@ def test_single_domain_prefix_cannot_hide_other_domains_in_same_job(queue):
     consumer, requests = factory(concurrency=6, domain_concurrency=2)
     try:
         consumer.poll()
-        assert [request.url for request in requests] == [
-            "https://wiki.example/0", "https://wiki.example/1",
-            "https://other.example/0", "https://third.example/0"]
+        assert [request.url for request in requests[:2]] == [
+            "https://wiki.example/0", "https://wiki.example/1"]
+        assert {request.url for request in requests[2:]} == {
+            "https://other.example/0", "https://third.example/0"}
         assert len(requests) == 4, "Only two wiki URLs should be admitted"
         wiki = [request for request in requests if "wiki.example" in request.url]
         complete(consumer, wiki[0])
@@ -552,5 +553,53 @@ def test_loading_job_groups_by_hostname_without_allocating_requests(queue, monke
         assert set(consumer.domains) == {expected}
         assert list(consumer.domains[expected].pending) == [("a", 0)]
         request.assert_not_called()
+    finally:
+        consumer.close()
+
+
+@pytest.mark.parametrize("a_jitter,b_jitter,first", [
+    (0.1, 0.9, "b"),
+    (0.9, 0.1, "a"),
+])
+def test_fixed_domain_jitter_breaks_ties_and_survives_updates(queue, a_jitter, b_jitter, first):
+    enqueue, factory, _ = queue
+    enqueue("mixed", urls=[f"https://{host}.example/{i}" for host in ("a", "b") for i in range(3)])
+    consumer, requests = factory(concurrency=1)
+    try:
+        consumer._load_jobs()
+        assert all(0 <= domain.jitter < 1 for domain in consumer.domains.values())
+        consumer.domains["a.example"].jitter = a_jitter
+        consumer.domains["b.example"].jitter = b_jitter
+        consumer.poll()
+        assert requests[0].url == f"https://{first}.example/0"
+        consumer.poll()
+        complete(consumer, requests[0])
+        other = "b" if first == "a" else "a"
+        assert requests[1].url == f"https://{other}.example/0", "One more second of work outweighs jitter"
+        assert consumer.domains["a.example"].jitter == a_jitter
+        assert consumer.domains["b.example"].jitter == b_jitter
+    finally:
+        consumer.close()
+
+
+def test_priority_updates_replace_entries_and_capped_domains_leave_queue(queue):
+    enqueue, factory, _ = queue
+    enqueue("mixed", urls=[f"https://{host}.example/{i}" for host in ("a", "b") for i in range(5)])
+    consumer, requests = factory(concurrency=1)
+    try:
+        consumer._load_jobs()
+        for latency in range(1, 101):
+            consumer.domains["a.example"].latency = latency
+            consumer._refresh_priorities(["a.example"])
+            assert set(consumer.ready) == {"a.example", "b.example"}
+        consumer.refill()
+        assert requests[0].url == "https://a.example/0"
+        assert "a.example" not in consumer.ready, "The domain is at its prefetch cap"
+
+        # A changed estimate must replace the previous priority on completion.
+        consumer.domains["a.example"].latency = 0.01
+        complete(consumer, requests[0])
+        assert requests[1].url == "https://b.example/0"
+        assert set(consumer.ready) == {"a.example"}
     finally:
         consumer.close()

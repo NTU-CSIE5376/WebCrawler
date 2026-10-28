@@ -370,7 +370,9 @@ Responsibilities:
   and `DOWNLOAD_SLOTS` overrides. Latency starts at one second and uses an
   exponentially smoothed `download_latency` from responses (20% new sample).
   Among slots below their prefetch cap, select the largest estimated remaining
-  service time; break equal scores by least-recent dispatch order.
+  service time plus a fixed random jitter of less than one second per domain.
+  An indexed priority queue (`pqdict`) keeps one entry per eligible slot and
+  updates its priority in place.
   Each slot's manual outstanding URLs (queued, downloading or retrying), across
   all jobs, are capped at its configured concurrency. Refill immediately on
   completion, and refresh live slot settings on each poll. These are prefetch

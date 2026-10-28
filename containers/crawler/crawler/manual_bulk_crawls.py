@@ -1,12 +1,14 @@
 """Feed bounded API work into the existing downloader and domain slots."""
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-import heapq
 from itertools import islice
 from pathlib import Path
+from random import random
 from time import monotonic
 
 import scrapy
+from pqdict import pqdict
 from twisted.internet.task import LoopingCall
 
 from libs.ipc.manual_bulk_crawl import (
@@ -28,8 +30,7 @@ class _DomainQueue:
     pending: deque[tuple[str, int]] = field(default_factory=deque)
     outstanding: int = 0
     latency: float = 1.0  # Bootstrap estimate until a response supplies download_latency.
-    last_selected: int = 0
-    version: int = 0
+    jitter: float = field(default_factory=random)  # Fixed [0, 1) seconds per domain.
 
 
 class ManualBulkCrawlConsumer:
@@ -47,9 +48,7 @@ class ManualBulkCrawlConsumer:
         self.inflight: set[tuple[str, int]] = set()
         self.domains: dict[str, _DomainQueue] = {}
         self.inflight_domains: dict[tuple[str, int], str] = {}
-        self.ready = []
-        self.ready_revision = 0
-        self.dispatch_count = 0
+        self.ready = pqdict(reverse=True)
         self.next_job_scan = 0.0
         self.finished = set()
         self.retry_after = {}
@@ -86,18 +85,18 @@ class ManualBulkCrawlConsumer:
                 self._discard_pending(job_id, job)
                 self.release_if_drained(job_id, job)
         # Re-read live slot delays, including AutoThrottle changes.
-        self._rebuild_ready()
+        self._refresh_priorities()
         self.next_job_scan = 0.0
         self.refill()
 
-    def _domain_limits(self, key, domain):
+    def _domain_limits(self, host, domain):
         settings = self.spider.crawler.settings
         downloader = getattr(self.spider.crawler.engine, "downloader", None)
-        slot = getattr(downloader, "slots", {}).get(key)
+        slot = getattr(downloader, "slots", {}).get(host)
         if slot is not None:
             concurrency, delay = slot.concurrency, slot.delay
         else:
-            overrides = settings.getdict("DOWNLOAD_SLOTS").get(key, {})
+            overrides = settings.getdict("DOWNLOAD_SLOTS").get(host, {})
             concurrency = overrides.get("concurrency", settings.getint("CONCURRENT_REQUESTS_PER_IP")
                                         or settings.getint("CONCURRENT_REQUESTS_PER_DOMAIN"))
             delay = overrides.get("delay", settings.getfloat("AUTOTHROTTLE_START_DELAY")
@@ -107,36 +106,34 @@ class ManualBulkCrawlConsumer:
         seconds_per_url = max(delay, domain.latency / max(1, concurrency))
         return concurrency, seconds_per_url
 
-    def _offer(self, key):
-        domain = self.domains[key]
-        self.ready_revision += 1
-        domain.version = self.ready_revision
-        if not domain.pending:
-            if not domain.outstanding:
-                del self.domains[key]
-            return
-        limit, seconds_per_url = self._domain_limits(key, domain)
-        if domain.outstanding >= limit:
-            return
-        remaining = len(domain.pending) + domain.outstanding
-        # Prioritize the longest remaining service time among domains below
-        # their prefetch cap. Equal scores use least-recent dispatch order.
-        heapq.heappush(self.ready, (
-            -remaining * seconds_per_url, domain.last_selected, key, domain.version,
-        ))
-
-    def _rebuild_ready(self):
-        self.ready.clear()
-        for key in list(self.domains):
-            self._offer(key)
+    def _refresh_priorities(self, hosts: Iterable[str] | None = None) -> None:
+        """Update queue eligibility and scores for selected hosts, or all hosts."""
+        for host in list(self.domains) if hosts is None else hosts:
+            domain = self.domains[host]
+            if not domain.pending:
+                self.ready.pop(host, None)
+                if not domain.outstanding:
+                    del self.domains[host]
+                continue
+            limit, seconds_per_url = self._domain_limits(host, domain)
+            if domain.outstanding >= limit:
+                self.ready.pop(host, None)
+                continue
+            remaining = len(domain.pending) + domain.outstanding
+            # Prefer the longest remaining service time, with fixed sub-second jitter.
+            self.ready[host] = remaining * seconds_per_url + domain.jitter
 
     def _discard_pending(self, job_id, job):
         if not job.pending:
             return
         job.pending.clear()
-        for domain in self.domains.values():
-            domain.pending = deque(entry for entry in domain.pending if entry[0] != job_id)
-        self._rebuild_ready()
+        touched = set()
+        for host, domain in self.domains.items():
+            pending = deque(entry for entry in domain.pending if entry[0] != job_id)
+            if len(pending) != len(domain.pending):
+                domain.pending = pending
+                touched.add(host)
+        self._refresh_priorities(touched)
 
     def _load_jobs(self):
         if monotonic() < self.next_job_scan or len(self.jobs) >= self.max_active_jobs:
@@ -153,14 +150,16 @@ class ManualBulkCrawlConsumer:
                 self.jobs[job_id] = _ActiveJob(batch=batch, pending=set(batch.remaining))
                 for index in sorted(batch.remaining):
                     # Use the hostname as the downloader slot key.
-                    key = host_of(batch.urls[index])
-                    self.domains.setdefault(key, _DomainQueue()).pending.append((job_id, index))
-                    touched.add(key)
+                    host = host_of(batch.urls[index])
+                    domain = self.domains.get(host)
+                    if domain is None:
+                        domain = self.domains[host] = _DomainQueue()
+                    domain.pending.append((job_id, index))
+                    touched.add(host)
         except Exception:
             self.spider.logger.exception("manual_bulk_crawl.queue_failed")
         finally:
-            for key in touched:
-                self._offer(key)
+            self._refresh_priorities(touched)
 
     def refill(self):
         if self.closed or self.filling:
@@ -171,10 +170,8 @@ class ManualBulkCrawlConsumer:
                                 if deadline > monotonic()}
             self._load_jobs()
             while len(self.inflight) < self.concurrency and self.ready:
-                _, _, key, version = heapq.heappop(self.ready)
-                domain = self.domains.get(key)
-                if domain is None or version != domain.version:
-                    continue
+                host, _ = self.ready.popitem()
+                domain = self.domains[host]
                 job_id, index = domain.pending[0]
                 job = self.jobs[job_id]
                 if not job.batch.path.exists() or is_expired(job.batch.payload):
@@ -185,12 +182,10 @@ class ManualBulkCrawlConsumer:
                 domain.pending.popleft()
                 job.pending.remove(index)
                 domain.outstanding += 1
-                self.dispatch_count += 1
-                domain.last_selected = self.dispatch_count
-                self.inflight_domains[job_id, index] = key
+                self.inflight_domains[job_id, index] = host
                 job.inflight.add(index)
                 self.inflight.add((job_id, index))
-                self._offer(key)
+                self._refresh_priorities([host])
                 try:
                     self.spider.crawler.engine.crawl(scrapy.Request(
                         job.batch.urls[index], callback=self.parse, errback=self.fetch_failed,
@@ -205,9 +200,6 @@ class ManualBulkCrawlConsumer:
                     self._discard_pending(job_id, job)
                     self.spider.logger.exception("manual_bulk_crawl.schedule_failed")
                     self.release_if_drained(job_id, job)
-            # Lazy heap invalidation stays bounded even across many tiny jobs.
-            if len(self.ready) > 2 * (len(self.domains) + self.concurrency):
-                self._rebuild_ready()
         finally:
             self.filling = False
 
@@ -231,12 +223,12 @@ class ManualBulkCrawlConsumer:
                   final_url=failure.request.url, status_code=None, error=failure.type.__name__)
 
     def _release_domain(self, job_id, index, latency=None):
-        key = self.inflight_domains.pop((job_id, index))
-        domain = self.domains[key]
+        host = self.inflight_domains.pop((job_id, index))
+        domain = self.domains[host]
         domain.outstanding -= 1
         if latency is not None and latency > 0:
             domain.latency = 0.8 * domain.latency + 0.2 * latency
-        self._offer(key)
+        self._refresh_priorities([host])
 
     def save(self, job_id, index, *, download_latency=None, **result):
         job = self.jobs.get(job_id)
