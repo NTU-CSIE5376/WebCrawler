@@ -458,7 +458,7 @@ class HtmlSpider(scrapy.Spider):
             extra={
                 "event": "request.fail",
                 "url": url,
-                "domain": self._host(url),
+                "domain": host_of(url),
                 "fail_reason": item["fail_reason"],
                 "status": status,
             },
@@ -466,16 +466,13 @@ class HtmlSpider(scrapy.Spider):
         self._finish_owned_request(reason="errback", domain_id=track_domain_id)
         yield item
 
-    def _host(self, url: str) -> str:
-        return host_of(url)
-
     def req_scheduled(self, request):
         logger.info(
             "request.scheduled",
             extra={
                 "event": "request.scheduled",
                 "url": request.url,
-                "domain": self._host(request.url),
+                "domain": host_of(request.url),
             },
         )
     def req_start(self, request):
@@ -486,7 +483,7 @@ class HtmlSpider(scrapy.Spider):
             extra={
                 "event": "request.start",
                 "url": request.url,
-                "domain": self._host(request.url),
+                "domain": host_of(request.url),
             },
         )
     def req_end(self, response, request):
@@ -503,7 +500,7 @@ class HtmlSpider(scrapy.Spider):
             extra={
                 "event": "request.end",
                 "url": request.url,
-                "domain": self._host(request.url),
+                "domain": host_of(request.url),
                 "status": response.status,
                 "latency_ms": downloader_total_ms,
                 "download_latency_ms": download_latency_ms,
