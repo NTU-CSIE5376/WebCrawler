@@ -1,10 +1,8 @@
 """Load and resolve site policies shared by site-specific middleware."""
 from dataclasses import dataclass
 from functools import lru_cache
-from ipaddress import ip_address
 from typing import Literal
 
-import idna
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from requests.utils import check_header_validity
 from scrapy.http import Headers
@@ -12,24 +10,11 @@ from twisted.web.http_headers import Headers as HTTPHeaders
 import tldextract
 
 from libs.config.loader import load_yaml
+from libs.urls import normalize_hostname
 
 
 # Use the bundled suffix list, with no network fetches or cache writes.
 DOMAIN_EXTRACTOR = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)
-
-
-def normalize_hostname(hostname: str) -> str:
-    """Validate and normalize a DNS name or IP address for policy matching."""
-    if not isinstance(hostname, str):
-        raise ValueError("Hostname must be a string")
-    try:
-        return str(ip_address(hostname))
-    except ValueError:
-        pass
-    try:
-        return idna.encode(hostname, uts46=True, std3_rules=True).decode("ascii").removesuffix(".")
-    except idna.IDNAError as error:
-        raise ValueError(f"Invalid hostname: {hostname!r}") from error
 
 
 def get_registered_domain(hostname: str) -> str:
