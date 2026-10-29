@@ -396,14 +396,18 @@ class IngestDB:
             WHEN EXCLUDED.robots_bits = {ROBOTS_UNKNOWN} THEN {tcur}.robots_bits
             ELSE EXCLUDED.robots_bits
           END
-        RETURNING {", ".join(_HIST_COLS)}, (xmax = 0) AS inserted
+        RETURNING {", ".join(_HIST_COLS)}
         """
+        # xmax is not available on all PG-wire-compatible targets (e.g. YSQL),
+        # so "newly inserted vs. pre-existing" is determined from a pre-upsert
+        # existence check rather than RETURNING ... (xmax = 0).
+        existing_before = self._existing_urls(cur, tcur, [d["url"] for d in decoded])
         returned = execute_values(
             cur, upsert_sql, upsert_rows, page_size=len(upsert_rows), fetch=True,
         )
 
         if returned:
-            history_rows = [row[:-1] for row in returned]  # drop trailing 'inserted' flag
+            history_rows = [row for row in returned]
             execute_values(
                 cur,
                 f"INSERT INTO {this} ({', '.join(_HIST_COLS)}) VALUES %s",
@@ -471,8 +475,7 @@ class IngestDB:
                 (list(ok_domain_ids),),
             )
 
-        # xmax = 0 in RETURNING means the row was inserted, not updated.
-        inserted_flags = {row[0]: row[-1] for row in returned}
+        inserted_flags = {d["url"]: d["url"] not in existing_before for d in decoded}
         return [
             (d["idx"], IngestResult(
                 new_link=bool(inserted_flags.get(d["url"], False)),
@@ -577,6 +580,10 @@ class IngestDB:
             f"({tcur}.parent_page_score IS NULL OR "
             f"EXCLUDED.parent_page_score > {tcur}.parent_page_score)"
         )
+        # xmax is not available on all PG-wire-compatible targets (e.g. YSQL),
+        # so "newly inserted vs. pre-existing" is determined from a pre-upsert
+        # existence check rather than RETURNING ... (xmax = 0).
+        existing_before = self._existing_urls(cur, tcur, [r[0] for r in link_rows])
         inserted_rows = execute_values(
             cur,
             f"""
@@ -598,13 +605,13 @@ class IngestDB:
                 THEN EXCLUDED.discovery_source_type ELSE {tcur}.discovery_source_type END,
               parent_page_score = CASE WHEN {pref}
                 THEN EXCLUDED.parent_page_score ELSE {tcur}.parent_page_score END
-            RETURNING url, (xmax = 0) AS inserted
+            RETURNING url
             """,
             link_rows,
             page_size=len(link_rows),
             fetch=True,
         )
-        inserted_set = {row[0] for row in inserted_rows if row[1]}
+        inserted_set = {row[0] for row in inserted_rows} - existing_before
 
         history_rows = [r for r in link_rows if r[0] in inserted_set]
         if history_rows:
