@@ -29,6 +29,10 @@ ACCEPTED_CONTENT_TYPES = ["text/html", "application/xhtml+xml"]
 MAX_URL_LEN = 2500
 MAX_HEADER_VALUE_LEN = 500
 
+
+def _source(request) -> str:
+    return "manual" if "manual_bulk_crawl_job_id" in request.meta else "normal"
+
 class HtmlSpider(scrapy.Spider):
     name = "html_spider"
 
@@ -323,6 +327,12 @@ class HtmlSpider(scrapy.Spider):
         scraper_runtime = self._scraper_runtime()
         scheduler_runtime = self._scheduler_runtime()
         domains_at_limit = self._count_domains_at_limit()
+        downloader = getattr(getattr(self.crawler, "engine", None), "downloader", None)
+        manual_active = sum(
+            "manual_bulk_crawl_job_id" in r.meta for r in getattr(downloader, "active", ()) or ()
+        )
+        stats = self.crawler.stats
+        consumer = self.manual_bulk_crawls
 
         logger.info(
             "spider.heartbeat",
@@ -344,6 +354,14 @@ class HtmlSpider(scrapy.Spider):
                 "engine_slot_inprogress": scheduler_runtime["engine_slot_inprogress"],
                 "scheduler_size": scheduler_runtime["scheduler_size"],
                 "domains_at_limit": domains_at_limit,
+                # Per-source counters; dequeued and save totals are cumulative.
+                "manual_active": manual_active,
+                "normal_active": len(getattr(downloader, "active", ()) or ()) - manual_active,
+                "manual_outstanding": len(consumer.inflight),
+                "dequeued_normal": stats.get_value("scheduler/dequeued/normal", 0),
+                "dequeued_manual": stats.get_value("scheduler/dequeued/manual", 0),
+                "manual_saves": consumer.saves,
+                "manual_save_ms": round(consumer.save_seconds * 1000),
             },
         )
 
@@ -461,6 +479,7 @@ class HtmlSpider(scrapy.Spider):
                 "domain": host_of(url),
                 "fail_reason": item["fail_reason"],
                 "status": status,
+                "source": "normal",
             },
         )
         self._finish_owned_request(reason="errback", domain_id=track_domain_id)
@@ -484,6 +503,7 @@ class HtmlSpider(scrapy.Spider):
                 "event": "request.start",
                 "url": request.url,
                 "domain": host_of(request.url),
+                "source": _source(request),
             },
         )
     def req_end(self, response, request):
@@ -501,6 +521,7 @@ class HtmlSpider(scrapy.Spider):
                 "event": "request.end",
                 "url": request.url,
                 "domain": host_of(request.url),
+                "source": _source(request),
                 "status": response.status,
                 "latency_ms": downloader_total_ms,
                 "download_latency_ms": download_latency_ms,

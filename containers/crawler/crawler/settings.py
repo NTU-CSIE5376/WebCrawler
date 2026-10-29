@@ -11,8 +11,10 @@ ROBOTSTXT_OBEY = True
 
 DUPEFILTER_CLASS = "scrapy.dupefilters.BaseDupeFilter" # Disable dupefilter
 
-# One dispatch policy for all jobs on this crawler; balanced alternates sources.
-MANUAL_BULK_CRAWL_SCHEDULING_POLICY = os.getenv("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", "manual_first")
+# One dispatch policy for all jobs on this crawler; weighted gives manual work
+# MANUAL_BULK_CRAWL_SHARE_PERCENT of the dispatches while both sources have work.
+MANUAL_BULK_CRAWL_SCHEDULING_POLICY = os.getenv("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", "weighted")
+MANUAL_BULK_CRAWL_SHARE_PERCENT = int(os.getenv("MANUAL_BULK_CRAWL_SHARE_PERCENT", "50"))
 # FIFO keeps newly fed
 # requests from overtaking older ones at the same priority, including startup.
 SCHEDULER = "crawler.fair_scheduler.FairScheduler"
@@ -128,4 +130,6 @@ MANUAL_BULK_CRAWL_QUEUE_DIR = os.getenv(
     "CRAWLER_MANUAL_BULK_CRAWL_QUEUE_DIR", "/data/manual_bulk_crawls/pending",
 )
 MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS = int(os.getenv("CRAWLER_MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS", "64"))
+# Outstanding manual requests per host: latency / delay rounded up, plus this headroom.
+MANUAL_BULK_CRAWL_HOST_HEADROOM = int(os.getenv("CRAWLER_MANUAL_BULK_CRAWL_HOST_HEADROOM", "1"))
 INTERVAL_MINUTES = 10
