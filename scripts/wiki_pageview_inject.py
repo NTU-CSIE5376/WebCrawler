@@ -793,8 +793,16 @@ def current_upsert_sql(shard_id: int, source_golden: int) -> str:
         WHEN {tcur}.source = {int(source_golden)} THEN {tcur}.source
         ELSE EXCLUDED.source
       END
-    RETURNING url, (xmax = 0) AS inserted
+    RETURNING url
     """
+
+
+def existing_urls_sql(shard_id: int) -> str:
+    # xmax is not available on all PG-wire-compatible targets (e.g. YSQL), so
+    # "newly inserted vs. pre-existing" is determined from a pre-upsert
+    # existence check rather than RETURNING ... (xmax = 0).
+    tcur = f"url_state_current_{shard_id:03d}"
+    return f"SELECT url FROM {tcur} WHERE url = ANY(%s)"
 
 
 def history_insert_sql(shard_id: int) -> str:
@@ -819,6 +827,8 @@ def inject_pageview_batch(
         (row.url, row.domain_id, row.domain_score, row.url_score, row.source)
         for row in rows
     ]
+    crawler_cur.execute(existing_urls_sql(shard_id), ([row.url for row in rows],))
+    existing_before = {r[0] for r in crawler_cur.fetchall()}
     returned = execute_values(
         crawler_cur,
         current_upsert_sql(shard_id, source_golden),
@@ -826,7 +836,7 @@ def inject_pageview_batch(
         page_size=len(values),
         fetch=True,
     )
-    inserted_urls = {url for url, inserted in returned if inserted}
+    inserted_urls = {url for (url,) in returned} - existing_before
     if inserted_urls:
         history_rows = [row for row in values if row[0] in inserted_urls]
         execute_values(
