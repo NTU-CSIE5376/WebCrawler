@@ -20,6 +20,13 @@ import psycopg2
 
 from constants import CRAWLERDB, NUM_SHARDS
 
+# YSQL does not support DROP INDEX CONCURRENTLY at all (unlike CREATE INDEX
+# CONCURRENTLY, which it does support): "DROP INDEX CONCURRENTLY not
+# supported yet" (psycopg2.errors.FeatureNotSupported). Fall back to a plain
+# DROP INDEX there; CONCURRENTLY is still tried first so real PostgreSQL
+# (production today) keeps the non-blocking drop.
+_CONCURRENTLY_UNSUPPORTED = "drop index concurrently not supported"
+
 
 def main() -> None:
     p = argparse.ArgumentParser(
@@ -52,7 +59,12 @@ def main() -> None:
                 print(f"  [DRY-RUN] {name}  size={size_str}")
             else:
                 t0 = time.time()
-                cur.execute(sql)
+                try:
+                    cur.execute(sql)
+                except psycopg2.errors.FeatureNotSupported as e:
+                    if _CONCURRENTLY_UNSUPPORTED not in str(e).lower():
+                        raise
+                    cur.execute(f"DROP INDEX IF EXISTS {name}")
                 print(f"  dropped {name}  ({time.time() - t0:.1f}s)")
             dropped += 1
     finally:
