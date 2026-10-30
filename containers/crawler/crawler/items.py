@@ -14,4 +14,6 @@ class PageItem(scrapy.Item):
     redirect_hop_count = scrapy.Field() # number of redirect hops before final response
     hreflang_count = scrapy.Field() # number of alternate hreflang links in HTML
     has_json_ld = scrapy.Field() # bool, page has >=1 <script type="application/ld+json">
+    requested_url = scrapy.Field() # url string as scheduled (url_state_current key); differs from url after a redirect or for a non-canonical row
+    requested_domain_id = scrapy.Field() # domain_id of the scheduled row (from the offerer queue file)
 

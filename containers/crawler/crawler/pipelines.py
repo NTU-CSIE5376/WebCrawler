@@ -69,6 +69,8 @@ class JsonPipeline:
             "cache_control": item.get("cache_control"),
             "is_redirect": item.get("is_redirect"),
             "redirect_hop_count": item.get("redirect_hop_count"),
+            "requested_url": item.get("requested_url"),
+            "requested_domain_id": item.get("requested_domain_id"),
         }
 
         append_jsonl(path, rec)

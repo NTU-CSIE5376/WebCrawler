@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Optional, Set, Tuple
 
 
 logger = logging.getLogger("router")
@@ -32,6 +32,32 @@ from .domain_resolver import DomainResolver
 
 def sha1_hex(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8", errors="replace")).hexdigest()
+
+
+# Record status for "this fetch result belongs to the scheduled row too".
+# The ingestor only UPDATEs an existing row with it (see IngestDB._bulk_requested).
+STATUS_REQUESTED = "requested"
+
+
+def build_requested_record(rec: Dict[str, Any], requested_url: str, shard_id: int) -> Dict[str, Any]:
+    """Carry the fetch outcome back to the url_state_current row the spider was
+    asked to fetch, when the result itself is keyed under another URL: after an
+    HTTP redirect (result lands on canonicalize_url(response.url)), or when the
+    scheduled row is stored under a non-canonical string (e.g. raw golden URLs
+    injected before golden_inject canonicalized them). Without this the
+    scheduled row never gets last_fetch_ok and reads as "never crawled"."""
+    return {
+        "status": STATUS_REQUESTED,
+        "url": requested_url,
+        "shard_id": shard_id,
+        "domain_id": rec.get("requested_domain_id"),
+        "fetched_at": rec.get("fetched_at"),
+        "result_status": rec.get("status"),
+        "fail_reason": rec.get("fail_reason"),
+        "final_url": rec.get("url"),
+        "is_redirect": rec.get("is_redirect"),
+        "redirect_hop_count": rec.get("redirect_hop_count"),
+    }
 
 @dataclass(frozen=True)
 class RouterConfig:
@@ -98,6 +124,8 @@ class RouterService:
         file_cnt = 0
 
         domain_cache = {}
+        # domain_id -> shard_id of the scheduled row, for STATUS_REQUESTED records
+        requested_shard_cache: Dict[int, int] = {}
 
         for f in folder.iterdir():
             if not f.is_file():
@@ -150,6 +178,8 @@ class RouterService:
                                     if l:
                                         new_outlinks.append(l)
 
+                                requested = self._requested_row(sess, rec, requested_shard_cache)
+
                         out = {
                             "url": rec.get("url"),
                             "status": status,
@@ -174,6 +204,13 @@ class RouterService:
                         out_dir.mkdir(parents=True, exist_ok=True)
                         out_path = out_dir / f"{datetime.now(timezone.utc).strftime('%H%M')}_router{self.cfg.router_id:02d}.jsonl"
                         append_jsonl(out_path, out)
+
+                        if requested:
+                            req_url, req_shard = requested
+                            req_dir = self._out_dir(self.sharder.shard_to_ingestor(req_shard))
+                            req_dir.mkdir(parents=True, exist_ok=True)
+                            req_path = req_dir / f"{datetime.now(timezone.utc).strftime('%H%M')}_router{self.cfg.router_id:02d}.jsonl"
+                            append_jsonl(req_path, build_requested_record(rec, req_url, req_shard))
                         break # success
 
                     except (OperationalError, InterfaceError) as e:
@@ -225,6 +262,32 @@ class RouterService:
                 "errors": error,
             },
         )
+
+    def _requested_row(
+        self, sess, rec: Dict[str, Any], shard_cache: Dict[int, int]
+    ) -> Optional[Tuple[str, int]]:
+        """(url, shard_id) of the scheduled row when the result is written under
+        a different URL, else None. The shard comes from the scheduled row's own
+        domain_id (domain_state.shard_id), not from re-hashing its host: rows
+        written by older inject scripts can sit in a different shard than the
+        router would pick today."""
+        req_url = rec.get("requested_url")
+        if not req_url or req_url == rec.get("url"):
+            return None
+
+        domain_id = int(rec.get("requested_domain_id") or 0)
+        shard_id = shard_cache.get(domain_id) if domain_id else None
+        if shard_id is None and domain_id:
+            row = sess.execute(
+                text("SELECT shard_id FROM domain_state WHERE domain_id = :d"),
+                {"d": domain_id},
+            ).first()
+            if row is not None:
+                shard_id = int(row.shard_id)
+                shard_cache[domain_id] = shard_id
+        if shard_id is None:
+            shard_id = self.sharder.domain_to_shard(host_of(req_url))
+        return req_url, shard_id
 
     def _parent_url_score(self, sess, shard_id: int, src_url: Optional[str]) -> Optional[float]:
         """url_score of the parent page (the crawled page that emitted these

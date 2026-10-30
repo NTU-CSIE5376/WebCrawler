@@ -35,6 +35,11 @@ ROBOTS_ALLOWED = 1
 ROBOTS_DISALLOWED = 2
 ROBOTS_FAIL_PREFIX = "IgnoreRequest Forbidden by robots.txt"
 
+# Written by the router when a fetch result is keyed under a different URL than
+# the row that was scheduled (redirect / non-canonical row). See
+# containers/scheduler_ingest/router/service.py:build_requested_record.
+STATUS_REQUESTED = "requested"
+
 
 # Fail reasons that are highly concentrated on specific domains: once a
 # domain is failing for one of these, nearly all its URLs will too. Pause
@@ -495,6 +500,60 @@ class IngestDB:
             results.extend(self._bulk_results_unique(cur, shard_id, sub))
         return results
 
+    def _bulk_requested(self, cur, shard_id: int, items: list[tuple[int, dict]]) -> None:
+        """Copy the fetch outcome onto the row that was scheduled, when the
+        result itself was written under another URL (HTTP redirect, or a row
+        stored under a non-canonical string). UPDATE only: a scheduled row
+        always exists, and if it was since deleted there is nothing to fix.
+
+        Only the outcome columns are touched. Fetch counters, url_event_counter,
+        history and domain pause are left to the result row so one fetch is not
+        counted twice. should_crawl is already FALSE (set by the offerer).
+        """
+        if not items:
+            return
+
+        tcur = self._tcur(shard_id)
+
+        # One row per url (UPDATE ... FROM VALUES picks an arbitrary match on
+        # duplicates); prefer a successful fetch, then the latest one.
+        def rank(rec: dict) -> tuple[bool, str]:
+            return rec.get("result_status") == "ok", rec.get("fetched_at") or ""
+
+        by_url: dict[str, dict] = {}
+        for _, rec in items:
+            prev = by_url.get(rec["url"])
+            if prev is None or rank(rec) >= rank(prev):
+                by_url[rec["url"]] = rec
+
+        rows = []
+        for url, rec in by_url.items():
+            is_ok = rec.get("result_status") == "ok"
+            fetched_at = self._parse_optional_datetime(rec.get("fetched_at")) or datetime.now(timezone.utc)
+            rows.append((
+                url,
+                fetched_at if is_ok else None,
+                None if is_ok else rec.get("fail_reason"),
+                rec.get("is_redirect"),
+                rec.get("redirect_hop_count"),
+            ))
+
+        execute_values(
+            cur,
+            f"""
+            UPDATE {tcur} AS t SET
+              last_fetch_ok = COALESCE(v.last_fetch_ok, t.last_fetch_ok),
+              last_fail_reason = v.last_fail_reason,
+              is_redirect = COALESCE(v.is_redirect, t.is_redirect),
+              redirect_hop_count = COALESCE(v.redirect_hop_count, t.redirect_hop_count)
+            FROM (VALUES %s) AS v(url, last_fetch_ok, last_fail_reason, is_redirect, redirect_hop_count)
+            WHERE t.url = v.url
+            """,
+            rows,
+            template="(%s, %s::timestamptz, %s::varchar, %s::boolean, %s::smallint)",
+            page_size=len(rows),
+        )
+
     def _bulk_links(
         self, cur, shard_id: int, items: list[tuple[int, dict]],
     ) -> list[tuple[int, bool]]:
@@ -663,17 +722,21 @@ class IngestDB:
 
         All-or-nothing: any failure rolls back and re-raises.
         Returns IngestResult for results, bool for new links, in input order.
+        STATUS_REQUESTED records return None (not counted in stats).
         """
         results: list[IngestResult | bool | None] = [None] * len(recs)
 
         results_by_shard: dict[int, list[tuple[int, dict]]] = defaultdict(list)
         links_by_shard: dict[int, list[tuple[int, dict]]] = defaultdict(list)
+        requested_by_shard: dict[int, list[tuple[int, dict]]] = defaultdict(list)
         for i, rec in enumerate(recs):
             if len(rec.get("url", "")) > MAX_URL_LEN:
                 continue
             sid = int(rec["shard_id"])
             if rec.get("status") == "new":
                 links_by_shard[sid].append((i, rec))
+            elif rec.get("status") == STATUS_REQUESTED:
+                requested_by_shard[sid].append((i, rec))
             else:
                 results_by_shard[sid].append((i, rec))
 
@@ -688,4 +751,6 @@ class IngestDB:
                 for sid, items in results_by_shard.items():
                     for idx, ir in self._bulk_results(cur, sid, items):
                         results[idx] = ir
+                for sid, items in requested_by_shard.items():
+                    self._bulk_requested(cur, sid, items)
         return results

@@ -58,9 +58,17 @@ Notes:
       "domain": "another.example",
       "anchor": "read more"
     }
-  ]
+  ],
+  "requested_url": "http://example.com/page",
+  "requested_domain_id": 55
 }
 ```
+
+`url` is `canonicalize_url(response.url)`, i.e. the page after redirects.
+`requested_url` is the string the offerer queued (the `url_state_current` key
+of the scheduled row) and `requested_domain_id` is that row's `domain_id`.
+They differ from `url` after an HTTP redirect, or when the scheduled row is
+stored under a non-canonical string.
 
 ### Router Output Record (result)
 
@@ -106,6 +114,36 @@ in the future SHOULD reuse the builder rather than hand-roll the dict,
 so the schema stays in sync with the ingestor's `_bulk_links` reader.
 `URL → (shard_id, ingestor_id)` routing is shared the same way through
 `libs/db/sharding/router.py:ShardRouter`.
+
+### Router Output Record (scheduled row of a redirected result)
+
+Emitted in addition to the result record when `requested_url != url`, into
+the ingestor directory of the scheduled row's shard (looked up from
+`domain_state.shard_id` of `requested_domain_id`; host routing is the
+fallback). Built by `router/service.py:build_requested_record(...)`.
+
+```json
+{
+  "url": "http://example.com/page",
+  "status": "requested",
+  "shard_id": 12,
+  "domain_id": 55,
+  "fetched_at": "2026-01-01T01:02:03+00:00",
+  "result_status": "ok",
+  "fail_reason": null,
+  "final_url": "https://example.com/page",
+  "is_redirect": true,
+  "redirect_hop_count": 1
+}
+```
+
+The ingestor (`IngestDB._bulk_requested`) only UPDATEs an existing row with
+it: `last_fetch_ok` (on `ok`), `last_fail_reason`, `is_redirect`,
+`redirect_hop_count`. Fetch counters, `url_event_counter`, history and domain
+pause stay with the result row so one fetch is counted once. Without it the
+scheduled row keeps `last_fetch_ok = NULL` forever.
+
+The feature extractor ignores these records (it only reads `status = "ok"`).
 
 ### Stats Delta (`*.json`)
 
