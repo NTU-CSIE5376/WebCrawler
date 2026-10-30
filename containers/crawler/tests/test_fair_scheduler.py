@@ -245,7 +245,7 @@ def longest_run(served, flow):
     return best
 
 
-@pytest.mark.parametrize("share", [25, 50, 75])
+@pytest.mark.parametrize("share", [20, 25, 50, 75])
 def test_weighted_gives_manual_its_share_while_both_have_work(scheduler_factory, share):
     scheduler = scheduler_factory(policy="weighted", share=share)
     served = refilled(scheduler, 10_000)

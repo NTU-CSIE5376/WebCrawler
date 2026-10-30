@@ -5,8 +5,11 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from scrapy import Spider
+from scrapy.core.downloader import Downloader
 from scrapy.http import HtmlResponse
 from scrapy.settings import Settings
+from scrapy.utils.test import get_crawler
 
 from containers.crawler.crawler.manual_bulk_crawls import ManualBulkCrawlConsumer
 from libs.ipc import manual_bulk_crawl as storage
@@ -302,6 +305,31 @@ def test_host_cap_follows_the_slot_delay(queue, headroom, latency, delay, in_tra
         assert len(requests) == in_transfer + headroom
     finally:
         consumer.close()
+
+
+def test_manual_and_normal_requests_share_the_hostname_slot(queue, monkeypatch):
+    # One slot per hostname means one AutoThrottle delay, so manual work cannot add a second rate.
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    from crawler.spiders.spider import HtmlSpider
+
+    enqueue, factory, _ = queue
+    enqueue("a", urls=["https://www.espn.com/nba/1"])
+    consumer, requests = factory()
+    crawler = get_crawler(Spider, {"AUTOTHROTTLE_ENABLED": True, "DOWNLOAD_DELAY": 0.25,
+                                   "CONCURRENT_REQUESTS_PER_DOMAIN": 16})
+    crawler.spider = Spider(name="slot-test")
+    downloader = Downloader(crawler)
+    spider = SimpleNamespace(_domain_pending={}, parse=None, errback=None)
+    normal = HtmlSpider._build_request(spider, "https://www.espn.com/nba/2", 7)
+    try:
+        consumer.poll()
+        manual_key, manual_slot = downloader._get_slot(requests[0])
+        normal_key, normal_slot = downloader._get_slot(normal)
+        assert manual_key == normal_key == "www.espn.com"
+        assert manual_slot is normal_slot
+    finally:
+        consumer.close()
+        downloader.close()
 
 
 def test_host_cap_never_exceeds_slot_concurrency_and_zero_delay_is_uncapped(queue):
