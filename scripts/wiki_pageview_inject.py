@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-"""Weekly script: download Wikimedia pageviews, extract Top-K URLs, and inject
-them into crawlerdb with pageview-based scheduler priority."""
+"""Weekly script: download Wikimedia pageviews, extract the Top-K Wikipedia
+articles, and inject them into crawlerdb with pageview-based scheduler priority.
+
+Ranking uses the `user` agent dump (human traffic) by default and sums each
+article's views across access methods (desktop / mobile-web / mobile-app)."""
 from __future__ import annotations
 
 import argparse
@@ -15,12 +18,19 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
-N = 1000000
+DEFAULT_TOP_K = 1_000_000
+AGENTS = ("user", "automated")
+DEFAULT_AGENT = "user"
+TOP_PROJECT_SUFFIX = b".wikipedia"
+# Dump rows that are not crawlable articles: unknown title, and the English
+# Special: namespace (e.g. Special:Search sits near the top every day).
+NON_ARTICLE_TITLES = {"-"}
+NON_ARTICLE_PREFIXES = ("Special:",)
 BASE_URL = "https://dumps.wikimedia.org/other/pageview_complete"
 MAX_URL_LEN = 2500
 DEFAULT_INJECT_BATCH_SIZE = 1000
@@ -38,8 +48,11 @@ INGEST_CONFIG = (
     WEBCRAWLER_DIR / "containers/scheduler_ingest/config/ingest.yaml"
 )
 
-DUMP_ARTIFACT_RE = re.compile(r"^pageviews-(\d{8})-automated\.bz2(?:\.part)?$")
-TOP_ARTIFACT_RE = re.compile(r"^top\d+_pageviews_(\d{8})\.txt(?:\.part)?$")
+DUMP_ARTIFACT_RE = re.compile(r"^pageviews-(\d{8})-(?:user|automated)\.bz2(?:\.part)?$")
+TOP_ARTIFACT_RE = re.compile(
+    r"^top\d+_pageviews_(\d{8})(?:_(?:user|automated))?\.txt(?:\.part)?$"
+)
+PRIORITY_ARTIFACT_RE = re.compile(r"^priority_(\d{8})_(user|automated)\.txt(?:\.part)?$")
 CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+|\*)$")
 
 
@@ -71,6 +84,10 @@ class InjectionStats:
     dry_run_urls: int = 0
     inserted: int = 0
     updated: int = 0
+    skipped: int = 0
+    demote_candidates: int = 0
+    demoted: int = 0
+    priority_urls: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -143,11 +160,12 @@ def fetch_listing(
 
 def latest_available_date(
     *,
+    agent: str = DEFAULT_AGENT,
     retries: int = DEFAULT_DOWNLOAD_RETRIES,
     backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS,
 ) -> datetime:
     today = datetime.now()
-    for day_offset in range(2, 10):
+    for day_offset in range(1, 10):
         dt = today - timedelta(days=day_offset)
         year = dt.strftime("%Y")
         month = dt.strftime("%m")
@@ -163,9 +181,9 @@ def latest_available_date(
                 raise
             continue
         pattern = re.escape(dt.strftime("%Y%m%d"))
-        if re.search(rf"pageviews-{pattern}-automated\.bz2", html):
+        if re.search(rf"pageviews-{pattern}-{re.escape(agent)}\.bz2", html):
             return dt
-    raise RuntimeError("no recent automated pageview dump found")
+    raise RuntimeError(f"no recent {agent} pageview dump found")
 
 
 def parse_pageview_dump_views(line: bytes) -> int | None:
@@ -484,19 +502,84 @@ def extract_project_title(line: bytes) -> tuple[str, str] | None:
     return project, rest[:next_space].decode("utf-8", errors="replace")
 
 
+def article_urls(project: str, title: str) -> list[str]:
+    host = f"{project}.org"
+    encoded_title = urllib.parse.quote(title, safe=":/(),'")
+    if project == "zh.wikipedia":
+        variants = ["zh-cn", "zh-hans", "zh-hant", "zh-tw", "zh-hk", "zh-sg"]
+        urls = [f"https://{host}/{v}/{encoded_title}" for v in variants]
+        urls.append(f"https://{host}/wiki/{encoded_title}")
+        return urls
+    return [f"https://{host}/wiki/{encoded_title}"]
+
+
 def line_to_urls(views: int, line: bytes) -> list[str]:
     parsed = extract_project_title(line)
     if parsed is None:
         return []
     project, title = parsed
-    host = f"{project}.org"
-    encoded_title = urllib.parse.quote(title, safe=":/(),'")
-    if project == "zh.wikipedia":
-        variants = ["zh-cn", "zh-hans", "zh-hant", "zh-tw"]
-        urls = [f"https://{host}/{v}/{encoded_title}\t{views}" for v in variants]
-        urls.append(f"https://{host}/wiki/{encoded_title}\t{views}")
-        return urls
-    return [f"https://{host}/wiki/{encoded_title}\t{views}"]
+    return [f"{url}\t{views}" for url in article_urls(project, title)]
+
+
+def top_articles(
+    lines,
+    n: int,
+    project_suffix: bytes = TOP_PROJECT_SUFFIX,
+) -> list[tuple[int, str, str]]:
+    """Top-n (views, project, title) articles, views summed over access methods.
+
+    Dumps are sorted by (project, title), so an article's rows are adjacent and
+    can be summed in one streaming pass with an n-sized heap. If the sort order
+    breaks, an article can enter the heap as two partial sums; those are merged
+    before ranking (a partial sum that fell out of the heap is lost, which only
+    under-counts such rare articles).
+    """
+    if n <= 0:
+        raise ValueError("n must be positive")
+    heap: list[tuple[int, bytes, bytes]] = []
+    cur: tuple[bytes, bytes] | None = None
+    cur_views = 0
+
+    def push(key: tuple[bytes, bytes], views: int) -> None:
+        item = (views, key[0], key[1])
+        if len(heap) < n:
+            heapq.heappush(heap, item)
+        elif item > heap[0]:
+            heapq.heapreplace(heap, item)
+
+    for i, line in enumerate(lines):
+        if i > 0 and i % 10_000_000 == 0:
+            print(f"  scan: {i:,} lines, heap={len(heap):,}", file=sys.stderr)
+        first_space = line.find(b" ")
+        if first_space <= 0 or not line[:first_space].endswith(project_suffix):
+            continue
+        views = parse_pageview_dump_views(line)
+        if views is None:
+            continue
+        parsed = extract_project_title(line)
+        if (
+            parsed is None
+            or parsed[1] in NON_ARTICLE_TITLES
+            or parsed[1].startswith(NON_ARTICLE_PREFIXES)
+        ):
+            continue
+        key = (parsed[0].encode(), parsed[1].encode())
+        if key != cur:
+            if cur is not None:
+                push(cur, cur_views)
+            cur, cur_views = key, 0
+        cur_views += views
+    if cur is not None:
+        push(cur, cur_views)
+
+    merged: dict[tuple[bytes, bytes], int] = defaultdict(int)
+    for views, project, title in heap:
+        merged[(project, title)] += views
+    ranked = sorted(
+        ((views, p.decode(), t.decode()) for (p, t), views in merged.items()),
+        key=lambda x: (-x[0], x[1], x[2]),
+    )
+    return ranked[:n]
 
 
 def extract_top(input_path: str | Path, output_path: str | Path, n: int) -> None:
@@ -507,63 +590,22 @@ def extract_top(input_path: str | Path, output_path: str | Path, n: int) -> None
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     part_output_path = Path(f"{output_path}.part")
-
-    print(f"Pass 1: finding threshold (top {n}) ...", file=sys.stderr)
     if part_output_path.exists():
         part_output_path.unlink()
 
+    print(f"Summing article views (top {n:,} Wikipedia articles) ...", file=sys.stderr)
     try:
-        heap: list[int] = []
         with bz2.open(input_path, "rb") as f:
-            for i, line in enumerate(f):
-                views = parse_pageview_dump_views(line)
-                if views is None:
-                    continue
-                if len(heap) < n:
-                    heapq.heappush(heap, views)
-                elif views > heap[0]:
-                    heapq.heapreplace(heap, views)
-                if i > 0 and i % 10_000_000 == 0:
-                    print(
-                        f"  pass1: {i:,} lines, heap[0]={heap[0]}",
-                        file=sys.stderr,
-                    )
-
-        if not heap:
-            raise RuntimeError(f"no valid pageview rows found in {input_path}")
-
-        threshold = heap[0]
-        print(f"Threshold: {threshold}", file=sys.stderr)
-
-        print("Pass 2: collecting lines ...", file=sys.stderr)
-        above: list[tuple[int, bytes]] = []
-        at: list[tuple[int, bytes]] = []
-        with bz2.open(input_path, "rb") as f:
-            for i, line in enumerate(f):
-                views = parse_pageview_dump_views(line)
-                if views is None:
-                    continue
-                if views > threshold:
-                    above.append((views, line))
-                elif views == threshold:
-                    at.append((views, line))
-                if i > 0 and i % 10_000_000 == 0:
-                    print(
-                        f"  pass2: {i:,} lines, above={len(above)}, at={len(at)}",
-                        file=sys.stderr,
-                    )
-
-        above.sort(key=lambda x: (-x[0], x[1]))
-        at.sort(key=lambda x: (-x[0], x[1]))
-        result = above + at[: max(0, n - len(above))]
-        result = result[:n]
+            ranked = top_articles(f, n)
+        if not ranked:
+            raise RuntimeError(f"no valid Wikipedia pageview rows found in {input_path}")
 
         print(f"Writing {part_output_path} ...", file=sys.stderr)
         count = 0
         with open(part_output_path, "w", encoding="utf-8") as out:
-            for views, line in result:
-                for url_line in line_to_urls(views, line):
-                    out.write(url_line + "\n")
+            for views, project, title in ranked:
+                for url in article_urls(project, title):
+                    out.write(f"{url}\t{views}\n")
                     count += 1
 
         max_pageviews, valid_rows = find_max_pageviews(part_output_path)
@@ -571,8 +613,11 @@ def extract_top(input_path: str | Path, output_path: str | Path, n: int) -> None
             raise RuntimeError(f"no valid extracted pageview rows in {part_output_path}")
 
         part_output_path.replace(output_path)
-        print(f"  {count} URLs written to {output_path}", file=sys.stderr)
-        print("Done.", file=sys.stderr)
+        print(
+            f"  {len(ranked):,} articles / {count:,} URLs written to {output_path} "
+            f"(views {ranked[-1][0]:,}..{ranked[0][0]:,})",
+            file=sys.stderr,
+        )
     except Exception:
         try:
             part_output_path.unlink()
@@ -665,8 +710,33 @@ def iter_injectable_pageviews(
             yield rec
 
 
+def delete_previous_dumps(data_dir: str | Path, date_str: str) -> list[Path]:
+    """Delete pageview dumps (and partials) dated before date_str.
+
+    Each run only needs its own dump once the top list is extracted, and
+    a user dump is ~730 MB, so older dumps are removed right away instead of
+    waiting for the retention window.
+    """
+    deleted = []
+    for path in Path(data_dir).iterdir():
+        match = DUMP_ARTIFACT_RE.match(path.name)
+        if not match or match.group(1) >= date_str:
+            continue
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        deleted.append(path)
+    if deleted:
+        print(
+            "Deleted previous dump(s): " + ", ".join(p.name for p in sorted(deleted)),
+            file=sys.stderr,
+        )
+    return deleted
+
+
 def artifact_date_from_name(name: str) -> datetime | None:
-    for pattern in (DUMP_ARTIFACT_RE, TOP_ARTIFACT_RE):
+    for pattern in (DUMP_ARTIFACT_RE, TOP_ARTIFACT_RE, PRIORITY_ARTIFACT_RE):
         match = pattern.match(name)
         if match:
             return datetime.strptime(match.group(1), "%Y%m%d")
@@ -782,17 +852,41 @@ def ensure_domain(crawler_cur, domain: str, shard_id: int) -> tuple[int, float]:
     return int(row[0]), float(row[1])
 
 
+# Every run the top-K list is compared against crawlerdb in this one upsert:
+#   - new URLs are inserted (should_crawl defaults to TRUE in the table);
+#   - URLs never fetched successfully (last_fetch_ok IS NULL) are put back on
+#     the schedule (should_crawl = TRUE) unless they were scheduled within the
+#     last day (likely still queued) or keep failing;
+#   - URLs already crawled and golden rows are left untouched.
+# url_score_updated_at is stamped like golden_inject.inject_url: the offerer
+# sorts rows without it last, and the ranker scorer only rescores rows with
+# url_score <= 1, so a pageview score (1, 2] stays above every ranker score and
+# below golden (3.0).
+UPSERT_TEMPLATE = "(%s, %s, %s, %s, NOW(), %s)"
+RESCHEDULE_AFTER = "1 day"
+RESCHEDULE_MAX_CONSECUTIVE_FAILS = 3
+
+
 def current_upsert_sql(shard_id: int, source_golden: int) -> str:
     tcur = f"url_state_current_{shard_id:03d}"
     return f"""
-    INSERT INTO {tcur} (url, domain_id, domain_score, url_score, source)
+    INSERT INTO {tcur} (url, domain_id, domain_score, url_score, url_score_updated_at, source)
     VALUES %s
     ON CONFLICT (url) DO UPDATE SET
       url_score = EXCLUDED.url_score,
-      source = CASE
-        WHEN {tcur}.source = {int(source_golden)} THEN {tcur}.source
-        ELSE EXCLUDED.source
-      END
+      url_score_updated_at = EXCLUDED.url_score_updated_at,
+      source = EXCLUDED.source,
+      should_crawl = TRUE
+    WHERE {tcur}.source IS DISTINCT FROM {int(source_golden)}
+      AND {tcur}.last_fetch_ok IS NULL
+      AND (
+        {tcur}.should_crawl
+        OR (
+          ({tcur}.last_scheduled IS NULL
+           OR {tcur}.last_scheduled < NOW() - INTERVAL '{RESCHEDULE_AFTER}')
+          AND COALESCE({tcur}.num_consecutive_fail, 0) < {RESCHEDULE_MAX_CONSECUTIVE_FAILS}
+        )
+      )
     RETURNING url
     """
 
@@ -803,6 +897,19 @@ def existing_urls_sql(shard_id: int) -> str:
     # existence check rather than RETURNING ... (xmax = 0).
     tcur = f"url_state_current_{shard_id:03d}"
     return f"SELECT url FROM {tcur} WHERE url = ANY(%s)"
+
+
+def demote_sql(shard_id: int, source_golden: int) -> str:
+    """Hand rows that left the priority list back to the ranker scorer."""
+    tcur = f"url_state_current_{shard_id:03d}"
+    return f"""
+    UPDATE {tcur}
+    SET url_score = NULL, url_score_updated_at = NULL
+    WHERE url = ANY(%s)
+      AND should_crawl
+      AND url_score > 1
+      AND source IS DISTINCT FROM {int(source_golden)}
+    """
 
 
 def history_insert_sql(shard_id: int) -> str:
@@ -819,9 +926,10 @@ def inject_pageview_batch(
     shard_id: int,
     rows: list[PageviewInjectRow],
     source_golden: int,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
+    """Upsert one shard batch; returns (inserted, updated, skipped)."""
     if not rows:
-        return 0, 0
+        return 0, 0, 0
 
     values = [
         (row.url, row.domain_id, row.domain_score, row.url_score, row.source)
@@ -833,6 +941,7 @@ def inject_pageview_batch(
         crawler_cur,
         current_upsert_sql(shard_id, source_golden),
         values,
+        template=UPSERT_TEMPLATE,
         page_size=len(values),
         fetch=True,
     )
@@ -845,7 +954,46 @@ def inject_pageview_batch(
             history_rows,
             page_size=len(history_rows),
         )
-    return len(inserted_urls), len(rows) - len(inserted_urls)
+    return (
+        len(inserted_urls),
+        len(returned) - len(inserted_urls),
+        len(rows) - len(returned),
+    )
+
+
+def demotion_urls(previous: set[str] | None, current: list[str]) -> list[str]:
+    """Previous run's priority URLs that are not in this run's list."""
+    if not previous:
+        return []
+    return sorted(previous.difference(current))
+
+
+def priority_list_path(data_dir: Path, date_str: str, agent: str) -> Path:
+    return data_dir / f"priority_{date_str}_{agent}.txt"
+
+
+def load_previous_priority(data_dir: Path, date_str: str, agent: str) -> set[str] | None:
+    """URLs from the newest priority list strictly before date_str, if any."""
+    candidates = []
+    for path in Path(data_dir).glob(f"priority_*_{agent}.txt"):
+        match = PRIORITY_ARTIFACT_RE.match(path.name)
+        if match and match.group(1) < date_str:
+            candidates.append((match.group(1), path))
+    if not candidates:
+        return None
+    _, path = max(candidates)
+    with open(path, encoding="utf-8") as f:
+        urls = {line.rstrip("\n") for line in f if line.strip()}
+    print(f"Previous priority list: {path} ({len(urls):,} URLs)", file=sys.stderr)
+    return urls
+
+
+def write_priority_list(path: Path, urls: list[str]) -> None:
+    part = Path(f"{path}.part")
+    with open(part, "w", encoding="utf-8") as f:
+        for url in urls:
+            f.write(url + "\n")
+    part.replace(path)
 
 
 def inject_top_pageviews(
@@ -853,7 +1001,10 @@ def inject_top_pageviews(
     *,
     dry_run: bool = False,
     batch_size: int = DEFAULT_INJECT_BATCH_SIZE,
+    previous_priority: set[str] | None = None,
 ) -> InjectionStats:
+    """Upsert this run's top URLs as priority rows, and demote the previous run's
+    priority URLs that dropped out of the list, in one transaction."""
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
 
@@ -871,7 +1022,7 @@ def inject_top_pageviews(
         rows = pending[shard_id]
         if not rows:
             return
-        inserted, updated = inject_pageview_batch(
+        inserted, updated, skipped = inject_pageview_batch(
             crawler_cur,
             deps.execute_values,
             shard_id,
@@ -880,6 +1031,7 @@ def inject_top_pageviews(
         )
         stats.inserted += inserted
         stats.updated += updated
+        stats.skipped += skipped
         rows.clear()
 
     try:
@@ -909,6 +1061,7 @@ def inject_top_pageviews(
                     domain_cache[domain] = (domain_id, shard_id, domain_score)
 
             domain_id, shard_id, domain_score = domain_cache[domain]
+            stats.priority_urls.append(rec.url)
             if dry_run:
                 stats.dry_run_urls += 1
             else:
@@ -936,6 +1089,22 @@ def inject_top_pageviews(
         if not dry_run:
             for shard_id in list(pending):
                 flush_shard(crawler_cur, shard_id)
+
+        demote = demotion_urls(previous_priority, stats.priority_urls)
+        stats.demote_candidates = len(demote)
+        demote_by_shard: dict[int, list[str]] = defaultdict(list)
+        for url in demote:
+            domain = extract_domain(url, deps.tldextract)
+            if domain:
+                demote_by_shard[
+                    deps.compute_shard(domain, deps.NUM_SHARDS, overrides, split_subdomains)
+                ].append(url)
+        if not dry_run:
+            for shard_id, urls in sorted(demote_by_shard.items()):
+                sql = demote_sql(shard_id, deps.SOURCE_GOLDEN)
+                for i in range(0, len(urls), batch_size):
+                    crawler_cur.execute(sql, (urls[i : i + batch_size],))
+                    stats.demoted += crawler_cur.rowcount
             crawler_conn.commit()
 
         action = "Would inject" if dry_run else "Injected"
@@ -945,6 +1114,8 @@ def inject_top_pageviews(
                 f"max_pageviews={stats.max_pageviews:,}, "
                 f"unique_valid={stats.queued:,}, "
                 f"inserted={stats.inserted:,}, updated={stats.updated:,}, "
+                f"skipped_golden_or_scheduled={stats.skipped:,}, "
+                f"demote_candidates={stats.demote_candidates:,}, demoted={stats.demoted:,}, "
                 f"dry_run_urls={stats.dry_run_urls:,}, "
                 f"invalid={stats.invalid:,}, duplicates={stats.duplicates:,}, "
                 f"oversized={stats.oversized:,}, bad_domain={stats.bad_domain:,}"
@@ -962,7 +1133,19 @@ def inject_top_pageviews(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download weekly Wikimedia pageviews, extract Top-K URLs, and inject crawlerdb scores."
+        description="Download weekly Wikimedia pageviews, extract the Top-K Wikipedia articles, and inject crawlerdb scores."
+    )
+    parser.add_argument(
+        "--agent",
+        choices=AGENTS,
+        default=DEFAULT_AGENT,
+        help=f"pageview_complete agent dump to rank by (default: {DEFAULT_AGENT}; 'automated' is bot traffic).",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=DEFAULT_TOP_K,
+        help=f"Number of Wikipedia articles (views summed over access methods) to inject (default: {DEFAULT_TOP_K:,}).",
     )
     parser.add_argument(
         "--data-dir",
@@ -1020,6 +1203,8 @@ def main() -> None:
         raise ValueError("--retry-backoff-seconds must be non-negative")
     if args.retention_days < 0:
         raise ValueError("--retention-days must be non-negative")
+    if args.top_k <= 0:
+        raise ValueError("--top-k must be positive")
 
     data_dir = args.data_dir
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -1027,16 +1212,17 @@ def main() -> None:
         cleanup_old_artifacts(data_dir, args.retention_days)
 
     dt = latest_available_date(
+        agent=args.agent,
         retries=args.download_retries,
         backoff_seconds=args.retry_backoff_seconds,
     )
     date_str = dt.strftime("%Y%m%d")
     year = dt.strftime("%Y")
     month = dt.strftime("%m")
-    fname = f"pageviews-{date_str}-automated.bz2"
+    fname = f"pageviews-{date_str}-{args.agent}.bz2"
     url = f"{BASE_URL}/{year}/{year}-{month}/{fname}"
     bz2_path = data_dir / fname
-    out_path = data_dir / f"top{N}_pageviews_{date_str}.txt"
+    out_path = data_dir / f"top{args.top_k}_pageviews_{date_str}_{args.agent}.txt"
 
     print(f"Target date: {date_str}", file=sys.stderr)
     print(f"Data directory: {data_dir}", file=sys.stderr)
@@ -1050,16 +1236,30 @@ def main() -> None:
                 retries=args.download_retries,
                 backoff_seconds=args.retry_backoff_seconds,
             )
-        extract_top(bz2_path, out_path, N)
+        extract_top(bz2_path, out_path, args.top_k)
+    delete_previous_dumps(data_dir, date_str)
 
     if args.skip_inject:
         print("Skipping crawlerdb injection", file=sys.stderr)
     else:
-        inject_top_pageviews(
+        previous = load_previous_priority(data_dir, date_str, args.agent)
+        if previous is None:
+            print(
+                "WARNING: no earlier priority list found; rows that left the "
+                "top list will keep their pageview score until they are crawled",
+                file=sys.stderr,
+            )
+        stats = inject_top_pageviews(
             out_path,
             dry_run=args.dry_run,
             batch_size=args.inject_batch_size,
+            previous_priority=previous,
         )
+        if not args.dry_run and stats.priority_urls:
+            write_priority_list(
+                priority_list_path(data_dir, date_str, args.agent),
+                stats.priority_urls,
+            )
 
     if not args.no_cleanup:
         cleanup_old_artifacts(data_dir, args.retention_days)
