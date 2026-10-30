@@ -1,0 +1,7 @@
+Scrapy>=2.13
+requests
+tldextract
+PyYAML==6.0.2
+python-json-logger==2.0.7
+pytest==8.4.2
+pqdict==1.5.1

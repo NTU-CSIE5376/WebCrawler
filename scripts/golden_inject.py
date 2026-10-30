@@ -107,6 +107,11 @@ def inject_url(
     # url_score_updated_at IS NOT NULL first, then url_score DESC, so goldens were being
     # buried under freshly inline-scored natural URLs on busy domains.
     tcur = f"url_state_current_{shard_id:03d}"
+    # xmax is not available on all PG-wire-compatible targets (e.g. YSQL), so
+    # "newly inserted vs. pre-existing" is determined from a pre-upsert
+    # existence check rather than RETURNING ... (xmax = 0).
+    crawler_cur.execute(f"SELECT 1 FROM {tcur} WHERE url = %s", (url,))
+    existed_before = crawler_cur.fetchone() is not None
     crawler_cur.execute(
         f"""
         INSERT INTO {tcur}
@@ -116,11 +121,10 @@ def inject_url(
             source = EXCLUDED.source,
             url_score = EXCLUDED.url_score,
             url_score_updated_at = EXCLUDED.url_score_updated_at
-        RETURNING (xmax = 0) AS inserted  -- xmax=0 iff freshly inserted (vs UPDATE path)
         """,
         (url, domain_id, domain_score, SOURCE_GOLDEN, GOLDEN_URL_SCORE),
     )
-    inserted = bool(crawler_cur.fetchone()[0])
+    inserted = not existed_before
     if not inserted:
         return False
 

@@ -141,7 +141,8 @@ Write patterns:
 - Ingestor: upserts fetch outcomes and resets/extends failure counters.
 - Router-discovered links: inserted with initial `domain_score`.
 - Golden set injection (`scripts/golden_inject.py`): inserts new URLs with `source=1`, or upserts `source=1` onto existing rows so that golden set membership is identifiable even when the crawler discovered the URL naturally first.
-- Weekly pageview injection (`scripts/wiki_pageview_inject.py`): inserts new URLs with `source=2` and `url_score = 1 + pageview / max_pageview`; existing golden rows keep `source=1`, while other existing rows are marked `source=2`. Existing rows get the refreshed pageview `url_score` without a history snapshot.
+- Weekly pageview injection (`scripts/wiki_pageview_inject.py`): upserts the top-K Wikipedia articles (default 1M, `user` agent dump, views summed across access methods) with `source=2`, `url_score = 1 + pageview / max_pageview` and `url_score_updated_at = NOW()`. Rows never fetched successfully are re-queued (`should_crawl = TRUE`) unless scheduled within the last day or failing 3+ times in a row; already-fetched rows and golden rows (`source=1`) are left untouched; new rows get a history snapshot. URLs on the previous run's priority list that dropped out are reset to `url_score = NULL, url_score_updated_at = NULL` (pending, non-golden, `url_score > 1` only) so the ranker scorer rescores them.
+- Score tiers in the offerer's per-domain pick: golden `3.0` > pageview priority `(1, 2]` > ranker `[0, 1]`. The ranker scorer never picks rows with `url_score > 1`, so it cannot overwrite either manual tier.
 
 ### `url_state_history_{shard}`
 
