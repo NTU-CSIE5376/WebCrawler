@@ -18,7 +18,8 @@ uv run scripts/migrate_add_source.py [--dry-run]
 
 - Recurring job (intended weekly).
 - Force-injects golden set URLs older than 4 weeks from metricdb into crawlerdb.
-- Shard resolution: goes through `libs.db.sharding.key.compute_shard` (single source of truth), which honors `domain_overrides` in `ingest.yaml` and `split_etld1` in `shard_split.yaml`; overrides for split eTLD+1s are stripped automatically.
+- URL key: `metric_url.url` is the raw SerpApi link; it is passed through w3lib `canonicalize_url` (same as the spider) before insert, so the injected row is the row that later receives the crawl result. Needs `w3lib` in the script environment.
+- Domain key / shard: resolved from the URL's host exactly like the router (`shard_key(host, split_subdomains)` + `compute_shard(host, ...)`): hosts in the `shard_split_subdomain` whitelist keep their full host and their own shard, everything else collapses to eTLD+1 and honors `domain_overrides` in `ingest.yaml`.
 - Writes to `domain_state`, `url_state_current_{shard}`, `url_state_history_{shard}`.
 - Existing rows are flipped to `source = 1` so golden set membership is identifiable. New rows are also mirrored into history (matches `db_ops.process_link`).
 - Does not write to metricdb.

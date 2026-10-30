@@ -14,10 +14,12 @@ from pathlib import Path
 
 import psycopg2
 import tldextract
+from w3lib.url import canonicalize_url
 
 from constants import NUM_SHARDS, CRAWLERDB, METRICDB, SOURCE_GOLDEN
 from libs.config.loader import load_yaml
-from libs.db.sharding.key import compute_shard, load_sharding_config
+from libs.db.sharding.key import compute_shard, load_sharding_config, shard_key
+from libs.db.sharding.router import host_of
 
 INJECT_AFTER_WEEKS = 4
 MAX_URL_LEN = 2500
@@ -36,17 +38,34 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 
-def domain_to_shard(domain: str, overrides: dict[str, int], split_subdomains: set[str] | None = None) -> int:
-    return compute_shard(domain, NUM_SHARDS, overrides, split_subdomains)
+def canonical_url(url: str) -> str | None:
+    # metric_url.url is the raw SerpApi link. The spider writes every row under
+    # canonicalize_url(), and url_state_current is keyed by that string, so a
+    # raw-string row would never receive its crawl result (the result lands on
+    # the canonical row instead) and would stay "scheduled, never crawled".
+    try:
+        return canonicalize_url(url)
+    except Exception:
+        return None
 
 
-def extract_domain(url: str) -> str | None:
-    # Must match crawler spider's _extract_domain (eTLD+1) so golden and
-    # natural-discovery rows share the same domain_id / shard.
-    e = tldextract.extract(url)
+def resolve_domain_and_shard(
+    url: str, overrides: dict[str, int], split_subdomains: set[str] | None = None
+) -> tuple[str, int] | None:
+    """(domain_state key, shard_id) exactly as the scheduler_ingest router
+    computes them (libs.db.sharding.router.ShardRouter), so golden rows and
+    crawl results for the same URL land in the same table under the same
+    domain_id. Hosts whitelisted in shard_split_subdomain keep their full host
+    as key and get their own shard; everything else collapses to eTLD+1.
+    Returns None when the URL has no registrable domain."""
+    host = host_of(url)
+    e = tldextract.extract(host)
     if not e.suffix or not e.domain:
         return None
-    return f"{e.domain}.{e.suffix}"
+    return (
+        shard_key(host, split_subdomains),
+        compute_shard(host, NUM_SHARDS, overrides, split_subdomains),
+    )
 
 
 def fetch_injectable_batch_ids(metric_cur) -> list[int]:
@@ -178,20 +197,30 @@ def main():
 
         # Cache domain -> (domain_id, shard_id, domain_score)
         domain_cache: dict[str, tuple[int, int, float]] = {}
+        # Several metric_url rows (batches, queries, raw spellings) can map to
+        # the same canonical URL; inject each one once.
+        seen: set[str] = set()
 
         for rec in urls:
-            url = rec["url"]
+            url = canonical_url(rec["url"])
+            if not url:
+                log.warning("Cannot canonicalize URL: %s", rec["url"])
+                failed += 1
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
             if len(url) > MAX_URL_LEN:
                 failed += 1
                 continue
-            domain = extract_domain(url)
-            if not domain:
+            resolved = resolve_domain_and_shard(url, overrides, split_subdomains)
+            if not resolved:
                 log.warning("Cannot parse domain from URL: %s", url)
                 failed += 1
                 continue
+            domain, shard_id = resolved
 
             if domain not in domain_cache:
-                shard_id = domain_to_shard(domain, overrides, split_subdomains)
                 if args.dry_run:
                     domain_cache[domain] = (0, shard_id, 0.0)
                 else:
