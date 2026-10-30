@@ -1,3 +1,4 @@
+"""Extract YouTube video outlinks from normal crawl items."""
 from __future__ import annotations
 
 import json
@@ -5,6 +6,9 @@ import logging
 import re
 from typing import Any
 from scrapy.http.response import Response
+from scrapy.utils.asyncgen import as_async_generator
+
+from ..items import PageItem
 
 logger = logging.getLogger("crawler")
 
@@ -154,3 +158,11 @@ def _yt_outlink(video_id: str) -> dict[str, str | None]:
         "domain": "youtube.com",
         "anchor": "",
     }
+
+
+class YouTubeMiddleware:
+    async def process_spider_output(self, response, result, policy):
+        async for item in as_async_generator(result):
+            if isinstance(item, PageItem) and item.get("content") is not None:
+                extract_youtube_outlinks(response, item["outlinks"])
+            yield item

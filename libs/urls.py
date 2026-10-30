@@ -15,6 +15,26 @@ def host_of(url: str | None) -> str:
     return (urlsplit(url).hostname or "").lower() if url else ""
 
 
+def normalize_hostname(hostname: str) -> str:
+    """Return an IDNA DNS name or canonical IP address, or raise ValueError.
+
+    Accepts bare hostnames, including local names and IPs used in site policies.
+    This does not enforce the public HTTP(S) URL rules in validate_url.
+    """
+    import idna
+
+    if not isinstance(hostname, str):
+        raise ValueError("Hostname must be a string")
+    try:
+        return str(ip_address(hostname))
+    except ValueError:
+        pass
+    try:
+        return idna.encode(hostname, uts46=True, std3_rules=True).decode("ascii").removesuffix(".")
+    except idna.IDNAError as error:
+        raise ValueError(f"Invalid hostname: {hostname!r}") from error
+
+
 def validate_url(url: object, *, max_length: int = MAX_URL_LEN) -> str:
     """Return a canonical absolute HTTP(S) URL or raise ValueError.
 

@@ -314,7 +314,7 @@ exposes; the 60s in-run cooldown plus 24h due-interval keep this at a
 handful of fetches/day per domain.
 
 The downstream URL crawl that those discoveries trigger inherits Scrapy's
-existing `domain_qps.json` controls — sitemap discovery does not bypass
+existing `config/site_policies.yml` controls — sitemap discovery does not bypass
 per-domain politeness on the actual page fetches.
 
 ## 8.8 Operations

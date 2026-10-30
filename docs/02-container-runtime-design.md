@@ -78,8 +78,8 @@ Runtime behavior of `golden_discovery_ranker_v1`:
 
 Runs `supervisord` with:
 
-- 15 baseline AutoThrottle spiders (`crawler_id=0..6,8..15`)
-- 1 independently configurable AutoThrottle canary spider (`crawler_id=7`)
+- 15 baseline AutoThrottle spiders (`crawler_id=0..14`)
+- 1 independently configurable AutoThrottle canary spider (`crawler_id=15`)
 - each spider reads/writes its own IPC queue/result path by `crawler_id`
 
 Crawler worker behavior:
@@ -87,10 +87,11 @@ Crawler worker behavior:
 1. Pop earliest queue batch JSON from `/data/ipc/url_queue/crawler_{id:02d}`.
 2. Delete queue file immediately after read.
 3. Crawl URLs with Scrapy AutoThrottle (robots obeyed, retries enabled).
-   - Baseline workers and the `crawler_id=7` canary currently use the same AutoThrottle values.
-   - `crawler_id=7` remains a separate supervisord program so future canary parameters can be adjusted independently.
-   - Fixed-QPS mode remains available through crawler settings when `CRAWLER_USE_AUTOTHROTTLE=false`.
-   - Scrapy scraper-slot backpressure defaults to `SCRAPER_SLOT_MAX_ACTIVE_SIZE=50000000` for every crawler worker.
+   - Baseline workers and the `crawler_id=15` canary currently use the same AutoThrottle values.
+   - `crawler_id=15` remains a separate supervisord program so future canary parameters can be adjusted independently.
+   - Domains and hosts can select fixed pacing with `crawler_mode: fixed` in `config/site_policies.yml`.
+   - Scrapy scraper-slot backpressure defaults to `SCRAPER_SLOT_MAX_ACTIVE_SIZE=50000000`; the canary uses `150000000`.
+   - Domain/host policies and site middleware behavior are documented in [Middleware](05-docker-settings-and-deployment.md#531-middleware).
 4. For each response:
    - if HTML/XHTML: save full content + extracted outlinks.
    - otherwise: emit failure record (`NonHTML content-type`).

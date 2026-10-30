@@ -126,11 +126,13 @@ def test_live_worker_crawls_only_requested_pages_and_never_emits_ingestor_result
     active = 0
     maximum = 0
     guard = Lock()
+    request_headers = []
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             nonlocal active, maximum
             hits.append(self.path)
+            request_headers.append(dict(self.headers))
             if self.path != "/robots.txt":
                 with guard:
                     active += 1
@@ -140,17 +142,17 @@ def test_live_worker_crawls_only_requested_pages_and_never_emits_ingestor_result
                     active -= 1
             if self.path == "/robots.txt":
                 body, code, mime = b"User-agent: *\nAllow: /\n", 200, "text/plain"
-            elif self.path == "/redirect":
+            elif self.path == "/wiki/redirect":
                 self.send_response(302)
-                self.send_header("Location", "/html")
+                self.send_header("Location", "/wiki/html")
                 self.end_headers()
                 return
-            elif self.path == "/missing":
+            elif self.path == "/wiki/missing":
                 body, code, mime = b"<html>missing</html>", 404, "text/html"
-            elif self.path == "/text":
+            elif self.path == "/wiki/text":
                 body, code, mime = b"plain", 200, "text/plain"
             else:
-                body, code, mime = b'<html><a href="/outlink">link</a></html>', 200, "text/html"
+                body, code, mime = b'<html><a href="/wiki/outlink">link</a></html>', 200, "text/html"
             self.send_response(code)
             self.send_header("Content-Type", mime)
             self.send_header("Content-Length", str(len(body)))
@@ -163,21 +165,33 @@ def test_live_worker_crawls_only_requested_pages_and_never_emits_ingestor_result
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    base = f"http://127.0.0.1:{server.server_port}"
+    base = f"http://en.wikipedia.org:{server.server_port}"
     # Exercise the crawler transport locally; public-host validation is tested
     # at the API boundary. No external hosts or production services are used.
-    path = enqueue(tmp_path, urls=[base + part for part in ("/redirect", "/missing", "/text")])
-    other = enqueue(tmp_path, name="another", urls=[base + "/other-job"])
+    path = enqueue(tmp_path, urls=[base + part for part in ("/wiki/redirect?oldid=123#History", "/wiki/missing", "/wiki/text")])
+    other = enqueue(tmp_path, name="another", urls=[base + "/wiki/other-job"])
     root = Path(__file__).resolve().parents[3]
     script = '''
 import sys
 from scrapy.crawler import CrawlerProcess
 from scrapy.settings import Settings
+from scrapy.resolver import dnscache
 from scrapy.utils.reactor import install_reactor
 install_reactor("twisted.internet.asyncioreactor.AsyncioSelectorReactor")
 from crawler.spiders.spider import HtmlSpider
+from crawler.site_policies import SitePolicies
+from libs.config.loader import load_yaml
+# Use the production policy file with deterministic local test limits.
+document = load_yaml("config/site_policies.yml")
+document["default"]["crawler_mode"] = "fixed"
+document["domains"]["wikipedia.org"]["crawler_mode"] = "fixed"
+document["domains"]["wikipedia.org"]["request_limits"].update(
+    max_qps=10, max_concurrent_requests=1)
+SitePolicies.load = classmethod(lambda cls: cls(document))
 import tldextract
 tldextract.extract = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)
+# Resolve the Wikipedia test hostname exclusively to this local HTTP server.
+dnscache["en.wikipedia.org"] = "127.0.0.1"
 settings = Settings()
 settings.setmodule("crawler.settings")
 settings.set("DOWNLOAD_DELAY", 0.1)
@@ -187,6 +201,8 @@ settings.set("LOG_LEVEL", "ERROR")
 settings.set("CLOSESPIDER_TIMEOUT", 4)
 settings.set("CONCURRENT_REQUESTS_PER_DOMAIN", 1, priority="cmdline")
 settings.set("DOWNLOAD_SLOTS", {}, priority="cmdline")
+settings.set("HTTPPROXY_ENABLED", False)
+settings.set("DNS_RESOLVER", "scrapy.resolver.CachingThreadedResolver")
 settings.set("MANUAL_BULK_CRAWL_QUEUE_DIR", sys.argv[1] + "/pending")
 settings.set("URL_QUEUE_TEMPLATE", sys.argv[1] + "/normal_queue/crawler_{id:02d}")
 settings.set("RESULT_DIR_TEMPLATE", sys.argv[1] + "/normal_results/crawler_{id:02d}")
@@ -196,7 +212,7 @@ process.start()
 '''
     normal = tmp_path / "normal_queue/crawler_00"
     normal.mkdir(parents=True)
-    (normal / "domain_99.json").write_text(json.dumps({"urls": [base + f"/regular/{i}" for i in range(20)]}))
+    (normal / "domain_99.json").write_text(json.dumps({"urls": [base + f"/wiki/regular/{i}?utm_source=test" for i in range(20)]}))
     try:
         result = subprocess.run([sys.executable, "-c", script, str(tmp_path)],
                                 cwd=root / "containers/crawler",
@@ -211,15 +227,20 @@ process.start()
         output = tmp_path / "results/batch/crawler_00"
         assert (output / "00000.html").read_bytes().startswith(b"<html>")
         first = json.loads((output / "00000.json").read_text())
-        assert first["url"] == base + "/redirect"
-        assert first["final_url"] == base + "/html"
+        assert first["url"] == base + "/wiki/redirect?oldid=123#History"
+        assert first["final_url"] == base + "/wiki/html"
         assert json.loads((output / "00001.json").read_text())["status_code"] == 404
         assert json.loads((output / "00002.json").read_text())["error"] == "NonHTML content-type"
-        assert "/outlink" not in hits
+        assert "/wiki/outlink" not in hits
+        assert request_headers
+        assert all("?" not in path for path in hits)
+        assert '"event": "wikipedia.url_normalized"' in result.stdout
+        assert all(headers["User-Agent"].startswith("WebCrawlerBot/") for headers in request_headers)
+        assert all("Sec-Fetch-Site" not in headers for headers in request_headers)
         records = [json.loads(line) for file in (tmp_path / "normal_results").rglob("*.jsonl")
                    for line in file.read_text().splitlines()]
         assert len(records) == 20
-        assert all(record["url"].startswith(base + "/regular/") for record in records)
+        assert all(record["url"].startswith(base + "/wiki/regular/") for record in records)
         assert all("manual_bulk_crawl_index" not in record for record in records)
         assert maximum == 1, "API and regular requests must share the same domain concurrency limit\n" + result.stderr
     finally:
