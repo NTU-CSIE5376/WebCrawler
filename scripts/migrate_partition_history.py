@@ -109,10 +109,10 @@ def migrate_shard(conn, prefix: str, shard: int, retention_days: int,
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="172.16.191.1")
-    ap.add_argument("--port", type=int, default=5432)
-    ap.add_argument("--user", default="crawler")
-    ap.add_argument("--password", default="crawler")
+    ap.add_argument("--host", default="172.16.191.3")
+    ap.add_argument("--port", type=int, default=5433)
+    ap.add_argument("--user", default="yugabyte")
+    ap.add_argument("--password", default="yugabyte")
     ap.add_argument("--dbname", default="crawlerdb")
     ap.add_argument("--prefix", default="url_state_history",
                     help="table family prefix, e.g. url_state_history")
