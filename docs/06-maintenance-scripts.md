@@ -327,14 +327,20 @@ uv run scripts/oneoff_drop_trap_frontier.py --execute --include-history
 
 ## 6.17 `wiki_pageview_inject.py`
 
-- Recurring job (intended weekly).
-- Downloads the latest available Wikimedia `pageview_complete` automated dump, extracts the top pageview URLs, and injects them into crawlerdb with pageview-derived `url_score`.
-- Stores dump and extracted artifacts under `/data/wiki_pageviews/` by default instead of the process working directory. `docker-compose.yml` mounts the same host path into `scheduler_ingest` for compose-run maintenance jobs.
-- Downloads to `*.part`, resumes incomplete dumps with HTTP `Range` requests, validates the compressed bzip2 dump, then atomically renames it into place. Transient Wikimedia/network failures keep resumable partial files and retry with exponential backoff.
-- Writes extracted top files through `*.part` and atomically renames them after validating the extracted rows.
-- Applies retention cleanup to old `pageviews-*-automated.bz2`, `top*_pageviews_*.txt`, and stale `*.part` artifacts. Default retention is 45 days; use `--retention-days` or `--no-cleanup` to adjust.
+- Recurring job, **weekly**. Each run uses one day of traffic: Wikimedia publishes the previous day's `pageview_complete` dump around 02:30 UTC, and the script picks the newest available one.
+- Ranks by the `user` agent dump (human traffic) by default; `--agent automated` (bot traffic) is kept only for comparison. Views are summed across access methods per article, only `*.wikipedia` projects are kept, and non-article titles (`-`, `Special:*`) are dropped.
+- Injects the top `--top-k` articles (default 1,000,000; zh articles expand to 7 URL variants) as scheduler priority: `url_score = 1 + views / max_views` plus `url_score_updated_at = NOW()`, which places them above ranker scores and below golden URLs.
+- Each run the whole top-K list is compared against crawlerdb in the same upsert: new URLs are inserted (`should_crawl` defaults to TRUE); URLs never fetched successfully (`last_fetch_ok IS NULL`) are put back on the schedule (`should_crawl = TRUE`) unless they were scheduled within the last day or have 3+ consecutive failures; already-crawled URLs and golden rows are not modified.
+- Writes the injected URLs to `priority_{date}_{agent}.txt`. On the next run, URLs from the newest earlier list that are no longer in the top K are handed back to the ranker (`url_score`/`url_score_updated_at` reset to NULL) in the same transaction. If no earlier list exists the script warns and skips this step.
+- Why K = 1M: in a batch 18/19 backtest (645 golden Wikipedia URLs pending in crawlerdb), ordering wikipedia.org's ~14K URLs/day by pageview crawls more pending golden URLs than the ranker at every budget from 1 to 60 days (36% vs 9% after 7 days, 66% vs 41% after 60 days). Cutting the list at a smaller K and handing the rest to the ranker never helped: after 60 days K=100K reaches 54% and K=300K 59%, against 66% for pageview order alone. The backtest uses one static list; with the weekly refresh, newly trending articles enter at high scores and are crawled first, so K mainly bounds how much of the wiki budget pageview can take from the ranker.
+- Stores dump, top, and priority files under `/data/wiki_pageviews/` by default. Downloads to `*.part`, resumes incomplete dumps with HTTP `Range` requests, validates the compressed bzip2 dump, then atomically renames it into place. Transient Wikimedia/network failures keep resumable partial files and retry with exponential backoff.
+- Deletes earlier dumps as soon as this run's top list is extracted (a `user` dump is ~730 MB).
+- Applies retention cleanup to old dumps, `top*_pageviews_*` files, priority lists, and stale `*.part` artifacts. Default retention is 45 days, which keeps the previous run's priority list for the demotion step; use `--retention-days` or `--no-cleanup` to adjust (keep it above the run interval, or demotion is skipped).
 
 ```bash
-uv run scripts/wiki_pageview_inject.py [--dry-run] [--skip-inject]
-docker compose exec scheduler_ingest python scripts/wiki_pageview_inject.py --retention-days 30
+uv run scripts/wiki_pageview_inject.py [--dry-run] [--skip-inject] [--top-k 100000] [--agent user]
+docker compose exec scheduler_ingest python scripts/wiki_pageview_inject.py
+
+# host crontab: weekly, Monday 04:30 UTC
+30 4 * * 1 cd /path/to/WebCrawler && docker compose exec -T scheduler_ingest python scripts/wiki_pageview_inject.py >> /var/log/wiki_pageview_inject.log 2>&1
 ```
