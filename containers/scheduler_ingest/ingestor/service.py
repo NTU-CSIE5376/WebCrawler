@@ -7,16 +7,24 @@ from libs.ipc.jsonio import read_json, read_jsonl
 from libs.stats.delta_writer import StatsDeltaWriter
 
 from .db_ops import IngestDB, IngestResult, BATCH_SIZE
+from .trap_filter import TrapFilter
 
 
 logger = logging.getLogger("ingestor")
 
 
 class IngestService:
-    def __init__(self, ingestor_id: int, db: IngestDB, stats: StatsDeltaWriter):
+    def __init__(
+        self,
+        ingestor_id: int,
+        db: IngestDB,
+        stats: StatsDeltaWriter,
+        trap_filter: TrapFilter | None = None,
+    ):
         self.ingestor_id = ingestor_id
         self.db = db
         self.stats = stats
+        self.trap_filter = trap_filter
 
     def _accumulate_result(self, result, counters, domains):
         if isinstance(result, bool):
@@ -68,6 +76,13 @@ class IngestService:
         link_recs = self.db.aggregate_links(
             [r for r in all_recs if r.get("status") == "new"]
         )
+        trap_dropped = url_normalized = 0
+        if self.trap_filter is not None:
+            link_recs, fstats = self.trap_filter.apply(link_recs)
+            trap_dropped, url_normalized = fstats.dropped, fstats.normalized
+            if url_normalized:
+                # Stripped variants of one page collapse into a single row.
+                link_recs = self.db.aggregate_links(link_recs)
         result_recs = [r for r in all_recs if r.get("status") != "new"]
 
         # Links before results: a url that appears as both discovery and crawl
@@ -107,6 +122,8 @@ class IngestService:
                 "num_fetch_fail": counters.get("num_fetch_fail", 0),
                 "num_content_update": counters.get("num_content_update", 0),
                 "new_links": counters.get("new_links", 0),
+                "trap_dropped": trap_dropped,
+                "url_normalized": url_normalized,
             },
         )
 
