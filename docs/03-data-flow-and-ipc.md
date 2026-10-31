@@ -379,6 +379,15 @@ Responsibilities:
   `ceil(latency / delay)` plus `MANUAL_BULK_CRAWL_HOST_HEADROOM` (default 1):
   the slot starts one request per delay, so further requests would only wait
   in the slot and count against `CONCURRENT_REQUESTS`.
+  `CRAWLER_MANUAL_BULK_CRAWL_HOST_INTERVAL` (seconds, default 0 = off) sets the
+  time between handing two manual requests for one slot to the scheduler, across
+  all jobs. The hand-offs follow a fixed grid: a timer that fires late shortens
+  the next gap, to no less than half an interval, so a busy reactor does not
+  lower the rate. A slot that falls behind by half an interval or more, as after
+  an idle spell, restarts the grid instead of catching up. A slot inside its
+  interval is not eligible, and the timer makes it eligible again. At send time,
+  gaps also vary with the time each request waits in the scheduler and the slot.
+  Downloader retries are not held back. The interval also bounds the estimated QPS.
   Among slots below their prefetch cap, select the largest estimated remaining
   service time plus the seconds the slot's oldest job has waited since
   admission, plus a fixed random jitter of less than one second per domain.

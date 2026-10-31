@@ -132,4 +132,6 @@ MANUAL_BULK_CRAWL_QUEUE_DIR = os.getenv(
 MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS = int(os.getenv("CRAWLER_MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS", "64"))
 # Outstanding manual requests per host: latency / delay rounded up, plus this headroom.
 MANUAL_BULK_CRAWL_HOST_HEADROOM = int(os.getenv("CRAWLER_MANUAL_BULK_CRAWL_HOST_HEADROOM", "1"))
+# Seconds between handing two manual requests for one host to the scheduler; 0 turns this off.
+MANUAL_BULK_CRAWL_HOST_INTERVAL = float(os.getenv("CRAWLER_MANUAL_BULK_CRAWL_HOST_INTERVAL", "0"))
 INTERVAL_MINUTES = 10
