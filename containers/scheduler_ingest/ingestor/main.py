@@ -15,7 +15,7 @@ from libs.scoring.golden_discovery_runtime import GoldenDiscoveryRuntimeScorer
 from libs.stats.delta_writer import StatsDeltaWriter
 
 from .service import IngestService
-from .trap_filter import TrapFilter, TrapFilterConfig
+from .trap_filter import DEFAULT_NORMALIZE_PARAMS, TrapFilter, TrapFilterConfig
 from .db_ops import IngestDB
 
 
@@ -112,14 +112,18 @@ def _load_trap_filter(raw: dict[str, Any], ingestor_id: int) -> TrapFilter | Non
     cfg = TrapFilterConfig(
         enabled=True,
         normalize=bool(tf.get("normalize", True)),
+        normalize_params=frozenset(
+            str(p).lower() for p in tf.get("normalize_params", DEFAULT_NORMALIZE_PARAMS)
+        ),
+        shadow_normalize=bool(tf.get("shadow_normalize", True)),
         drop=bool(tf.get("drop", True)),
-        normalize_generic_session_tokens=bool(tf.get("normalize_generic_session_tokens", False)),
         log_dir=log_dir_template.format(id=ingestor_id) if log_dir_template else None,
     )
     LOGGER.info(
         "ingest.trap_filter_enabled",
         extra={"event": "ingest.trap_filter_enabled", "normalize": cfg.normalize,
-               "drop": cfg.drop, "drop_rules": ",".join(sorted(cfg.drop_rules)),
+               "normalize_params": ",".join(sorted(cfg.normalize_params)),
+               "shadow_normalize": cfg.shadow_normalize, "drop": cfg.drop, "drop_rules": ",".join(sorted(cfg.drop_rules)),
                "log_dir": cfg.log_dir},
     )
     return TrapFilter(cfg)

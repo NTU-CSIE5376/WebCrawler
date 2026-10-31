@@ -27,16 +27,21 @@ ingestor:
   stats_dir: "/data/ipc/stats"
   interval_minutes: 10
 
-# Newly discovered links only (crawl results are untouched). Strips tracking
-# and named session-id params (libs/frontier/url_normalize.py), then drops
-# links hitting a high-confidence trap rule (libs/frontier/trap_rules.py
-# HIGH_CONFIDENCE). Every normalized / dropped link goes to a daily gzip JSONL
-# audit log; scripts/trap_filter_golden_check.py measures golden false kills.
+# Newly discovered links only (crawl results are untouched).
+#   normalize_params: stripped for real (libs/frontier/url_normalize.py).
+#   shadow_normalize: log what stripping every tracking / session param would
+#     change (action "would_normalize"), without applying it.
+#   drop: discard links hitting a high-confidence trap rule
+#     (libs/frontier/trap_rules.py HIGH_CONFIDENCE).
+# Every affected link goes to a daily gzip JSONL audit log;
+# scripts/trap_filter_golden_check.py measures golden false kills. Rules and
+# validation: docs/09-frontier-trap-rules.md.
 trap_filter:
   enabled: true
   normalize: true
+  normalize_params: [srsltid, jsessionid, phpsessid]
+  shadow_normalize: true
   drop: true
-  normalize_generic_session_tokens: false
   log_dir_template: "/data/ipc/trap_filter/ingestor_{id:02d}"
 
 extractor:

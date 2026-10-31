@@ -15,12 +15,12 @@ template analysis instead).
 | Group | Rules | Action at ingest (`trap_filter`, see [02.4](02-container-runtime-design.md)) |
 |---|---|---|
 | High confidence | `A_path_repeat`, `A_too_many_segments`, `B_nested_redirect`, `B_faceted`, `B_calendar` | Link dropped |
-| Duplicate class | `A_session_id`, `B_tracking_params` | Parameter stripped by `url_normalize.strip_params`, link kept |
+| Duplicate class | `A_session_id`, `B_tracking_params` | `srsltid`, `jsessionid`, `phpsessid` stripped (`normalize_params`); every other tracking / session param only logged as `would_normalize`. Link kept |
 | Medium / low | `B_big_page`, `B_big_offset`, `B_future_date`, `B_many_params`, `B_long_url`, `B_random_token` | Not acted on; signal only |
 
 The groups are `HIGH_CONFIDENCE` and `DUPLICATE_CLASS` in `trap_rules.py`.
 High-confidence rules are checked on the normalized URL, so
-`/x/x/x/?utm_source=a` is stripped first and then dropped.
+`/x/x/x/?srsltid=a` is stripped first and then dropped.
 
 ## Rule reference
 
@@ -86,15 +86,25 @@ false positives were removed:
 | `B_long_url` | percent-encoded Arabic / Hindi URLs: 0.43% of golden | length measured after decoding (0.012%) |
 | tracking params | mixed into `random_token` | split out as `B_tracking_params`, classed as duplicate |
 
-## Normalization (`url_normalize.strip_params`)
+## Normalization
 
-Stripping changes a URL's identity, so it is stricter than `A_session_id`:
+Stripping changes a URL's identity, so ingest only strips params with strong
+evidence that the page is the same without them, and shadow-logs the rest.
 
-| Class | Default |
-|---|---|
-| Tracking params (`utm_*`, `gclid`, `fbclid`, `srsltid`, …) | on |
-| Named session params (`jsessionid`, `phpsessid`, `aspsessionid*`, `cfid`, `cftoken`, `zenid`, `oscsid`) | on |
-| Generic names (`sid`, `s`, `sessionid`, …) holding a 32-hex token | **off** (`trap_filter.normalize_generic_session_tokens`); `saskatchewan.ca/…?s=<32 hex>` is a search id |
+| Param | Ingest | Evidence |
+|---|---|---|
+| `srsltid` | **stripped** | Google documents it as Merchant Center attribution only; a new value per search |
+| `;jsessionid=`, `jsessionid`, `phpsessid` | **stripped** | phase 2 duplicate check: two session variants of a page matched in 92.5% / 95.8% of fetched pairs (different-page baseline 4.9%) |
+| `utm_*`, `fbclid`, `_gl`, other tracking params | logged (`would_normalize`) | stripped vs. original matched 83% / 92% / 83% within 30 days, but most domains had no fetched pair to check |
+| `gclid` | logged | 59% match, 15 domains |
+| `oscsid`, `cfid`, `cftoken`, `zenid`, `aspsessionid*` | logged | `oscsid` 63% (3 domains); others too rare to measure |
+| `sid`, `s`, `sessionid`, … holding a 32-hex token | logged | often a session (`sid` 97% in variant pairs), but `saskatchewan.ca/…?s=<32 hex>` is a search id |
+
+The stripped set is `trap_filter.normalize_params`
+(`url_normalize.strip_named_params`); the shadow form is the full
+`url_normalize.strip_params(..., generic_session_tokens=True)`. Widen
+`normalize_params` only after the `would_normalize` golden hits and a
+same-page check on the shadow-logged URLs look clean.
 
 The rest of the query keeps its original encoding and order byte for byte.
 With PR #103, `scripts/golden_inject.py` strips `srsltid` from golden URLs
@@ -103,7 +113,7 @@ link the crawler discovers end up as the same URL.
 
 ## Checking and changing the rules
 
-- Ingest logs every dropped / normalized link; `scripts/trap_filter_golden_check.py`
+- Ingest logs every dropped / normalized / would-be-normalized link; `scripts/trap_filter_golden_check.py`
   reports golden false kills per rule ([06.18](06-maintenance-scripts.md)).
 - Before promoting a rule to `HIGH_CONFIDENCE` or changing a threshold:
   run `match_rules` over the golden URL list and a frontier sample, compare

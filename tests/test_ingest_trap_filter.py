@@ -53,28 +53,59 @@ class TrapFilterTest(unittest.TestCase):
         self.assertEqual([r["url"] for r in kept], [url])
         self.assertEqual(stats.dropped, 0)
 
-    def test_tracking_and_session_params_are_stripped(self):
+    def test_only_validated_params_are_stripped(self):
         kept, stats = _filter().apply([
-            _link("https://example.com/a?id=5&utm_source=x&srsltid=abc"),
+            _link("https://example.com/a?id=5&srsltid=abc"),
             _link("https://example.com/b;jsessionid=ABC123?x=1"),
+            _link("https://example.com/c?PHPSESSID=f00&t=2"),
         ])
-        self.assertEqual([r["url"] for r in kept],
-                         ["https://example.com/a?id=5", "https://example.com/b?x=1"])
-        self.assertEqual(stats.normalized, 2)
+        self.assertEqual([r["url"] for r in kept], [
+            "https://example.com/a?id=5", "https://example.com/b?x=1",
+            "https://example.com/c?t=2",
+        ])
+        self.assertEqual((stats.normalized, stats.would_normalize), (3, 0))
         # Other fields are carried over unchanged.
         self.assertEqual(kept[0]["domain_id"], 7)
         self.assertEqual(kept[0]["discovered_from"], "https://example.com/")
 
-    def test_generic_session_token_kept_by_default(self):
-        url = "https://forum.example.com/viewtopic.php?t=1&sid=0123456789abcdef0123456789abcdef"
-        kept, _ = _filter().apply([_link(url)])
-        self.assertEqual(kept[0]["url"], url)
-        kept, _ = _filter(normalize_generic_session_tokens=True).apply([_link(url)])
-        self.assertEqual(kept[0]["url"], "https://forum.example.com/viewtopic.php?t=1")
+    def test_other_params_are_shadow_logged_only(self):
+        urls = [
+            "https://example.com/a?id=5&utm_source=x",
+            "https://example.com/b?gclid=1",
+            "https://shop.example.com/p?oscsid=abc",
+            "https://forum.example.com/t.php?t=1&sid=0123456789abcdef0123456789abcdef",
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            kept, stats = _filter(log_dir=d).apply([_link(u) for u in urls])
+            events = list(read_audit_log(Path(d)))
+        self.assertEqual([r["url"] for r in kept], urls)
+        self.assertEqual((stats.normalized, stats.would_normalize), (0, 4))
+        self.assertEqual({e["action"] for e in events}, {"would_normalize"})
+        self.assertEqual([e["would_normalize_url"] for e in events], [
+            "https://example.com/a?id=5", "https://example.com/b",
+            "https://shop.example.com/p", "https://forum.example.com/t.php?t=1",
+        ])
+        self.assertTrue(all("normalized_url" not in e for e in events))
+
+    def test_applied_and_shadow_on_same_link(self):
+        url = "https://example.com/a?srsltid=x&utm_source=y&id=1"
+        with tempfile.TemporaryDirectory() as d:
+            kept, stats = _filter(log_dir=d).apply([_link(url)])
+            (event,) = read_audit_log(Path(d))
+        self.assertEqual(kept[0]["url"], "https://example.com/a?utm_source=y&id=1")
+        self.assertEqual((stats.normalized, stats.would_normalize), (1, 1))
+        self.assertEqual(event["action"], "normalize")
+        self.assertEqual(event["normalized_url"], "https://example.com/a?utm_source=y&id=1")
+        self.assertEqual(event["would_normalize_url"], "https://example.com/a?id=1")
+
+    def test_shadow_can_be_turned_off(self):
+        kept, stats = _filter(shadow_normalize=False).apply(
+            [_link("https://example.com/a?utm_source=x")])
+        self.assertEqual(stats.would_normalize, 0)
 
     def test_rules_run_on_normalized_url(self):
         # Trap after stripping: still dropped, and the log records both forms.
-        url = "https://example.com/x/x/x/page?utm_source=a"
+        url = "https://example.com/x/x/x/page?srsltid=a"
         with tempfile.TemporaryDirectory() as d:
             kept, stats = _filter(log_dir=d).apply([_link(url)])
             events = list(read_audit_log(Path(d)))
@@ -86,20 +117,20 @@ class TrapFilterTest(unittest.TestCase):
         self.assertEqual(events[0]["rules"], ["A_path_repeat"])
 
     def test_disabled_steps(self):
-        recs = [_link("https://example.com/a?utm_source=x"),
+        recs = [_link("https://example.com/a?srsltid=x"),
                 _link("https://example.com/x/x/x/")]
         kept, stats = _filter(drop=False).apply(recs)
         self.assertEqual(len(kept), 2)
         self.assertEqual(stats.normalized, 1)
         kept, stats = _filter(normalize=False).apply(recs)
-        self.assertEqual([r["url"] for r in kept], ["https://example.com/a?utm_source=x"])
+        self.assertEqual([r["url"] for r in kept], ["https://example.com/a?srsltid=x"])
         kept, stats = _filter(enabled=False).apply(recs)
         self.assertEqual(kept, recs)
 
     def test_audit_log_is_daily_gzip_jsonl_and_appends(self):
         with tempfile.TemporaryDirectory() as d:
             f = _filter(log_dir=d)
-            f.apply([_link("https://example.com/a?gclid=1")])
+            f.apply([_link("https://example.com/a?srsltid=1")])
             f.apply([_link("https://example.com/x/x/x/"), _link("https://example.com/ok")])
             path = Path(d) / "2026-10-31.jsonl.gz"
             self.assertTrue(path.exists())
@@ -108,7 +139,7 @@ class TrapFilterTest(unittest.TestCase):
         self.assertEqual([e["action"] for e in events], ["normalize", "drop"])
         self.assertEqual(events[0], {
             "ts": "2026-10-31T12:00:00+00:00", "action": "normalize",
-            "url": "https://example.com/a?gclid=1",
+            "url": "https://example.com/a?srsltid=1",
             "normalized_url": "https://example.com/a",
             "domain_id": 7, "shard_id": 3,
             "discovered_from": "https://example.com/",
@@ -144,8 +175,8 @@ class _FakeStats:
 class IngestServiceTrapFilterTest(unittest.TestCase):
     def test_process_folder_filters_links_but_not_results(self):
         recs = [
-            _link("https://example.com/a?utm_source=x", inlink_count_approx=1),
-            _link("https://example.com/a?gclid=2", inlink_count_approx=1),
+            _link("https://example.com/a?srsltid=x", inlink_count_approx=1),
+            _link("https://example.com/a;jsessionid=2", inlink_count_approx=1),
             _link("https://example.com/x/x/x/"),
             {"url": "https://example.com/x/x/x/?utm_source=y", "status": "ok",
              "shard_id": 3, "domain_id": 7},
@@ -159,7 +190,7 @@ class IngestServiceTrapFilterTest(unittest.TestCase):
             svc.process_folder(folder)
             events = list(read_audit_log(Path(d) / "log"))
         links, results = db.batches
-        # Both tracking variants collapse into one row with summed inlinks.
+        # Both stripped variants collapse into one row with summed inlinks.
         self.assertEqual([(r["url"], r["inlink_count_approx"]) for r in links],
                          [("https://example.com/a", 2)])
         # Crawl results keep their exact URL, even when it looks like a trap.
@@ -180,6 +211,14 @@ class GoldenMatchTest(unittest.TestCase):
                                        "normalized_url": "https://shop.example.com/p/1"}, index),
                          golden)
         self.assertIsNone(match_golden({"url": "https://shop.example.com/p/2"}, index))
+
+    def test_golden_with_utm_matches_shadow_form(self):
+        from scripts.trap_filter_golden_check import golden_index, match_golden
+        golden = "https://a.example.com/live/1/?utm_source=x"
+        index = golden_index({golden})
+        ev = {"url": "https://a.example.com/live/1/?utm_source=x&gclid=9",
+              "would_normalize_url": "https://a.example.com/live/1/"}
+        self.assertEqual(match_golden(ev, index), golden)
 
 
 if __name__ == "__main__":

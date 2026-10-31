@@ -1,6 +1,33 @@
 import unittest
 
-from libs.frontier.url_normalize import strip_params
+from libs.frontier.url_normalize import strip_named_params, strip_params
+
+
+class StripNamedParamsTest(unittest.TestCase):
+    NAMES = frozenset({"srsltid", "jsessionid", "phpsessid"})
+
+    def test_only_named_params_removed(self):
+        self.assertEqual(
+            strip_named_params("https://a.com/p?gclid=1&id=5&SRSLTID=x&utm_source=y", self.NAMES),
+            "https://a.com/p?gclid=1&id=5&utm_source=y",
+        )
+        self.assertEqual(
+            strip_named_params("https://a.com/f?PHPSESSID=abc&t=1&oscsid=z", self.NAMES),
+            "https://a.com/f?t=1&oscsid=z",
+        )
+
+    def test_path_session_only_when_named(self):
+        url = "https://a.com/x.do;jsessionid=36ED?flag=3"
+        self.assertEqual(strip_named_params(url, self.NAMES), "https://a.com/x.do?flag=3")
+        self.assertEqual(strip_named_params(url, frozenset({"srsltid"})), url)
+        self.assertEqual(
+            strip_named_params("https://a.com/x;phpsessid=1;jsessionid=2", frozenset({"jsessionid"})),
+            "https://a.com/x;phpsessid=1",
+        )
+
+    def test_unchanged_returns_same_string(self):
+        url = "https://a.com/p?q=srsltid&xsrsltid=1"
+        self.assertIs(strip_named_params(url, self.NAMES), url)
 
 
 class StripParamsTest(unittest.TestCase):

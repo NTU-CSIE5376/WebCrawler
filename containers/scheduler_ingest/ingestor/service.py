@@ -76,10 +76,11 @@ class IngestService:
         link_recs = self.db.aggregate_links(
             [r for r in all_recs if r.get("status") == "new"]
         )
-        trap_dropped = url_normalized = 0
+        trap_dropped = url_normalized = url_would_normalize = 0
         if self.trap_filter is not None:
             link_recs, fstats = self.trap_filter.apply(link_recs)
             trap_dropped, url_normalized = fstats.dropped, fstats.normalized
+            url_would_normalize = fstats.would_normalize
             if url_normalized:
                 # Stripped variants of one page collapse into a single row.
                 link_recs = self.db.aggregate_links(link_recs)
@@ -124,6 +125,7 @@ class IngestService:
                 "new_links": counters.get("new_links", 0),
                 "trap_dropped": trap_dropped,
                 "url_normalized": url_normalized,
+                "url_would_normalize": url_would_normalize,
             },
         )
 
