@@ -18,6 +18,7 @@ import tldextract
 from constants import NUM_SHARDS, CRAWLERDB, METRICDB, SOURCE_GOLDEN
 from libs.config.loader import load_yaml
 from libs.db.sharding.key import compute_shard, load_sharding_config
+from libs.urls import strip_srsltid
 
 INJECT_AFTER_WEEKS = 4
 MAX_URL_LEN = 2500
@@ -175,12 +176,16 @@ def main():
         injected = 0
         marked = 0
         failed = 0
+        normalized = 0
 
         # Cache domain -> (domain_id, shard_id, domain_score)
         domain_cache: dict[str, tuple[int, int, float]] = {}
 
         for rec in urls:
-            url = rec["url"]
+            # Golden URLs copied from Google results carry `srsltid`; inject the
+            # stripped URL so it matches the page the crawler discovers itself.
+            url = strip_srsltid(rec["url"])
+            normalized += url != rec["url"]
             if len(url) > MAX_URL_LEN:
                 failed += 1
                 continue
@@ -216,10 +221,12 @@ def main():
             crawler_conn.commit()
 
         log.info(
-            "Done: %d newly injected, %d existing URLs marked as golden, %d failed",
+            "Done: %d newly injected, %d existing URLs marked as golden, %d failed, "
+            "%d stripped of srsltid",
             injected,
             marked,
             failed,
+            normalized,
         )
 
     except Exception:
