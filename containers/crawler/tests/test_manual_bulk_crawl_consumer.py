@@ -393,6 +393,64 @@ def test_close_cancels_pending_host_interval_timers(queue, monkeypatch):
     assert not clock.getDelayedCalls()
 
 
+def test_redirects_take_later_grid_steps(queue, monkeypatch):
+    enqueue, factory, _ = queue
+    enqueue("a", urls=[f"https://paced.example/{i}" for i in range(2)])
+    consumer, requests = factory(concurrency=8, host_interval=5.0)
+    clock = paced(consumer, monkeypatch)
+    try:
+        consumer.poll()
+        clock.advance(1.0)
+        # Two hops, as RedirectMiddleware leaves them on the final request.
+        final = requests[0].replace(url="https://paced.example/0/final")
+        final.meta["redirect_times"] = 2
+        complete(consumer, final)
+        clock.advance(13.9)
+        assert len(requests) == 1, "Each hop holds one more interval: t = 1015"
+        clock.advance(0.1)
+        assert len(requests) == 2
+    finally:
+        consumer.close()
+
+
+def test_a_retried_failure_takes_a_later_grid_step(queue, monkeypatch):
+    from twisted.internet.error import TimeoutError
+    from twisted.python.failure import Failure
+
+    enqueue, factory, _ = queue
+    enqueue("a", urls=[f"https://paced.example/{i}" for i in range(2)])
+    consumer, requests = factory(concurrency=8, host_interval=5.0)
+    clock = paced(consumer, monkeypatch)
+    try:
+        consumer.poll()
+        clock.advance(1.0)
+        retried = requests[0].copy()
+        retried.meta["retry_times"] = 1
+        failure = Failure(TimeoutError())
+        failure.request = retried
+        consumer.fetch_failed(failure)
+        clock.advance(8.9)
+        assert len(requests) == 1, "The retry holds one more interval: t = 1010"
+        clock.advance(0.1)
+        assert len(requests) == 2
+    finally:
+        consumer.close()
+
+
+def test_redirects_do_not_hold_an_unpaced_host(queue):
+    enqueue, factory, _ = queue
+    enqueue("a", urls=[f"https://unpaced.example/{i}" for i in range(2)])
+    consumer, requests = factory(concurrency=1)
+    try:
+        consumer.poll()
+        final = requests[0].replace(url="https://unpaced.example/0/final")
+        final.meta["redirect_times"] = 3
+        complete(consumer, final)
+        assert len(requests) == 2
+    finally:
+        consumer.close()
+
+
 def slots(consumer, **hosts):
     """Live downloader slots: host -> (concurrency, delay)."""
     consumer.spider.crawler.engine.downloader = SimpleNamespace(slots={

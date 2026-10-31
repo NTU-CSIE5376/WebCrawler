@@ -56,6 +56,11 @@ def _float_setting(settings, name, default, minimum):
     return float(value)
 
 
+def _extra_requests(meta):
+    """Requests RedirectMiddleware and RetryMiddleware added after the one refill() sent."""
+    return int(meta.get("redirect_times") or 0) + int(meta.get("retry_times") or 0)
+
+
 class ManualBulkCrawlConsumer:
     def __init__(self, spider):
         self.spider = spider
@@ -262,6 +267,7 @@ class ManualBulkCrawlConsumer:
             error = error or "NonHTML content-type"
         self.save(response.meta["manual_bulk_crawl_job_id"], response.meta["manual_bulk_crawl_index"],
                   download_latency=response.meta.get("download_latency"),
+                  extra_requests=_extra_requests(response.meta),
                   final_url=response.url, status_code=response.status,
                   body=response.body if html else None, error=error)
 
@@ -276,17 +282,20 @@ class ManualBulkCrawlConsumer:
             return self.parse(response)
         meta = failure.request.meta
         self.save(meta["manual_bulk_crawl_job_id"], meta["manual_bulk_crawl_index"],
-                  final_url=failure.request.url, status_code=None, error=failure.type.__name__)
+                  extra_requests=_extra_requests(meta), final_url=failure.request.url, status_code=None, error=failure.type.__name__)
 
-    def _release_domain(self, job_id, index, latency=None):
+    def _release_domain(self, job_id, index, latency=None, extra_requests=0):
         host = self.inflight_domains.pop((job_id, index))
         domain = self.domains[host]
         domain.outstanding -= 1
+        if extra_requests and self.host_interval:
+            # Redirects and retries bypass refill(), so they take later grid steps instead.
+            domain.next_send = max(domain.next_send, monotonic()) + extra_requests * self.host_interval
         if latency is not None and latency > 0:
             domain.latency = 0.8 * domain.latency + 0.2 * latency
         self._refresh_priorities([host])
 
-    def save(self, job_id, index, *, download_latency=None, **result):
+    def save(self, job_id, index, *, download_latency=None, extra_requests=0, **result):
         job = self.jobs.get(job_id)
         if job is None or index not in job.inflight:
             return
@@ -305,7 +314,7 @@ class ManualBulkCrawlConsumer:
         finally:
             job.inflight.discard(index)
             self.inflight.discard((job_id, index))
-            self._release_domain(job_id, index, download_latency)
+            self._release_domain(job_id, index, download_latency, extra_requests)
             if job.failed:
                 self._discard_pending(job_id, job)
             self.release_if_drained(job_id, job)
