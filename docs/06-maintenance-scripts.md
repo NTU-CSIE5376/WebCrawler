@@ -21,6 +21,7 @@ uv run scripts/migrate_add_source.py [--dry-run]
 - Shard resolution: goes through `libs.db.sharding.key.compute_shard` (single source of truth), which honors `domain_overrides` in `ingest.yaml` and `split_etld1` in `shard_split.yaml`; overrides for split eTLD+1s are stripped automatically.
 - Writes to `domain_state`, `url_state_current_{shard}`, `url_state_history_{shard}`.
 - Existing rows are flipped to `source = 1` so golden set membership is identifiable. New rows are also mirrored into history (matches `db_ops.process_link`).
+- Google's `srsltid` is stripped before injecting (`libs.urls.strip_srsltid`); a URL with and without `srsltid` counts as the same page. If crawlerdb only holds the `srsltid` form, that row is marked golden instead of inserting the stripped URL, so the page is not stored or fetched twice.
 - Does not write to metricdb.
 
 ```bash

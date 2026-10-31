@@ -95,13 +95,23 @@ def ensure_domain(crawler_cur, domain: str, shard_id: int) -> tuple[int, float]:
     return int(row[0]), float(row[1])
 
 
+INSERTED = "inserted"
+MARKED = "marked"
+MARKED_VARIANT = "marked_variant"
+
+
 def inject_url(
-    crawler_cur, url: str, domain_id: int, shard_id: int, domain_score: float
-) -> bool:
+    crawler_cur, url: str, domain_id: int, shard_id: int, domain_score: float,
+    variant: str | None = None,
+) -> str:
     # New URL: insert into current and mirror into history (see db_ops.process_link).
     # Existing URL: update source so the row is identifiable as golden set membership,
     # even if the crawler discovered it naturally first. No history snapshot is written
-    # for source-only updates. Returns True iff a new row was inserted.
+    # for source-only updates. Returns INSERTED, MARKED or MARKED_VARIANT.
+    #
+    # `variant` is the same page under another URL (the golden URL as copied, still
+    # carrying `srsltid`). A URL with and without `srsltid` counts as one page: if
+    # only the variant row exists, mark that row instead of adding a second row.
     #
     # url_score/url_score_updated_at are stamped on both new and existing rows so the
     # offerer lifts goldens to the top of their domain's pick order: the ranker prefers
@@ -111,8 +121,12 @@ def inject_url(
     # xmax is not available on all PG-wire-compatible targets (e.g. YSQL), so
     # "newly inserted vs. pre-existing" is determined from a pre-upsert
     # existence check rather than RETURNING ... (xmax = 0).
-    crawler_cur.execute(f"SELECT 1 FROM {tcur} WHERE url = %s", (url,))
-    existed_before = crawler_cur.fetchone() is not None
+    candidates = [url] if not variant or variant == url else [url, variant]
+    crawler_cur.execute(f"SELECT url FROM {tcur} WHERE url = ANY(%s)", (candidates,))
+    present = {row[0] for row in crawler_cur.fetchall()}
+    result = MARKED if url in present else INSERTED
+    if result == INSERTED and variant in present:
+        url, result = variant, MARKED_VARIANT
     crawler_cur.execute(
         f"""
         INSERT INTO {tcur}
@@ -125,9 +139,8 @@ def inject_url(
         """,
         (url, domain_id, domain_score, SOURCE_GOLDEN, GOLDEN_URL_SCORE),
     )
-    inserted = not existed_before
-    if not inserted:
-        return False
+    if result != INSERTED:
+        return result
 
     thist = f"url_state_history_{shard_id:03d}"
     crawler_cur.execute(
@@ -137,7 +150,7 @@ def inject_url(
         """,
         (url, domain_id, domain_score, SOURCE_GOLDEN),
     )
-    return True
+    return INSERTED
 
 
 def main():
@@ -175,6 +188,7 @@ def main():
         overrides, split_subdomains = load_sharding_config(INGEST_CONFIG, crawler_conn)
         injected = 0
         marked = 0
+        marked_variant = 0
         failed = 0
         normalized = 0
 
@@ -185,7 +199,8 @@ def main():
             # Golden URLs copied from Google results carry `srsltid`; inject the
             # stripped URL so it matches the page the crawler discovers itself.
             url = strip_srsltid(rec["url"])
-            normalized += url != rec["url"]
+            variant = rec["url"] if url != rec["url"] else None
+            normalized += variant is not None
             if len(url) > MAX_URL_LEN:
                 failed += 1
                 continue
@@ -212,8 +227,13 @@ def main():
                 injected += 1
                 continue
 
-            if inject_url(crawler_cur, url, domain_id, shard_id, domain_score):
+            result = inject_url(
+                crawler_cur, url, domain_id, shard_id, domain_score, variant=variant,
+            )
+            if result == INSERTED:
                 injected += 1
+            elif result == MARKED_VARIANT:
+                marked_variant += 1
             else:
                 marked += 1
 
@@ -221,10 +241,11 @@ def main():
             crawler_conn.commit()
 
         log.info(
-            "Done: %d newly injected, %d existing URLs marked as golden, %d failed, "
-            "%d stripped of srsltid",
+            "Done: %d newly injected, %d existing URLs marked as golden "
+            "(%d of them under their srsltid form), %d failed, %d stripped of srsltid",
             injected,
-            marked,
+            marked + marked_variant,
+            marked_variant,
             failed,
             normalized,
         )
