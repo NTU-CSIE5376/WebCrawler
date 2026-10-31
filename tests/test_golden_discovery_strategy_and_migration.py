@@ -175,43 +175,49 @@ class GoldenDiscoveryOffererStrategyTest(unittest.TestCase):
 
 
 class GoldenDiscoveryPeekGlobalCandidatesTest(unittest.TestCase):
-    def test_peek_queries_domain_state_with_global_order(self):
-        rows = [
-            SimpleNamespace(domain_id=42, shard_id=3, domain_score=0.9),
-            SimpleNamespace(domain_id=17, shard_id=11, domain_score=0.5),
-        ]
+    def test_peek_issues_one_query_per_shard_and_merges_in_global_order(self):
+        # Shard 3's query returns the lower-scoring domain first (per-shard
+        # ORDER BY is local to that shard); shard 11's query returns the
+        # higher-scoring one. The merged, re-sorted result must still come
+        # out in global domain_score DESC order regardless of per-shard call
+        # order.
+        # shard range 3..11 is 9 shards; only shard 3 (call index 0) and
+        # shard 11 (call index 8, the last) return a candidate.
+        rows = [[]] * 9
+        rows[0] = [SimpleNamespace(domain_id=17, shard_id=3, domain_score=0.5)]
+        rows[8] = [SimpleNamespace(domain_id=42, shard_id=11, domain_score=0.9)]
         session = _FakeOffererSession(rows=rows)
         strategy = GoldenDiscoveryRankerV1Strategy(Session=_FakeOffererSessionFactory(session))
 
         candidates = strategy.peek_global_candidates(
             limit=10, exclude_domain_ids={99, 100},
-            shard_start=0, shard_end=15,
+            shard_start=3, shard_end=11,
         )
 
         self.assertEqual(
             [(c.domain_id, c.shard_id, c.domain_score) for c in candidates],
-            [(42, 3, 0.9), (17, 11, 0.5)],
+            [(42, 11, 0.9), (17, 3, 0.5)],
         )
 
-        sql, params = session.calls[0]
-        self.assertIn("FROM domain_state d", sql)
+        # One query per shard in range (9 shards: 3..11 inclusive), not one
+        # combined query across the whole range.
+        self.assertEqual(len(session.calls), 9)
+        first_sql, first_params = session.calls[0]
+        self.assertIn("FROM domain_state d", first_sql)
+        self.assertIn("d.shard_id = :shard_id", first_sql)
         self.assertIn(
-            "d.shard_id BETWEEN :shard_start AND :shard_end", sql,
+            "d.crawl_paused_until IS NULL OR d.crawl_paused_until <= NOW()", first_sql,
         )
         self.assertIn(
-            "d.crawl_paused_until IS NULL OR d.crawl_paused_until <= NOW()", sql,
+            "ORDER BY d.domain_score DESC NULLS LAST, d.domain_id", first_sql,
         )
-        self.assertIn(
-            "ORDER BY d.domain_score DESC NULLS LAST, d.domain_id", sql,
-        )
-        self.assertIn("LIMIT :limit", sql)
-        self.assertNotIn("FOR UPDATE", sql)
-        self.assertEqual(params["limit"], 10)
-        self.assertEqual(params["shard_start"], 0)
-        self.assertEqual(params["shard_end"], 15)
-        self.assertEqual(sorted(params["exclude_arr"]), [99, 100])
+        self.assertIn("LIMIT :limit", first_sql)
+        self.assertNotIn("FOR UPDATE", first_sql)
+        self.assertEqual(first_params["limit"], 10)
+        self.assertEqual(first_params["shard_id"], 3)
+        self.assertEqual(sorted(first_params["exclude_arr"]), [99, 100])
 
-    def test_peek_emits_per_shard_exists_subqueries(self):
+    def test_peek_scopes_each_query_to_its_own_shard_partition(self):
         session = _FakeOffererSession(rows=[])
         strategy = GoldenDiscoveryRankerV1Strategy(Session=_FakeOffererSessionFactory(session))
 
@@ -220,28 +226,21 @@ class GoldenDiscoveryPeekGlobalCandidatesTest(unittest.TestCase):
             shard_start=2, shard_end=4,
         )
 
-        sql, _ = session.calls[0]
-        # Each shard in the range has a guarded EXISTS subquery pointing at its
-        # url_state_current_NNN partition. Only the matching shard's branch is
-        # evaluated per domain_state row.
-        self.assertIn(
-            "(d.shard_id = 2 AND EXISTS (SELECT 1 FROM url_state_current_002 u "
-            "WHERE u.domain_id = d.domain_id AND u.should_crawl = TRUE))",
-            sql,
-        )
-        self.assertIn(
-            "(d.shard_id = 3 AND EXISTS (SELECT 1 FROM url_state_current_003 u "
-            "WHERE u.domain_id = d.domain_id AND u.should_crawl = TRUE))",
-            sql,
-        )
-        self.assertIn(
-            "(d.shard_id = 4 AND EXISTS (SELECT 1 FROM url_state_current_004 u "
-            "WHERE u.domain_id = d.domain_id AND u.should_crawl = TRUE))",
-            sql,
-        )
-        # Shards outside the range must not appear.
-        self.assertNotIn("url_state_current_001", sql)
-        self.assertNotIn("url_state_current_005", sql)
+        # One query per shard, each scoped to that shard's own
+        # url_state_current_NNN partition via a plain EXISTS (no OR chain
+        # across shards, which is what made the combined query slow on YSQL).
+        self.assertEqual(len(session.calls), 3)
+        shard_ids = [params["shard_id"] for _, params in session.calls]
+        self.assertEqual(shard_ids, [2, 3, 4])
+
+        sql_2, _ = session.calls[0]
+        self.assertIn("url_state_current_002", sql_2)
+        self.assertNotIn("url_state_current_003", sql_2)
+        self.assertNotIn("url_state_current_004", sql_2)
+        # No cross-shard OR chain (the pattern that made the combined query
+        # slow on YSQL) — only the benign crawl_paused_until OR remains.
+        self.assertNotIn("d.shard_id = 3", sql_2)
+        self.assertNotIn("d.shard_id = 4", sql_2)
 
     def test_peek_returns_empty_when_limit_is_zero(self):
         session = _FakeOffererSession()
@@ -277,8 +276,9 @@ class GoldenDiscoveryPeekGlobalCandidatesTest(unittest.TestCase):
         )
 
         self.assertEqual(candidates, [])
-        _, params = session.calls[0]
-        self.assertEqual(params["exclude_arr"], [])
+        sql, params = session.calls[0]
+        self.assertNotIn("exclude_arr", params)
+        self.assertNotIn("domain_id <>", sql)
 
 
 class GoldenDiscoveryClaimDomainUrlsTest(unittest.TestCase):

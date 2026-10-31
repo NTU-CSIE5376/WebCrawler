@@ -132,38 +132,50 @@ class GoldenDiscoveryRankerV1Strategy(SelectionStrategy):
         if limit <= 0 or shard_start > shard_end:
             return []
 
-        # Per-shard EXISTS predicates: filter out domains whose owning shard
-        # has no should_crawl=TRUE URL right now. Only the OR branch whose
-        # shard_id matches `d.shard_id` is evaluated per row (the others short
-        # circuit), so each candidate costs at most one partial-index probe.
-        shard_exists = " OR ".join(
-            f"(d.shard_id = {sid} AND EXISTS ("
-            f"SELECT 1 FROM url_state_current_{sid:03d} u "
-            f"WHERE u.domain_id = d.domain_id AND u.should_crawl = TRUE"
-            f"))"
-            for sid in range(shard_start, shard_end + 1)
-        )
+        # One query per shard instead of a single domain_state scan guarded by
+        # an OR of per-shard EXISTS branches. On PostgreSQL the planner only
+        # evaluates the OR branch whose shard_id matches a given row, but on
+        # YSQL it does not short-circuit that way: it can fall back to a full
+        # domain_state scan that probes all (shard_end - shard_start + 1)
+        # EXISTS subqueries per row, which is catastrophically slow at
+        # production scale (observed: single peek taking minutes instead of
+        # sub-second). Splitting by shard lets each query hit
+        # idx_domain_state_shard_score (shard_id, domain_score DESC, domain_id)
+        # directly. Results are merged and re-sorted in Python so the output
+        # is identical to the original single-query ordering (domain_score
+        # DESC NULLS LAST, domain_id) and LIMIT.
+        exclude_clause = ""
+        base_params: dict = {"limit": limit}
+        if exclude_domain_ids:
+            exclude_clause = "AND d.domain_id <> ALL(:exclude_arr)"
+            base_params["exclude_arr"] = list(exclude_domain_ids)
 
-        sql = text(f"""
-        SELECT d.domain_id, d.shard_id, d.domain_score
-        FROM domain_state d
-        WHERE d.shard_id BETWEEN :shard_start AND :shard_end
-          AND (d.crawl_paused_until IS NULL OR d.crawl_paused_until <= NOW())
-          AND d.domain_id <> ALL(:exclude_arr)
-          AND ({shard_exists})
-        ORDER BY d.domain_score DESC NULLS LAST, d.domain_id
-        LIMIT :limit
-        """)
-
-        params = {
-            "limit": limit,
-            "shard_start": shard_start,
-            "shard_end": shard_end,
-            "exclude_arr": list(exclude_domain_ids) if exclude_domain_ids else [],
-        }
-
+        rows: list = []
         with self.Session() as sess:
-            rows = sess.execute(sql, params).fetchall()
+            for sid in range(shard_start, shard_end + 1):
+                sql = text(f"""
+                SELECT d.domain_id, d.shard_id, d.domain_score
+                FROM domain_state d
+                WHERE d.shard_id = :shard_id
+                  AND (d.crawl_paused_until IS NULL OR d.crawl_paused_until <= NOW())
+                  {exclude_clause}
+                  AND EXISTS (
+                    SELECT 1 FROM url_state_current_{sid:03d} u
+                    WHERE u.domain_id = d.domain_id AND u.should_crawl = TRUE
+                  )
+                ORDER BY d.domain_score DESC NULLS LAST, d.domain_id
+                LIMIT :limit
+                """)
+                params = dict(base_params)
+                params["shard_id"] = sid
+                rows.extend(sess.execute(sql, params).fetchall())
+
+        def sort_key(row):
+            score = row.domain_score
+            has_score = score is not None
+            return (0 if has_score else 1, -float(score) if has_score else 0.0, row.domain_id)
+
+        rows.sort(key=sort_key)
 
         return [
             CandidateDomain(
@@ -171,7 +183,7 @@ class GoldenDiscoveryRankerV1Strategy(SelectionStrategy):
                 shard_id=r.shard_id,
                 domain_score=float(r.domain_score) if r.domain_score is not None else 0.0,
             )
-            for r in rows
+            for r in rows[:limit]
         ]
 
     def claim_domain_urls(
