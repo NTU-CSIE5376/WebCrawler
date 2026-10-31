@@ -168,5 +168,19 @@ class IngestServiceTrapFilterTest(unittest.TestCase):
         self.assertEqual(sorted(e["action"] for e in events), ["drop", "normalize", "normalize"])
 
 
+class GoldenMatchTest(unittest.TestCase):
+    def test_golden_with_srsltid_matches_clean_discovered_link(self):
+        from scripts.trap_filter_golden_check import golden_index, match_golden
+        golden = "https://shop.example.com/p/1?srsltid=AfmBOoq"
+        index = golden_index({golden})
+        # Crawler discovers the clean URL and drops it: still a golden kill.
+        self.assertEqual(match_golden({"url": "https://shop.example.com/p/1"}, index), golden)
+        # Discovered with a different srsltid value, then normalized.
+        self.assertEqual(match_golden({"url": "https://shop.example.com/p/1?srsltid=zz",
+                                       "normalized_url": "https://shop.example.com/p/1"}, index),
+                         golden)
+        self.assertIsNone(match_golden({"url": "https://shop.example.com/p/2"}, index))
+
+
 if __name__ == "__main__":
     unittest.main()

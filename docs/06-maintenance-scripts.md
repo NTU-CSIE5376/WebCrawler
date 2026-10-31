@@ -348,9 +348,10 @@ docker compose exec scheduler_ingest python scripts/wiki_pageview_inject.py
 ## 6.18 `trap_filter_golden_check.py`
 
 - Reads the ingest trap filter's audit logs (`/data/ipc/trap_filter/ingestor_*/YYYY-MM-DD.jsonl.gz`, one JSON object per normalized / dropped discovery link: `ts`, `action`, `url`, `normalized_url`, `rules`, `domain_id`, `shard_id`, `discovered_from`) and checks them against the golden set (metricdb `metric_url`, read-only, or `--golden-file`).
+- Golden URLs are also matched by their normalized form: metricdb stores them as copied from search results (often with `srsltid`), while the crawler discovers the clean URL. `golden_inject.py` strips `srsltid` on its side, so both converge on the same row.
 - Reports per rule: drop events, distinct golden URLs dropped, and the false-kill rate (`golden dropped / golden total`). Golden URLs that were only normalized are listed separately: the stripped URL is still inserted, so they are not kills.
 - Streams the logs; only the golden set is held in memory. `--out DIR` writes `summary.csv` and `golden_hits.csv` (each golden hit with its rules, parent URL and first timestamp).
-- Baseline before rollout: running the filter over the 138,459 metricdb golden URLs drops 4 (0.0029%) and normalizes 1,327 (all `srsltid`).
+- Baseline before rollout: running the filter over the 138,459 metricdb golden URLs drops 4 (0.0029%) and normalizes 1,327 (~1,290 `srsltid`, the rest `utm_*`, `_gl`, `;jsessionid=`).
 - Log volume: inflow is logged before the DB existence check, so a trap URL rediscovered in many folders is logged each time. Delete old log files by hand once the review is done.
 
 ```bash

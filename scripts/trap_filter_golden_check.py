@@ -12,8 +12,11 @@ logs and reports, per rule:
   * golden URLs that were normalized: not a kill (the stripped URL is still
     inserted), listed so the stripping can be reviewed
 
-A golden URL counts as hit when it equals either the logged original URL or its
-normalized form. Only the golden set is held in memory; the logs are streamed.
+Golden URLs are matched by their normalized form too: metricdb keeps them as
+copied from search results (often with `srsltid` / `utm_*`), while the crawler
+discovers the clean page URL. A logged link hits a golden URL when the link or
+its normalized form equals the golden URL or the golden URL's normalized form.
+Only the golden set is held in memory; the logs are streamed.
 
 Golden set: metricdb `metric_url` (read-only, scripts/constants.METRICDB), or a
 text/CSV file with one URL per line (first column).
@@ -34,6 +37,7 @@ from urllib.parse import urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from containers.scheduler_ingest.ingestor.trap_filter import read_audit_log  # noqa: E402
+from libs.frontier.url_normalize import strip_params  # noqa: E402
 
 
 def load_golden_from_file(path: Path) -> set[str]:
@@ -62,6 +66,21 @@ def load_golden_from_metricdb() -> set[str]:
         conn.close()
 
 
+def golden_index(golden: set[str]) -> dict[str, str]:
+    """Map each golden URL and its normalized form to the golden URL."""
+    index = {strip_params(g): g for g in golden}
+    index.update({g: g for g in golden})
+    return index
+
+
+def match_golden(event: dict, index: dict[str, str]) -> str | None:
+    url = event.get("url") or ""
+    for key in (url, event.get("normalized_url"), strip_params(url)):
+        if key and key in index:
+            return index[key]
+    return None
+
+
 def _in_range(event: dict, since: str | None, until: str | None) -> bool:
     day = (event.get("ts") or "")[:10]
     return (since is None or day >= since) and (until is None or day <= until)
@@ -79,6 +98,7 @@ def main() -> None:
     golden = load_golden_from_file(args.golden_file) if args.golden_file else load_golden_from_metricdb()
     if not golden:
         sys.exit("golden set is empty")
+    index = golden_index(golden)
 
     drop_events: Counter[str] = Counter()
     golden_dropped: dict[str, set[str]] = defaultdict(set)   # rule -> golden urls
@@ -92,7 +112,7 @@ def main() -> None:
         action = ev.get("action")
         totals[action] += 1
         url, norm = ev.get("url"), ev.get("normalized_url")
-        hit = url if url in golden else (norm if norm in golden else None)
+        hit = match_golden(ev, index)
         if action == "drop":
             rules = ev.get("rules") or ["?"]
             drop_events.update(rules)
