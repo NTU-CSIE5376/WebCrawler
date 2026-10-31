@@ -126,6 +126,7 @@ Input: router output folders `ingestor_{id}`.
 Responsibilities:
 
 - `status="new"` records: insert new URL candidates into `url_state_current_{shard}` and history.
+  - Trap filter (`trap_filter` in `ingest.yaml`, `ingestor/trap_filter.py`), applied before any DB work: strip the validated params in `normalize_params` (default `srsltid`, `jsessionid`, `phpsessid`), merge links that collapse to the same URL, log what stripping every other tracking / session param would change without applying it (`would_normalize`), then drop links hitting a high-confidence trap rule (`libs/frontier/trap_rules.HIGH_CONFIDENCE`: path repeat, too many path segments, nested redirect, faceted navigation, calendar plugin). Every affected link is appended to `/data/ipc/trap_filter/ingestor_{id}/YYYY-MM-DD.jsonl.gz`; `scripts/trap_filter_golden_check.py` measures golden false kills from these logs. Crawl results are never filtered. Rule definitions: [09-frontier-trap-rules.md](09-frontier-trap-rules.md).
   - Links whose domain has `domain_state.discovery_frozen=TRUE` are skipped (frontier budget; see `frontier_gc` in 2.2), so frozen domains stop accumulating new frontier rows.
   - If `GOLDEN_DISCOVERY_RANKER_V1_INGEST_INLINE_ENABLED=true`, check which URLs are truly new, score those with the mounted ranker artifact before writing them to DB, and fall back to unscored insert when the inline scoring time budget is exhausted.
   - If inline scoring is disabled, new URLs keep `url_score_updated_at=NULL` and the background ranker can score them later.
