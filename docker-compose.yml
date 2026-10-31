@@ -119,6 +119,7 @@ services:
     init: true
     environment:
       - MANUAL_BULK_CRAWL_SCHEDULING_POLICY
+      - MANUAL_BULK_CRAWL_SHARE_PERCENT
     dns:
       - 8.8.8.8
       - 1.1.1.1

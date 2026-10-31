@@ -342,19 +342,25 @@ Responsibilities:
 - Consume only this crawler's queue partition. Run one live crawler process per
   crawler ID, as with normal IPC. Different crawlers can process one job
   concurrently without file locks.
-- Configure `MANUAL_BULK_CRAWL_SCHEDULING_POLICY` on the crawler (also passed
-  through Compose); restart crawlers after changing it. The default is
-  `manual_first`. This crawler-wide setting applies to all jobs, including
+- Configure `MANUAL_BULK_CRAWL_SCHEDULING_POLICY` and
+  `MANUAL_BULK_CRAWL_SHARE_PERCENT` on the crawler (both passed through
+  Compose); restart crawlers after changing them. The default is `weighted`
+  with a share of 50. This crawler-wide setting applies to all jobs, including
   already queued requests; jobs and requests carry no dispatch policy.
   Each crawler has two scheduler queues: normal and manual.
+  In `weighted` mode, while both queues have requests, the manual queue gets
+  `MANUAL_BULK_CRAWL_SHARE_PERCENT` (1–99) of the dispatches (stride
+  scheduling); a queue with nothing to send gives its turns to the other and
+  does not bank them. Neither source starves while it has work. The share
+  counts dispatches, not slot time; the per-host prefetch cap below keeps slow
+  or dead manual hosts from holding many slots.
   In `balanced` mode, dispatch one normal request and one manual request in turn,
   skipping an empty queue so the other uses all available dispatch capacity.
   `manual_first` drains available manual requests before normal requests;
   `normal_first` drains available normal requests before manual requests.
   These are dispatch preferences, not preemption of downloads or changes to QPS.
-  Priority modes can starve lower-priority queues under continuous load.
-  No dispatch ratio or manual
-  percentage concurrency cap is configured. Each source retains Scrapy's
+  Priority modes starve the lower-priority queue under continuous load; use them
+  only to drain one side. Each source retains Scrapy's
   downloader-aware domain selection and uses FIFO queues at equal priority,
   including startup requests. Retries retain their source and priority so new
   URLs within the same queue cannot indefinitely overtake them.
@@ -369,8 +375,28 @@ Responsibilities:
   using live downloader slot settings when available, otherwise crawler settings
   and `DOWNLOAD_SLOTS` overrides. Latency starts at one second and uses an
   exponentially smoothed `download_latency` from responses (20% new sample).
+  A slot's prefetch cap is its concurrency, but with a delay it is at most
+  `ceil(latency / delay)` plus `MANUAL_BULK_CRAWL_HOST_HEADROOM` (default 1):
+  the slot starts one request per delay, so further requests would only wait
+  in the slot and count against `CONCURRENT_REQUESTS`.
+  `CRAWLER_MANUAL_BULK_CRAWL_HOST_INTERVAL` (seconds, default 0 = off) sets the
+  time between handing two manual requests for one slot to the scheduler, across
+  all jobs. The hand-offs follow a fixed grid: a timer that fires late shortens
+  the next gap, to no less than half an interval, so a busy reactor does not
+  lower the rate. A slot that falls behind by half an interval or more, as after
+  an idle spell, restarts the grid instead of catching up. A slot inside its
+  interval is not eligible, and the timer makes it eligible again. At send time,
+  gaps also vary with the time each request waits in the scheduler and the slot.
+  Redirects and downloader retries go to the scheduler without a hand-off, so
+  they are not held back. When a manual URL finishes, each redirect hop and retry
+  it took moves the slot's next hand-off one interval later. A slot's average
+  rate, these requests included, then stays at one request per interval. A
+  redirect to another hostname is charged to the slot of the first request.
+  The interval also bounds the estimated QPS.
   Among slots below their prefetch cap, select the largest estimated remaining
-  service time plus a fixed random jitter of less than one second per domain.
+  service time plus the seconds the slot's oldest job has waited since
+  admission, plus a fixed random jitter of less than one second per domain.
+  The wait term lets a small host of an old job overtake newer, larger hosts.
   An indexed priority queue (`pqdict`) keeps one entry per eligible slot and
   updates its priority in place.
   Each slot's manual outstanding URLs (queued, downloading or retrying), across
