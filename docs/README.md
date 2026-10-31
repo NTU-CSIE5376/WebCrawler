@@ -17,3 +17,4 @@ This documentation set describes the architecture implemented in this repository
 6. [06-maintenance-scripts.md](./06-maintenance-scripts.md)
 7. [07-grafana-loki-observability.md](./07-grafana-loki-observability.md)
 8. [08-sitemap-patroller.md](./08-sitemap-patroller.md)
+9. [09-frontier-trap-rules.md](./09-frontier-trap-rules.md)
