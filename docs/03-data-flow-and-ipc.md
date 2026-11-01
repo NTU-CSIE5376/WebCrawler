@@ -378,21 +378,11 @@ Responsibilities:
   A slot's prefetch cap is its concurrency, but with a delay it is at most
   `ceil(latency / delay)` plus `MANUAL_BULK_CRAWL_HOST_HEADROOM` (default 1):
   the slot starts one request per delay, so further requests would only wait
-  in the slot and count against `CONCURRENT_REQUESTS`.
-  `CRAWLER_MANUAL_BULK_CRAWL_HOST_INTERVAL` (seconds, default 0 = off) sets the
-  time between handing two manual requests for one slot to the scheduler, across
-  all jobs. The hand-offs follow a fixed grid: a timer that fires late shortens
-  the next gap, to no less than half an interval, so a busy reactor does not
-  lower the rate. A slot that falls behind by half an interval or more, as after
-  an idle spell, restarts the grid instead of catching up. A slot inside its
-  interval is not eligible, and the timer makes it eligible again. At send time,
-  gaps also vary with the time each request waits in the scheduler and the slot.
-  Redirects and downloader retries go to the scheduler without a hand-off, so
-  they are not held back. When a manual URL finishes, each redirect hop and retry
-  it took moves the slot's next hand-off one interval later. A slot's average
-  rate, these requests included, then stays at one request per interval. A
-  redirect to another hostname is charged to the slot of the first request.
-  The interval also bounds the estimated QPS.
+  in the slot and count against `CONCURRENT_REQUESTS`. The cap has no fixed
+  value: AutoThrottle keeps a slot's delay at least `latency / TARGET_CONCURRENCY`,
+  so the cap follows the target (target 2.0 gives 3 with headroom 1, target 4.0
+  gives 5). The manual consumer sets no per-host rate of its own; the slot delay
+  is the only per-host pacing, the same as for normal requests.
   Among slots below their prefetch cap, select the largest estimated remaining
   service time plus the seconds the slot's oldest job has waited since
   admission, plus a fixed random jitter of less than one second per domain.
@@ -400,7 +390,9 @@ Responsibilities:
   An indexed priority queue (`pqdict`) keeps one entry per eligible slot and
   updates its priority in place.
   Each slot's manual outstanding URLs (queued, downloading or retrying), across
-  all jobs, are capped at its configured concurrency. Refill immediately on
+  all jobs, are held to this prefetch cap. Redirects and retries keep the
+  original request's `download_slot`, so they stay on, and are charged to, the
+  original slot until the URL's final result. Refill immediately on
   completion, and refresh live slot settings on each poll. These are prefetch
   decisions; the shared downloader still enforces actual politeness for both
   normal and manual work. Jobs outside the active window wait for admission.

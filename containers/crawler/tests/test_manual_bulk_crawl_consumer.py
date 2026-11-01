@@ -10,7 +10,6 @@ from scrapy.core.downloader import Downloader
 from scrapy.http import HtmlResponse
 from scrapy.settings import Settings
 from scrapy.utils.test import get_crawler
-from twisted.internet.task import Clock
 
 from containers.crawler.crawler.manual_bulk_crawls import ManualBulkCrawlConsumer
 from libs.ipc import manual_bulk_crawl as storage
@@ -285,172 +284,6 @@ def test_invalid_host_headroom_fails_at_startup(queue, value):
         factory(host_headroom=value)
 
 
-@pytest.mark.parametrize("value", [-1, -0.5, True, None, "5"])
-def test_invalid_host_interval_fails_at_startup(queue, value):
-    _, factory, _ = queue
-    with pytest.raises(ValueError, match="MANUAL_BULK_CRAWL_HOST_INTERVAL"):
-        factory(host_interval=value)
-
-
-def paced(consumer, monkeypatch):
-    """One fake clock for the consumer's monotonic() and its timers."""
-    import containers.crawler.crawler.manual_bulk_crawls as consumer_module
-
-    clock = Clock()
-    clock.advance(1000)
-    monkeypatch.setattr(consumer_module, "monotonic", clock.seconds)
-    consumer.poller.clock = clock
-    return clock
-
-
-def test_host_interval_spaces_one_hosts_requests_without_holding_others(queue, monkeypatch):
-    enqueue, factory, _ = queue
-    enqueue("a", urls=[f"https://paced.example/{i}" for i in range(3)])
-    enqueue("b", urls=["https://other.example/0"])
-    consumer, requests = factory(concurrency=8, host_interval=5.0)
-    clock = paced(consumer, monkeypatch)
-    try:
-        consumer.poll()
-        assert sorted(r.url for r in requests) == ["https://other.example/0", "https://paced.example/0"]
-        complete(consumer, requests[0])
-        clock.advance(4.9)
-        assert len(requests) == 2, "A completed request does not shorten the interval"
-        clock.advance(0.1)
-        assert requests[-1].url == "https://paced.example/1"
-        complete(consumer, requests[-1])
-        clock.advance(5.0)
-        assert requests[-1].url == "https://paced.example/2"
-        assert len(requests) == 4
-    finally:
-        consumer.close()
-
-
-def test_late_timer_shortens_the_next_gap_instead_of_lowering_the_rate(queue, monkeypatch):
-    enqueue, factory, _ = queue
-    enqueue("a", urls=[f"https://paced.example/{i}" for i in range(3)])
-    consumer, requests = factory(concurrency=8, host_interval=5.0)
-    clock = paced(consumer, monkeypatch)
-    try:
-        consumer.poll()
-        clock.advance(6.0)  # The timer for t = 1005 runs at t = 1006.
-        assert len(requests) == 2, "Pacing does not wait for the previous response"
-        clock.advance(3.9)
-        assert len(requests) == 2
-        clock.advance(0.1)
-        assert len(requests) == 3, "The third request keeps the grid: t = 1010"
-    finally:
-        consumer.close()
-
-
-def test_host_interval_restarts_after_an_idle_spell(queue, monkeypatch):
-    enqueue, factory, _ = queue
-    enqueue("a", urls=["https://paced.example/a"])
-    consumer, requests = factory(concurrency=8, host_interval=5.0)
-    clock = paced(consumer, monkeypatch)
-    try:
-        consumer.poll()
-        complete(consumer, requests[0])
-        clock.advance(20.0)
-        enqueue("b", urls=[f"https://paced.example/b{i}" for i in range(2)])
-        consumer.poll()
-        assert len(requests) == 2
-        clock.advance(4.9)
-        assert len(requests) == 2, "No catching up on the idle time"
-        clock.advance(0.1)
-        assert len(requests) == 3
-    finally:
-        consumer.close()
-
-
-def test_host_interval_holds_across_jobs_after_the_backlog_empties(queue, monkeypatch):
-    enqueue, factory, _ = queue
-    enqueue("a", urls=["https://paced.example/a"])
-    consumer, requests = factory(concurrency=8, host_interval=5.0)
-    clock = paced(consumer, monkeypatch)
-    try:
-        consumer.poll()
-        complete(consumer, requests[0])
-        clock.advance(1.0)
-        enqueue("b", urls=["https://paced.example/b"])
-        consumer.poll()
-        assert len(requests) == 1
-        clock.advance(4.0)
-        assert requests[-1].url == "https://paced.example/b"
-    finally:
-        consumer.close()
-
-
-def test_close_cancels_pending_host_interval_timers(queue, monkeypatch):
-    enqueue, factory, _ = queue
-    enqueue("a", urls=[f"https://paced.example/{i}" for i in range(2)])
-    consumer, requests = factory(concurrency=8, host_interval=5.0)
-    clock = paced(consumer, monkeypatch)
-    consumer.poll()
-    complete(consumer, requests[0])
-    assert len(requests) == 1
-    assert clock.getDelayedCalls()
-    consumer.close()
-    assert not clock.getDelayedCalls()
-
-
-def test_redirects_take_later_grid_steps(queue, monkeypatch):
-    enqueue, factory, _ = queue
-    enqueue("a", urls=[f"https://paced.example/{i}" for i in range(2)])
-    consumer, requests = factory(concurrency=8, host_interval=5.0)
-    clock = paced(consumer, monkeypatch)
-    try:
-        consumer.poll()
-        clock.advance(1.0)
-        # Two hops, as RedirectMiddleware leaves them on the final request.
-        final = requests[0].replace(url="https://paced.example/0/final")
-        final.meta["redirect_times"] = 2
-        complete(consumer, final)
-        clock.advance(13.9)
-        assert len(requests) == 1, "Each hop holds one more interval: t = 1015"
-        clock.advance(0.1)
-        assert len(requests) == 2
-    finally:
-        consumer.close()
-
-
-def test_a_retried_failure_takes_a_later_grid_step(queue, monkeypatch):
-    from twisted.internet.error import TimeoutError
-    from twisted.python.failure import Failure
-
-    enqueue, factory, _ = queue
-    enqueue("a", urls=[f"https://paced.example/{i}" for i in range(2)])
-    consumer, requests = factory(concurrency=8, host_interval=5.0)
-    clock = paced(consumer, monkeypatch)
-    try:
-        consumer.poll()
-        clock.advance(1.0)
-        retried = requests[0].copy()
-        retried.meta["retry_times"] = 1
-        failure = Failure(TimeoutError())
-        failure.request = retried
-        consumer.fetch_failed(failure)
-        clock.advance(8.9)
-        assert len(requests) == 1, "The retry holds one more interval: t = 1010"
-        clock.advance(0.1)
-        assert len(requests) == 2
-    finally:
-        consumer.close()
-
-
-def test_redirects_do_not_hold_an_unpaced_host(queue):
-    enqueue, factory, _ = queue
-    enqueue("a", urls=[f"https://unpaced.example/{i}" for i in range(2)])
-    consumer, requests = factory(concurrency=1)
-    try:
-        consumer.poll()
-        final = requests[0].replace(url="https://unpaced.example/0/final")
-        final.meta["redirect_times"] = 3
-        complete(consumer, final)
-        assert len(requests) == 2
-    finally:
-        consumer.close()
-
-
 def slots(consumer, **hosts):
     """Live downloader slots: host -> (concurrency, delay)."""
     consumer.spider.crawler.engine.downloader = SimpleNamespace(slots={
@@ -459,7 +292,9 @@ def slots(consumer, **hosts):
 
 
 @pytest.mark.parametrize("headroom", [0, 1, 2])
-@pytest.mark.parametrize("latency,delay,in_transfer", [(2.5, 1.0, 3), (3.5, 1.75, 2), (1.0, 4.0, 1)])
+# (2.0, 0.5, 4) is AutoThrottle at TARGET_CONCURRENCY 4: the cap follows the target.
+@pytest.mark.parametrize("latency,delay,in_transfer",
+                         [(2.5, 1.0, 3), (3.5, 1.75, 2), (1.0, 4.0, 1), (2.0, 0.5, 4)])
 def test_host_cap_follows_the_slot_delay(queue, headroom, latency, delay, in_transfer):
     enqueue, factory, _ = queue
     enqueue("a", urls=[f"https://slow.example/{i}" for i in range(30)])
@@ -705,6 +540,25 @@ def test_later_jobs_supply_other_domains_without_draining_wiki_job(queue):
         assert any(request.url == "https://other.example/0" for request in requests)
         assert len(requests) == 3
         assert len(consumer.jobs["wiki"].pending) == 98
+    finally:
+        consumer.close()
+
+
+def test_a_redirected_url_releases_its_original_host_once(queue):
+    # RedirectMiddleware keeps download_slot, so the hop stays on the original slot.
+    enqueue, factory, _ = queue
+    enqueue("a", urls=[f"https://origin.example/{i}" for i in range(2)])
+    consumer, requests = factory(concurrency=1)
+    try:
+        consumer.poll()
+        final = requests[0].replace(url="https://elsewhere.example/landing")
+        final.meta["redirect_times"] = 2
+        complete(consumer, final)
+        assert len(requests) == 2
+        assert consumer.domains["origin.example"].outstanding == 1
+        assert "elsewhere.example" not in consumer.domains
+        complete(consumer, final)
+        assert consumer.domains["origin.example"].outstanding == 1
     finally:
         consumer.close()
 

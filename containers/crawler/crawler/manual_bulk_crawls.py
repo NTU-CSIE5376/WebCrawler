@@ -11,7 +11,6 @@ from time import monotonic
 
 import scrapy
 from pqdict import pqdict
-from twisted.internet.interfaces import IDelayedCall
 from twisted.internet.task import LoopingCall
 
 from libs.ipc.manual_bulk_crawl import (
@@ -37,8 +36,6 @@ class _DomainQueue:
     outstanding: int = 0
     latency: float = 1.0  # Bootstrap estimate until a response supplies download_latency.
     jitter: float = field(default_factory=random)  # Fixed [0, 1) seconds per domain.
-    next_send: float = 0.0  # monotonic() before which the host interval holds the next request.
-    wake: IDelayedCall | None = None
 
 
 def _int_setting(settings, name, default, minimum):
@@ -46,19 +43,6 @@ def _int_setting(settings, name, default, minimum):
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise ValueError(f"{name} must be an integer of at least {minimum}")
     return value
-
-
-def _float_setting(settings, name, default, minimum):
-    # Settings.get() would turn an explicit None into the default instead of rejecting it.
-    value = settings[name] if name in settings else default  # noqa: SIM401
-    if isinstance(value, bool) or not isinstance(value, int | float) or value < minimum:
-        raise ValueError(f"{name} must be a number of at least {minimum}")
-    return float(value)
-
-
-def _extra_requests(meta):
-    """Requests RedirectMiddleware and RetryMiddleware added after the one refill() sent."""
-    return int(meta.get("redirect_times") or 0) + int(meta.get("retry_times") or 0)
 
 
 class ManualBulkCrawlConsumer:
@@ -69,7 +53,6 @@ class ManualBulkCrawlConsumer:
         self.concurrency = settings.getint("CONCURRENT_REQUESTS", 64)
         self.max_active_jobs = _int_setting(settings, "MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS", 64, 1)
         self.host_headroom = _int_setting(settings, "MANUAL_BULK_CRAWL_HOST_HEADROOM", 1, 0)
-        self.host_interval = _float_setting(settings, "MANUAL_BULK_CRAWL_HOST_INTERVAL", 0.0, 0)
         self.jobs: dict[str, _ActiveJob] = {}
         self.inflight: set[tuple[str, int]] = set()
         self.saves = 0
@@ -93,9 +76,6 @@ class ManualBulkCrawlConsumer:
             self.poller.stop()
         for job in self.jobs.values():
             job.batch.close()
-        for domain in self.domains.values():
-            if domain.wake is not None and domain.wake.active():
-                domain.wake.cancel()
         self.jobs.clear()
         self.inflight.clear()
         self.inflight_domains.clear()
@@ -133,8 +113,8 @@ class ManualBulkCrawlConsumer:
             delay = overrides.get("delay", settings.getfloat("AUTOTHROTTLE_START_DELAY")
                                   if settings.getbool("AUTOTHROTTLE_ENABLED")
                                   else settings.getfloat("DOWNLOAD_DELAY"))
-        # Inverse QPS: delay-, latency/concurrency- or interval-bound, whichever is slowest.
-        seconds_per_url = max(delay, domain.latency / max(1, concurrency), self.host_interval)
+        # Inverse QPS: delay-bound or latency/concurrency-bound, whichever is slower.
+        seconds_per_url = max(delay, domain.latency / max(1, concurrency))
         if delay > 0:
             # A slot starts one request per delay, so beyond about latency / delay in
             # transfer, more outstanding requests only wait in the slot and hold capacity.
@@ -148,18 +128,12 @@ class ManualBulkCrawlConsumer:
             domain = self.domains[host]
             if not domain.pending:
                 self.ready.pop(host, None)
-                # Keep a paced host until its interval ends, so a new job cannot reset it.
-                if not domain.outstanding and domain.next_send <= now:
+                if not domain.outstanding:
                     del self.domains[host]
                 continue
             limit, seconds_per_url = self._domain_limits(host, domain)
             if domain.outstanding >= limit:
                 self.ready.pop(host, None)
-                continue
-            if domain.next_send > now:
-                self.ready.pop(host, None)
-                if domain.wake is None or not domain.wake.active():
-                    domain.wake = self.poller.clock.callLater(domain.next_send - now, self._wake, host)
                 continue
             remaining = len(domain.pending) + domain.outstanding
             # Prefer the longest remaining service time, with fixed sub-second jitter. The
@@ -167,12 +141,6 @@ class ManualBulkCrawlConsumer:
             # forever by newer, larger ones.
             waited = now - self.jobs[domain.pending[0][0]].admitted_at
             self.ready[host] = remaining * seconds_per_url + waited + domain.jitter
-
-    def _wake(self, host):
-        if self.closed or host not in self.domains:
-            return
-        self._refresh_priorities([host])
-        self.refill()
 
     def _discard_pending(self, job_id, job):
         if not job.pending:
@@ -234,10 +202,6 @@ class ManualBulkCrawlConsumer:
                 domain.pending.popleft()
                 job.pending.remove(index)
                 domain.outstanding += 1
-                # Step a fixed grid, so a late timer shortens the next gap instead of lowering
-                # the rate. A host behind by half an interval or more restarts it from now.
-                now, step = monotonic(), domain.next_send + self.host_interval
-                domain.next_send = step if step >= now + self.host_interval / 2 else now + self.host_interval
                 self.inflight_domains[job_id, index] = host
                 job.inflight.add(index)
                 self.inflight.add((job_id, index))
@@ -267,7 +231,6 @@ class ManualBulkCrawlConsumer:
             error = error or "NonHTML content-type"
         self.save(response.meta["manual_bulk_crawl_job_id"], response.meta["manual_bulk_crawl_index"],
                   download_latency=response.meta.get("download_latency"),
-                  extra_requests=_extra_requests(response.meta),
                   final_url=response.url, status_code=response.status,
                   body=response.body if html else None, error=error)
 
@@ -282,20 +245,17 @@ class ManualBulkCrawlConsumer:
             return self.parse(response)
         meta = failure.request.meta
         self.save(meta["manual_bulk_crawl_job_id"], meta["manual_bulk_crawl_index"],
-                  extra_requests=_extra_requests(meta), final_url=failure.request.url, status_code=None, error=failure.type.__name__)
+                  final_url=failure.request.url, status_code=None, error=failure.type.__name__)
 
-    def _release_domain(self, job_id, index, latency=None, extra_requests=0):
+    def _release_domain(self, job_id, index, latency=None):
         host = self.inflight_domains.pop((job_id, index))
         domain = self.domains[host]
         domain.outstanding -= 1
-        if extra_requests and self.host_interval:
-            # Redirects and retries bypass refill(), so they take later grid steps instead.
-            domain.next_send = max(domain.next_send, monotonic()) + extra_requests * self.host_interval
         if latency is not None and latency > 0:
             domain.latency = 0.8 * domain.latency + 0.2 * latency
         self._refresh_priorities([host])
 
-    def save(self, job_id, index, *, download_latency=None, extra_requests=0, **result):
+    def save(self, job_id, index, *, download_latency=None, **result):
         job = self.jobs.get(job_id)
         if job is None or index not in job.inflight:
             return
@@ -314,7 +274,7 @@ class ManualBulkCrawlConsumer:
         finally:
             job.inflight.discard(index)
             self.inflight.discard((job_id, index))
-            self._release_domain(job_id, index, download_latency, extra_requests)
+            self._release_domain(job_id, index, download_latency)
             if job.failed:
                 self._discard_pending(job_id, job)
             self.release_if_drained(job_id, job)
