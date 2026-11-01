@@ -396,7 +396,9 @@ def test_every_accepted_url_gets_a_terminal_record_after_cancel_or_expiry(env, c
     flush(env)
     got = records(env, A)
     reason = "cancelled" if close == "cancel" else "expired"
-    expected = {f"b-{i}" for i in range(6)} | ({"late-0"} if close == "expire" else set())
+    # The late batch was accepted before the API saw the cancel (a race), so it is owed
+    # a record too.
+    expected = {f"b-{i}" for i in range(6)} | {"late-0"}
     assert {record["id"] for record in got} == expected
     errors = [record["error"] for record in got]
     assert errors.count(None) == 1 and errors.count(reason) == len(expected) - 1
@@ -405,16 +407,19 @@ def test_every_accepted_url_gets_a_terminal_record_after_cancel_or_expiry(env, c
     assert A not in consumer.requests
 
 
-def test_cancelled_request_inbox_is_dropped_and_removed_request_is_forgotten(env):
+def test_cancelled_request_inbox_gets_records_and_removed_request_is_forgotten(env):
     submit(env, A, ["https://example.com/0"])
     atomic_write_json(env.paths.cancelled(A), {})
     submit(env, B, ["https://example.org/0", "https://example.org/1"])
     consumer, requests = env.consumer(concurrency=1)
     assert not list(env.paths.inbox(0).glob("*.json"))
-    assert [request_id for request_id, *_ in rows(env)] == [B, B]
+    assert all(r.meta["crawl_request"][0] == B for r in requests)  # nothing of A is fetched
     env.paths.meta(B).unlink()  # Removed by GC.
-    consumer.poll()
+    for _ in range(2):
+        consumer.poll()
     complete(consumer, requests[0])
+    flush(env)
+    assert [(r["id"], r["error"]) for r in records(env, A)] == [("b-0", "cancelled")]
     assert len(requests) == 1 and not rows(env) and not consumer.requests
     assert not env.paths.segments(B).exists()
 

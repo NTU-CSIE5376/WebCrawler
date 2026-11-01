@@ -218,8 +218,10 @@ class Frontier:
                 continue
             if request_id not in states:
                 states.update(self.check([request_id]))
-            meta, cancelled = states[request_id]
-            if meta is not None and not cancelled:
+            meta, _ = states[request_id]
+            # A cancelled request's batch is still taken in: it was accepted, so each URL
+            # gets its `cancelled` record through the normal close path.
+            if meta is not None:
                 with self.db:
                     for item in items:
                         slot = slot_key(item["url"])
