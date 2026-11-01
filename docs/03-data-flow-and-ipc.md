@@ -147,288 +147,135 @@ so the schema stays in sync with the ingestor's `_bulk_links` reader.
 
 The external API lets other services submit URLs for crawling. The default
 local base URL is `http://localhost:4000`; remote clients use the host address
-provided by the deployment. Authentication is not required.
+provided by the deployment. Request bodies are limited to 300 MiB; larger ones
+return `413` with `{"error":"Request body too large"}`. Errors always use a JSON
+`error` field.
 
-The API limits request bodies to 300 MiB. Oversized requests return
-`413 Content Too Large` with a JSON body:
+### 3.6.1 Crawl Request API (bulk crawl v2)
 
-```json
-{"error":"Request body too large"}
+Every `/v1/crawl-requests*` call needs `Authorization: Bearer <token>`.
+`crawl_requests.tokens_file` (YAML, token -> tenant) decides the tenant, which a
+body cannot set. A missing or unknown token returns `401`; another tenant's request
+returns `404`. Bodies must be `application/json`.
+
+```text
+POST   /v1/crawl-requests            {name, result_quota_gb?, expires_days?}
+       -> 201 {request_id, name, result_quota_gb, expires_at}
+GET    /v1/crawl-requests            -> 200 {requests: [<status>, ...]}
+POST   /v1/crawl-requests/{id}/urls  {batch_id, urls: [{id, url, priority}]}   (1..max_urls)
+       -> 202 {accepted, skipped: [{index, id, reason: "invalid"|"duplicate"}]}
+POST   /v1/crawl-requests/{id}/seal  -> 200 {sealed: true}
+DELETE /v1/crawl-requests/{id}       -> 202 {cancelled: true}
+GET    /v1/crawl-requests/{id}       -> 200 <status>
+GET    /v1/crawl-requests/{id}/segments?wait=<s>   -> 200 {segments: [{name, bytes}]}
+GET    /v1/crawl-requests/{id}/segments/{name}     -> 200 application/gzip
+POST   /v1/crawl-requests/{id}/ack   {segments: [name, ...]} -> 200 {deleted}
 ```
 
-### 3.6.1 Manual Bulk Crawl API
+- `result_quota_gb` defaults to, and is capped at, `max_result_quota_gb` (GB =
+  10^9 bytes). `expires_days` defaults to 30 and is capped at 60.
+- URLs: each item is validated and canonicalized like other API URLs (HTTP(S),
+  public host, no credentials, at most `max_url_length`). A bad URL is skipped
+  as `invalid`; a repeated `id` within the batch is skipped as `duplicate`.
+  Skipped items never get a record. Only a malformed body returns `400`.
+- `priority` is an integer; lower is crawled first within a host.
+- The same `batch_id` again returns the stored first response and writes
+  nothing. An `id` already pending in the request (queued, downloading or not
+  yet in a closed segment) is dropped silently; once its record is published,
+  the same `id` can be sent again and is crawled again.
+- `409`: the request is sealed, cancelled or expired. `404`: unknown request.
+- `503` with `Retry-After` (`retry_after_s`): a target crawler's inbox holds more
+  than `max_inbox_files` files, free space under the data root is below
+  `min_free_gb`, the tenant has more than `max_tenant_queued_urls` queued URLs,
+  or the routing lookup failed. Nothing is written in that case.
+- `DELETE` cancels queued URLs; each gets an `error: "cancelled"` record. URLs
+  already downloading finish normally. Unacked segments stay listable,
+  downloadable and ackable.
+- Status: `{request_id, name, created_at, expires_at, sealed, cancelled, queued,
+  leased, unacked_segments, unacked_bytes, top_hosts: [{host, remaining,
+  done_1h}], updated_at}`. Counts are summed from crawler snapshots taken every
+  `MANUAL_BULK_CRAWL_STATUS_S`; `updated_at` is the oldest snapshot time.
+- `segments` lists closed, unacked segments oldest first. `wait` (capped at
+  `long_poll_max_s`) long-polls until the list is non-empty. `ack` deletes the
+  named segments and ignores unknown names.
 
-`POST /v1/manual-bulk-crawls`
+Segment name: `{crawler_id:02d}-{seq:012d}.jsonl.gz`. Each gzip line is one
+terminal record:
 
-The `manual-bulk-crawl-api` creates an independent crawl job for one or more URLs.
-Jobs fetch the submitted pages and save their HTML in separate storage without
-updating scheduler state, discovering links or running feature extraction. The request must use `Content-Type: application/json`.
-
-**Request body**
-
-```json
-{
-  "urls": [
-    "https://example.com/article",
-    "https://example.org/page"
-  ],
-  "ttl_days": 14
-}
+```text
+{id, url, priority, final_url, status_code, error, fetched_at | null, finished_at, html | null}
 ```
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `urls` | Array of strings | Yes | Nonempty list of absolute HTTP or HTTPS URLs; default maximum 10,000 per request. |
-| `ttl_days` | Integer | No | Retention from submission, 1–60 days inclusive; defaults to 14 days. |
+- `url` is the canonical submitted URL; `final_url` is after redirects.
+- `html` is the decoded body of an HTML 2xx response, otherwise null.
+- `error`: null (HTML 2xx) | `non_html` (other 2xx) | `http_<code>` | `dns` |
+  `timeout` | `connection` | `robots` | `retries_exhausted` | `expired` |
+  `cancelled`.
+- `fetched_at` is null without a response; every record has `finished_at`.
+- Delivery is at least once: every accepted URL gets one or more records.
 
-The default URL length limit is 2,500
-characters, checked both before and after normalization.
-Deployments may configure a smaller length limit or a different per-request
-URL count limit. Each URL must have a valid hostname and port and contain no
-credentials, whitespace, or control characters. If any URL is invalid, the
-entire request is rejected.
+## 3.7 Crawl Request Processing
 
-**Successful response**
+Layout under `crawl_requests.root` / `MANUAL_BULK_CRAWL_ROOT`
+(`/data/manual_bulk_crawls`, shared by the api and crawler containers). Every
+JSON file is written as tmp + fsync + rename.
 
-`200 OK`
-
-```json
-{"job_id":"ab12cd34ef56ab78cd90ef12ab34cd56"}
+```text
+requests/{id}.json, {id}.sealed, {id}.cancel     API: meta (tenant, expiry, quota) and markers
+requests/{id}/batches/{batch_key}.json           API: stored 202 response
+inbox/crawler_NN/{id}-{batch_key}.json           API writes, crawler NN ingests and deletes
+frontier/crawler_NN.sqlite                       crawler NN only (the API never opens it)
+segments/{id}/crawler_NN/{NN}-{seq}.jsonl.gz     crawler NN writes (.part while open); API deletes on ack
+status/crawler_NN.json                           crawler NN snapshot
 ```
 
-Submission is all-or-nothing: `200 OK` means the entire batch has been
-accepted for processing. It does not mean the URLs have already been
-crawled. Crawling is asynchronous, respects robots.txt and crawler politeness,
-and uses the existing crawler workers alongside normal crawling.
-API jobs share crawler capacity and domain politeness limits with regular work. No completion time is guaranteed.
+Ownership follows the normal IPC rule: one consumer per partition. The API
+validates, routes each URL to the crawler that owns its domain (read-only
+`domain_state` lookup, cached per host for `route_cache_ttl_s`), writes one
+inbox file per target crawler, then the batch record. A retry rewrites the
+same inbox files.
 
-URLs are normalized, and duplicates within the request are collapsed. Every
-job fetches its own submitted URLs, including previously crawled URLs. Requests
-from different jobs are independent.
+Each crawler process runs one frontier thread that owns its SQLite file (WAL)
+and one segment thread. The reactor only schedules in memory:
 
-**Job status**
+1. Ingest: up to `MANUAL_BULK_CRAWL_INGEST_FILES` inbox files per poll go into
+   SQLite with `INSERT OR IGNORE` on `(request, id)`. Files of a missing or
+   cancelled request are deleted unread.
+2. Dispatch, while manual in-flight < `CONCURRENT_REQUESTS`: pick the eligible
+   request with the lowest stride pass (equal weights; a new or idle request
+   does not bank turns). In it, pick the ready slot (hostname) with the largest
+   `remaining * seconds_per_url + jitter`. A slot is ready below its cap,
+   `min(slot concurrency, ceil(latency / delay) + MANUAL_BULK_CRAWL_HOST_HEADROOM)`,
+   shared by all requests, and when not blocked. Each (request, slot) keeps a
+   small leased buffer (about 2 x cap rows) that the frontier thread refills.
+3. The `FairScheduler` then shares downloader dispatch between normal and
+   manual work (`MANUAL_BULK_CRAWL_SCHEDULING_POLICY`, `weighted` with
+   `MANUAL_BULK_CRAWL_SHARE_PERCENT`). Manual and normal requests use the same
+   downloader slot, robots.txt rules, retries and AutoThrottle.
+4. 429/503: the slot is blocked for `Retry-After` (at most
+   `MANUAL_BULK_CRAWL_MAX_BLOCK_S`) or `MANUAL_BULK_CRAWL_BLOCK_BASE_S * 2**n`,
+   and the URL is requeued without a record, up to
+   `MANUAL_BULK_CRAWL_MAX_REQUEUES` times.
+5. Records go to the open segment of their request. A segment closes (gzip
+   flush, fsync, rename) at `MANUAL_BULK_CRAWL_SEGMENT_BYTES` or after
+   `MANUAL_BULK_CRAWL_SEGMENT_S`; only then are its rows deleted from SQLite.
+6. Cancel or expiry: queued rows are closed in chunks of
+   `MANUAL_BULK_CRAWL_CLOSE_CHUNK` per poll and get `cancelled` / `expired`
+   records.
 
-`GET /v1/manual-bulk-crawls/{job_id}`
+Backpressure: a crawler pauses a request while its unacked bytes in that
+crawler (closed segments plus the open one) exceed
+`result_quota_bytes / MANUAL_BULK_CRAWL_SHARDS`; an ack resumes it on the next
+poll. All manual dispatch pauses while free space is below
+`MANUAL_BULK_CRAWL_MIN_FREE_GB`. The heartbeat reports `manual_queued`,
+`manual_outstanding`, `manual_unacked_bytes`, `manual_blocked_slots` and
+`manual_paused`.
 
-```json
-{
-  "job_id": "ab12cd34ef56ab78cd90ef12ab34cd56",
-  "status": "completed",
-  "total_urls": 1000,
-  "completed_urls": 1000,
-  "succeeded_urls": 990,
-  "failed_urls": 10,
-  "html_files": 993,
-  "created_at": "2026-10-17T10:00:00+00:00",
-  "started_at": "2026-10-17T10:00:01+00:00",
-  "completed_at": "2026-10-17T10:01:00+00:00",
-  "results_url": "/v1/manual-bulk-crawls/ab12cd34ef56ab78cd90ef12ab34cd56/results"
-}
-```
+Restart: the crawler resets leased and closing rows to queued and deletes its
+own `.part` files, so unpublished work is redone (at least once). Segment
+numbers continue from the highest one ever closed, so acked names are not reused.
 
-`status` is `pending`, `running` or `completed`. Unknown job IDs return `404`.
-Counts refer to normalized, unique URLs. `completed` means every URL has a
-terminal result, including failures; it does not mean every fetch succeeded.
-`succeeded_urls` counts successful HTML responses; `failed_urls` includes HTTP
-errors, transport failures and non-HTML responses. `html_files` can exceed
-`succeeded_urls` because HTML error pages are also saved. `started_at` and
-`completed_at` are null until those events occur. `results_url` is null until the job
-completes. Interrupted jobs resume from saved per-URL results; a fetch
-interrupted before its result was saved may run again.
-
-**Reading HTML results**
-
-Completed results are available over HTTP through the API.
-Clients on another machine can download them without mounting the server's
-filesystem. Use the API's reachable hostname and port as the base URL;
-all returned download URLs are relative to that origin.
-
-`GET /v1/manual-bulk-crawls/{job_id}/results`
-
-Follow the status response's `results_url` to list available files:
-
-```json
-{
-  "job_id": "ab12cd34ef56ab78cd90ef12ab34cd56",
-  "files": [
-    {
-      "name": "00000.html",
-      "url": "https://example.com/",
-      "size_bytes": 12345,
-      "download_url": "/v1/manual-bulk-crawls/ab12cd34ef56ab78cd90ef12ab34cd56/results/00000.html"
-    }
-  ]
-}
-```
-
-The list includes downloaded HTML, per-URL JSON metadata, `request.json` and
-`status.json`. Each entry gives its byte size, download URL and original
-submitted URL in `url` (after validation and normalization, before redirects).
-Job-wide files (`request.json` and `status.json`) have `url: null`.
-
-`GET /v1/manual-bulk-crawls/{job_id}/results/{filename}`
-
-Follow a file's `download_url` to download its original bytes. Files are served
-as attachments. Downloads support HTTP byte ranges for resuming transfers.
-A result-listing or file request returns `409` until the job completes, `404`
-for an unknown job or unavailable filename, or `503` if storage is unavailable.
-Errors use a JSON `error` field.
-
-`request.json` contains the normalized URL list in order. Each numbered JSON
-file identifies the original URL, final URL after redirects, HTTP status (null
-for transport failures), fetch time, error and HTML filename. A URL that did
-not return HTML has no `.html` file. HTML files contain the downloaded response
-bytes. All results become available together after all URLs finish.
-
-**Submission error responses**
-
-| HTTP status | Meaning |
-|-------------|---------|
-| `400 Bad Request` | Malformed JSON, unexpected fields, an invalid URL, or a URL list outside the permitted size. |
-| `415 Unsupported Media Type` | Content type is not JSON. |
-| `500 Internal Server Error` | An unexpected internal failure prevented submission. The entire batch was rejected. |
-| `503 Service Unavailable` | A temporary service or resource availability problem prevented submission, such as full temporary storage. The entire batch was rejected. |
-
-API errors use an `error` field, for example:
-
-```json
-{"error":"Invalid HTTP(S) URL at index 1"}
-```
-
-URL indices are zero-based.
-
-For `500`, the response is:
-
-```json
-{"error":"Submission failed; no URLs accepted"}
-```
-
-For `503`, the response is:
-
-```json
-{"error":"Submission unavailable; no URLs accepted"}
-```
-
-**Retries and batch behavior**
-
-- A `200` response accepts the entire batch. Do not resubmit it merely because
-  crawling has not completed yet.
-- A `500` or `503` response accepts none of the URLs. There is no partial-success
-  response or per-URL acceptance count.
-- After `503`, retry the entire request with a delay between attempts.
-- After `500`, investigate the failure before retrying; immediate retries may
-  encounter the same internal error.
-- After `400` or `415`, correct the request before resubmitting.
-- If the connection is lost without an HTTP response, acceptance is unknown.
-  Retrying may create a second job and fetch the URLs again; this endpoint
-  does not provide cross-request idempotency.
-
-## 3.7 Manual Bulk Crawl Processing
-
-Input: per-crawler job entries under `MANUAL_BULK_CRAWL_QUEUE_DIR/crawler_{id:02d}`
-(default `/data/manual_bulk_crawls/pending/crawler_{id:02d}`).
-
-The existing `html_spider` workers also consume API jobs. The API resolves each
-URL to the crawler that owns its domain's shard, using read-only routing data.
-The routing configuration is selected by `ingest_config_path` in
-`containers/api/config/config.yml`; PostgreSQL connection settings remain in
-that API configuration. It neither inserts domains nor updates URL scheduling
-flags. API requests use
-the same downloader, domain slots, robots.txt rules, retry policy and
-AutoThrottle settings as regular requests.
-
-Responsibilities:
-
-- Consume only this crawler's queue partition. Run one live crawler process per
-  crawler ID, as with normal IPC. Different crawlers can process one job
-  concurrently without file locks.
-- Configure `MANUAL_BULK_CRAWL_SCHEDULING_POLICY` and
-  `MANUAL_BULK_CRAWL_SHARE_PERCENT` on the crawler (both passed through
-  Compose); restart crawlers after changing them. The default is `weighted`
-  with a share of 50. This crawler-wide setting applies to all jobs, including
-  already queued requests; jobs and requests carry no dispatch policy.
-  Each crawler has two scheduler queues: normal and manual.
-  In `weighted` mode, while both queues have requests, the manual queue gets
-  `MANUAL_BULK_CRAWL_SHARE_PERCENT` (1–99) of the dispatches (stride
-  scheduling); a queue with nothing to send gives its turns to the other and
-  does not bank them. Neither source starves while it has work. The share
-  counts dispatches, not slot time; the per-host prefetch cap below keeps slow
-  or dead manual hosts from holding many slots.
-  In `balanced` mode, dispatch one normal request and one manual request in turn,
-  skipping an empty queue so the other uses all available dispatch capacity.
-  `manual_first` drains available manual requests before normal requests;
-  `normal_first` drains available normal requests before manual requests.
-  These are dispatch preferences, not preemption of downloads or changes to QPS.
-  Priority modes starve the lower-priority queue under continuous load; use them
-  only to drain one side. Each source retains Scrapy's
-  downloader-aware domain selection and uses FIFO queues at equal priority,
-  including startup requests. Retries retain their source and priority so new
-  URLs within the same queue cannot indefinitely overtake them.
-  Manual prefetch is bounded by `CONCURRENT_REQUESTS`; active jobs remain bounded
-  by `MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS` (default 64), overridable with
-  `CRAWLER_MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS`.
-- Admit manual jobs in submission order up to the active-job limit, then group
-  their unfinished URLs by Scrapy downloader slot (normally hostname). Within a
-  slot, preserve submission order and original URL indexes. Across slots, prefer
-  the longest estimated remaining service time: remaining URLs divided by
-  estimated QPS. QPS is estimated as `1 / max(delay, latency / concurrency)`,
-  using live downloader slot settings when available, otherwise crawler settings
-  and `DOWNLOAD_SLOTS` overrides. Latency starts at one second and uses an
-  exponentially smoothed `download_latency` from responses (20% new sample).
-  A slot's prefetch cap is its concurrency, but with a delay it is at most
-  `ceil(latency / delay)` plus `MANUAL_BULK_CRAWL_HOST_HEADROOM` (default 1):
-  the slot starts one request per delay, so further requests would only wait
-  in the slot and count against `CONCURRENT_REQUESTS`. The cap has no fixed
-  value: AutoThrottle keeps a slot's delay at least `latency / TARGET_CONCURRENCY`,
-  so the cap follows the target (target 2.0 gives 3 with headroom 1, target 4.0
-  gives 5). The manual consumer sets no per-host rate of its own; the slot delay
-  is the only per-host pacing, the same as for normal requests.
-  Among slots below their prefetch cap, select the largest estimated remaining
-  service time, plus a fixed random jitter of less than one second per domain.
-  A slot at its cap leaves the queue, so the free capacity goes to smaller
-  slots: a large host cannot hold back a small one, in its own job or another.
-  An indexed priority queue (`pqdict`) keeps one entry per eligible slot and
-  updates its priority in place.
-  Each slot's manual outstanding URLs (queued, downloading or retrying), across
-  all jobs, are held to this prefetch cap. Redirects and retries keep the
-  original request's `download_slot`, so they stay on, and are charged to, the
-  original slot until the URL's final result. Refill immediately on
-  completion, and refresh live slot settings on each poll. These are prefetch
-  decisions; the shared downloader still enforces actual politeness for both
-  normal and manual work. Jobs outside the active window wait for admission.
-- Fetch only submitted URLs. Dedicated callbacks save HTML and metadata without
-  emitting PageItems, discovering outlinks or entering the normal result pipeline.
-- Write results and atomically replace progress only within
-  `result_dir/{job_id}/crawler_{id:02d}`. Each partition has one writer.
-- Remove only this crawler's queue entry after its completed progress is saved.
-  Resume unfinished entries from durable per-URL records after restart; a fetch
-  interrupted before its record was saved may run again.
-- On a job failure, drain its outstanding callbacks before retrying. Other jobs
-  and crawler partitions continue independently.
-
-The API creates output partitions and queue entries before atomically publishing
-an immutable job manifest. Entries without a manifest are ignored, so a failed
-submission cannot expose part of a batch. Concurrent API workers publish distinct
-jobs without sharing a mutable queue file.
-
-The API computes job status by summing each assigned crawler's progress. A job is
-completed only when every partition has a completion timestamp; result listing
-and downloads remain unavailable until then. No crawler publishes a shared final
-status or moves the whole result directory. Download filenames stay flat; the API
-resolves each numbered file to its owning crawler partition.
-
-Only the API and its GC process delete jobs. They atomically retire the manifest
-to hide the job, then move its output directory out of the visible namespace
-before removing it. Crawlers never create output directories, so late callbacks
-cannot recreate deleted results. GC retries interrupted cleanup and removes
-expired, uncommitted preparations too.
-
-The API and normal crawler container share a separate host directory, configured
-by `MANUAL_BULK_CRAWL_DATA_DIR` in Compose (default `/data/manual_bulk_crawls`). The
-crawler does not read API configuration. The API publishes URLs, assigned crawler
-IDs and the output root in each job message. The crawler reads only its own
-settings; `CRAWLER_MANUAL_BULK_CRAWL_QUEUE_DIR` selects the input queue and must
-match the API publisher's `manual_bulk_crawl.pending_dir`. No new crawler processes or SQL dispatcher threads
-are started. API jobs share crawler capacity and politeness budgets, while their
-results stay outside `/data/ipc/crawl_result` and never enter ingestion or feature
-extraction.
+GC (`containers.api.manual_bulk_crawl_gc`, every `gc_interval_sec`) removes a
+request `gc_grace_days` after it expires, or once it is cancelled, all its
+segments are acked, no inbox file or open segment remains, and every crawler
+snapshot taken after the cancel reports nothing queued or leased.
