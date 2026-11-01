@@ -124,12 +124,29 @@ ITEM_PIPELINES = {
 
 URL_QUEUE_TEMPLATE = "/data/ipc/url_queue/crawler_{id:02d}"
 RESULT_DIR_TEMPLATE = "/data/ipc/crawl_result/crawler_{id:02d}"
-# Transport location and resource limits belong to the crawler. Per-job output
-# destinations arrive in the queue payload, without reading API configuration.
-MANUAL_BULK_CRAWL_QUEUE_DIR = os.getenv(
-    "CRAWLER_MANUAL_BULK_CRAWL_QUEUE_DIR", "/data/manual_bulk_crawls/pending",
-)
-MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS = int(os.getenv("CRAWLER_MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS", "64"))
+# Crawl requests (bulk crawl v2). The crawler reads no API configuration; the API
+# and crawlers share this root (inbox, frontier, segments, status).
+def _manual(name: str, default: str, kind=int):
+    return kind(os.getenv(f"CRAWLER_MANUAL_BULK_CRAWL_{name}", default))
+
+
+MANUAL_BULK_CRAWL_ROOT = os.getenv("CRAWLER_MANUAL_BULK_CRAWL_ROOT", "/data/manual_bulk_crawls")
 # Outstanding manual requests per host: latency / delay rounded up, plus this headroom.
-MANUAL_BULK_CRAWL_HOST_HEADROOM = int(os.getenv("CRAWLER_MANUAL_BULK_CRAWL_HOST_HEADROOM", "1"))
+MANUAL_BULK_CRAWL_HOST_HEADROOM = _manual("HOST_HEADROOM", "1")
+MANUAL_BULK_CRAWL_POLL_S = _manual("POLL_S", "1", float)  # Inbox, cancel/expiry and quota checks
+MANUAL_BULK_CRAWL_INGEST_FILES = _manual("INGEST_FILES", "8")  # Inbox files moved into SQLite per poll
+MANUAL_BULK_CRAWL_CLOSE_CHUNK = _manual("CLOSE_CHUNK", "10000")  # Cancelled/expired rows per poll
+MANUAL_BULK_CRAWL_SEGMENT_BYTES = _manual("SEGMENT_BYTES", str(64 * 1024 * 1024))
+MANUAL_BULK_CRAWL_SEGMENT_S = _manual("SEGMENT_S", "60", float)
+MANUAL_BULK_CRAWL_GZIP_LEVEL = _manual("GZIP_LEVEL", "6")
+MANUAL_BULK_CRAWL_STATUS_S = _manual("STATUS_S", "60", float)
+MANUAL_BULK_CRAWL_TOP_HOSTS = _manual("TOP_HOSTS", "10")
+# Each crawler pauses a request once its unacked bytes exceed result_quota / SHARDS.
+MANUAL_BULK_CRAWL_SHARDS = _manual("SHARDS", "16")
+MANUAL_BULK_CRAWL_MIN_FREE_GB = _manual("MIN_FREE_GB", "300", float)  # Pause all manual dispatch below
+# 429/503: block the slot for Retry-After or BLOCK_BASE_S * 2**n, at most MAX_BLOCK_S,
+# and requeue the URL up to MAX_REQUEUES times before a terminal http_<code> record.
+MANUAL_BULK_CRAWL_MAX_REQUEUES = _manual("MAX_REQUEUES", "5")
+MANUAL_BULK_CRAWL_BLOCK_BASE_S = _manual("BLOCK_BASE_S", "30", float)
+MANUAL_BULK_CRAWL_MAX_BLOCK_S = _manual("MAX_BLOCK_S", "3600", float)
 INTERVAL_MINUTES = 10

@@ -5,7 +5,7 @@ from scrapy.core.scheduler import BaseScheduler, Scheduler
 from scrapy.dupefilters import BaseDupeFilter
 
 POLICIES = ("weighted", "balanced", "manual_first", "normal_first")
-MANUAL = "manual_bulk_crawl_job_id"
+MANUAL = "crawl_request"  # Request meta key: (request_id, frontier rowid)
 
 
 class FairScheduler(BaseScheduler):

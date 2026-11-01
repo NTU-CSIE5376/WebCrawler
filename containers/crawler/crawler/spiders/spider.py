@@ -17,6 +17,7 @@ from twisted.internet import task as twisted_task
 from crawler.items import PageItem
 from crawler.queue_consumer import QueueConsumer
 from crawler.youtube_extractor import extract_youtube_outlinks
+from crawler.fair_scheduler import MANUAL
 from crawler.manual_bulk_crawls import ManualBulkCrawlConsumer
 from libs.obslog import configure as configure_logging
 from libs.urls import host_of
@@ -31,7 +32,7 @@ MAX_HEADER_VALUE_LEN = 500
 
 
 def _source(request) -> str:
-    return "manual" if "manual_bulk_crawl_job_id" in request.meta else "normal"
+    return "manual" if MANUAL in request.meta else "normal"
 
 class HtmlSpider(scrapy.Spider):
     name = "html_spider"
@@ -329,7 +330,7 @@ class HtmlSpider(scrapy.Spider):
         domains_at_limit = self._count_domains_at_limit()
         downloader = getattr(getattr(self.crawler, "engine", None), "downloader", None)
         manual_active = sum(
-            "manual_bulk_crawl_job_id" in r.meta for r in getattr(downloader, "active", ()) or ()
+            MANUAL in r.meta for r in getattr(downloader, "active", ()) or ()
         )
         stats = self.crawler.stats
         consumer = self.manual_bulk_crawls
@@ -354,14 +355,13 @@ class HtmlSpider(scrapy.Spider):
                 "engine_slot_inprogress": scheduler_runtime["engine_slot_inprogress"],
                 "scheduler_size": scheduler_runtime["scheduler_size"],
                 "domains_at_limit": domains_at_limit,
-                # Per-source counters; dequeued and save totals are cumulative.
+                # Per-source counters; dequeued totals are cumulative.
                 "manual_active": manual_active,
                 "normal_active": len(getattr(downloader, "active", ()) or ()) - manual_active,
-                "manual_outstanding": len(consumer.inflight),
                 "dequeued_normal": stats.get_value("scheduler/dequeued/normal", 0),
                 "dequeued_manual": stats.get_value("scheduler/dequeued/manual", 0),
-                "manual_saves": consumer.saves,
-                "manual_save_ms": round(consumer.save_seconds * 1000),
+                # Frontier queued, outstanding, unacked bytes, blocked slots, pause reason.
+                **consumer.heartbeat(),
             },
         )
 

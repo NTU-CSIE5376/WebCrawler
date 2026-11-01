@@ -49,12 +49,12 @@ def scheduler_factory(tmp_path):
 def request(source, index, **kwargs):
     meta = kwargs.pop("meta", {})
     if source == "manual":
-        meta["manual_bulk_crawl_job_id"] = "a" * 32
+        meta["crawl_request"] = "a" * 32
     return Request(f"https://example.com/{source}/{index}", meta=meta, **kwargs)
 
 
 def source(request):
-    return "manual" if "manual_bulk_crawl_job_id" in request.meta else "normal"
+    return "manual" if "crawl_request" in request.meta else "normal"
 
 
 def test_round_robin_alternates_sources_and_preserves_fifo(scheduler_factory):
