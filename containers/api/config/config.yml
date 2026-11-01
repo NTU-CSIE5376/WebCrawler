@@ -8,10 +8,24 @@ ingest_config_path: "containers/scheduler_ingest/config/ingest.yaml"
 postgres:
   dsn: "postgresql+psycopg2://crawler:crawler@172.16.191.1:5432/crawlerdb"
 
-manual_bulk_crawl:
-  gc_interval_sec: 3600  # Expired manual bulk crawl jobs are removed hourly.
-  # The API publishes result_dir in each job; the crawler reads no API config.
-  pending_dir: "/data/manual_bulk_crawls/pending"
-  result_dir: "/data/manual_bulk_crawls/results"
-  max_urls: 10000
+crawl_requests:
+  # Shared with the crawlers (same bind mount); the crawler reads no API config.
+  root: "/data/manual_bulk_crawls"
+  # YAML mapping of bearer token -> tenant name. Kept out of the repository.
+  tokens_file: "/data/manual_bulk_crawls/tokens.yml"
+  max_urls: 10000              # URL items per POST .../urls
   max_url_length: 2500
+  max_result_quota_gb: 100     # Default and cap for result_quota_gb (GB = 10^9 bytes)
+  default_expires_days: 30
+  max_expires_days: 60
+  # Admission control: 503 + Retry-After when any limit is exceeded.
+  max_inbox_files: 64          # Unconsumed inbox files per target crawler
+  min_free_gb: 300             # Free space under root
+  max_tenant_queued_urls: 5000000
+  retry_after_s: 30
+  route_cache_ttl_s: 86400     # Host -> crawler routing cache
+  long_poll_max_s: 60          # Upper bound for GET .../segments?wait=
+  long_poll_interval_s: 1
+  top_hosts: 10                # Hosts listed in a request's status
+  gc_interval_sec: 3600
+  gc_grace_days: 3             # Keep expired requests' unacked segments this long
