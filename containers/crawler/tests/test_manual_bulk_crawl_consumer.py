@@ -408,23 +408,33 @@ def test_full_capacity_spreads_over_many_hosts_at_their_caps(queue):
         consumer.close()
 
 
-def test_waiting_small_host_overtakes_a_newer_larger_one(queue, monkeypatch):
-    import containers.crawler.crawler.manual_bulk_crawls as consumer_module
-
-    clock = [1000.0]
-    monkeypatch.setattr(consumer_module, "monotonic", lambda: clock[0])
+def test_longest_remaining_host_goes_first_across_jobs(queue):
     enqueue, factory, _ = queue
     enqueue("old", urls=[f"https://small.example/{i}" for i in range(2)])
     consumer, requests = factory(concurrency=1)
     try:
         consumer.poll()
         assert requests[0].url.startswith("https://small.example/")
-        clock[0] += 500
         enqueue("new", urls=[f"https://big.example/{i}" for i in range(200)])
         consumer.poll()
         complete(consumer, requests[0])
-        # 1 URL left plus 500 s waited outranks 200 URLs at 1 s each that waited 0 s.
-        assert requests[1].url.startswith("https://small.example/")
+        # 200 URLs left outrank 1, however long the older job has waited.
+        assert requests[1].url.startswith("https://big.example/")
+    finally:
+        consumer.close()
+
+
+def test_a_host_at_its_cap_leaves_free_slots_to_smaller_hosts(queue):
+    enqueue, factory, _ = queue
+    enqueue("old", urls=[f"https://small.example/{i}" for i in range(2)])
+    enqueue("new", urls=[f"https://big.example/{i}" for i in range(200)])
+    consumer, requests = factory(concurrency=4, slot_settings={
+        "big.example": {"delay": 0.5, "concurrency": 16}})
+    try:
+        consumer.poll()
+        hosts = [request.url.split("/")[2] for request in requests]
+        # big.example goes first but stops at its cap of 3 (latency 1.0 / delay 0.5 + 1).
+        assert hosts == ["big.example"] * 3 + ["small.example"]
     finally:
         consumer.close()
 

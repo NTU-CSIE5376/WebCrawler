@@ -384,9 +384,9 @@ Responsibilities:
   gives 5). The manual consumer sets no per-host rate of its own; the slot delay
   is the only per-host pacing, the same as for normal requests.
   Among slots below their prefetch cap, select the largest estimated remaining
-  service time plus the seconds the slot's oldest job has waited since
-  admission, plus a fixed random jitter of less than one second per domain.
-  The wait term lets a small host of an old job overtake newer, larger hosts.
+  service time, plus a fixed random jitter of less than one second per domain.
+  A slot at its cap leaves the queue, so the free capacity goes to smaller
+  slots: a large host cannot hold back a small one, in its own job or another.
   An indexed priority queue (`pqdict`) keeps one entry per eligible slot and
   updates its priority in place.
   Each slot's manual outstanding URLs (queued, downloading or retrying), across

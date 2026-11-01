@@ -27,7 +27,6 @@ class _ActiveJob:
     pending: set[int]
     inflight: set[int] = field(default_factory=set)
     failed: bool = False
-    admitted_at: float = 0.0
 
 
 @dataclass
@@ -123,7 +122,6 @@ class ManualBulkCrawlConsumer:
 
     def _refresh_priorities(self, hosts: Iterable[str] | None = None) -> None:
         """Update queue eligibility and scores for selected hosts, or all hosts."""
-        now = monotonic()
         for host in list(self.domains) if hosts is None else hosts:
             domain = self.domains[host]
             if not domain.pending:
@@ -136,11 +134,9 @@ class ManualBulkCrawlConsumer:
                 self.ready.pop(host, None)
                 continue
             remaining = len(domain.pending) + domain.outstanding
-            # Prefer the longest remaining service time, with fixed sub-second jitter. The
-            # wait of the host's oldest job is added so a small host is not passed over
-            # forever by newer, larger ones.
-            waited = now - self.jobs[domain.pending[0][0]].admitted_at
-            self.ready[host] = remaining * seconds_per_url + waited + domain.jitter
+            # Prefer the longest remaining service time, with fixed sub-second jitter. A host
+            # at its cap leaves the queue, so smaller hosts get the free slots.
+            self.ready[host] = remaining * seconds_per_url + domain.jitter
 
     def _discard_pending(self, job_id, job):
         if not job.pending:
@@ -166,8 +162,7 @@ class ManualBulkCrawlConsumer:
             )
             for batch in islice(batches, self.max_active_jobs - len(self.jobs)):
                 job_id = batch.path.stem
-                self.jobs[job_id] = _ActiveJob(batch=batch, pending=set(batch.remaining),
-                                               admitted_at=monotonic())
+                self.jobs[job_id] = _ActiveJob(batch=batch, pending=set(batch.remaining))
                 for index in sorted(batch.remaining):
                     # Use the hostname as the downloader slot key.
                     host = host_of(batch.urls[index])
