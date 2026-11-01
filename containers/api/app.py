@@ -1,29 +1,37 @@
 """FastAPI entry point for the crawler's external API."""
 from __future__ import annotations
 
+import asyncio
 import errno
+import hmac
 import logging
+from typing import Any
 
 import psycopg2
-from fastapi import Depends, FastAPI, Request, Response
+from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
-from sqlalchemy.exc import SQLAlchemyError, TimeoutError as PoolTimeoutError
+from libs.config.loader import load_yaml
+from libs.obslog import configure
+from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, StrictStr
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException
 
-from libs.obslog import configure
-from libs.urls import MAX_URL_LEN
-from libs.ipc.manual_bulk_crawl import (
-    DEFAULT_TTL_DAYS, MAX_TTL_DAYS,
-)
 from .body_limit import RequestBodyLimitMiddleware
 from .config_loader import api_config_path, load_api_config
+from .crawl_requests import (
+    CrawlRequestService,
+    RequestClosed,
+    RequestNotFound,
+    Unavailable,
+)
 from .routing import ManualBulkCrawlRouter
-from .service import JobNotCompleted, ManualBulkCrawlService, validate_manual_bulk_crawl_request
-
 
 logger = logging.getLogger("api")
+
+SQLITE_INT_MIN, SQLITE_INT_MAX = -(2 ** 63), 2 ** 63 - 1
 
 
 def temporary_storage_error(error: Exception) -> bool:
@@ -44,11 +52,34 @@ def temporary_storage_error(error: Exception) -> bool:
     return isinstance(underlying, (psycopg2.OperationalError, psycopg2.InterfaceError))
 
 
-class ManualBulkCrawlRequest(BaseModel):
+class CreateCrawlRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    urls: list[StrictStr]
-    ttl_days: StrictInt = Field(default=DEFAULT_TTL_DAYS, ge=1, le=MAX_TTL_DAYS)
+    name: StrictStr = Field(min_length=1)
+    result_quota_gb: StrictInt | StrictFloat | None = Field(default=None, gt=0)
+    expires_days: StrictInt | None = Field(default=None, ge=1)
+
+
+class UrlItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: StrictStr
+    # Any value: a bad URL skips its item as "invalid" instead of failing the batch.
+    url: Any
+    priority: StrictInt = Field(ge=SQLITE_INT_MIN, le=SQLITE_INT_MAX)
+
+
+class UrlBatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: StrictStr = Field(min_length=1)
+    urls: list[UrlItem]
+
+
+class AckSegments(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    segments: list[StrictStr]
 
 
 def require_json(request: Request):
@@ -58,7 +89,16 @@ def require_json(request: Request):
         raise HTTPException(415, "Content-Type must be application/json")
 
 
-def create_app(config_path: str | None = None, *, service=None) -> FastAPI:
+def load_tokens(path: str) -> dict[str, str]:
+    tokens = load_yaml(path)
+    if not isinstance(tokens, dict) or not tokens or not all(
+            isinstance(token, str) and token and isinstance(tenant, str) and tenant
+            for token, tenant in tokens.items()):
+        raise ValueError("crawl_requests.tokens_file must map non-empty tokens to tenant names")
+    return tokens
+
+
+def create_app(config_path: str | None = None, *, service=None, tokens=None) -> FastAPI:
     app = FastAPI(title="Crawler API", redirect_slashes=False)
     config_path = api_config_path(config_path)
     config = load_api_config(config_path)
@@ -67,94 +107,106 @@ def create_app(config_path: str | None = None, *, service=None) -> FastAPI:
         raise ValueError("max_content_length must be a positive integer")
     app.state.max_content_length = max_content_length
     app.add_middleware(RequestBodyLimitMiddleware, max_bytes=max_content_length)
-    crawl_config = config["manual_bulk_crawl"]
-    max_urls = int(crawl_config.get("max_urls", 10000))
-    max_url_length = int(crawl_config.get("max_url_length", MAX_URL_LEN))
-    if max_urls < 1:
-        raise ValueError("manual_bulk_crawl.max_urls must be positive")
-    if not 1 <= max_url_length <= MAX_URL_LEN:
-        raise ValueError(f"manual_bulk_crawl.max_url_length must be between 1 and {MAX_URL_LEN}")
-
+    crawl_config = config["crawl_requests"]
+    if tokens is None:
+        tokens = load_tokens(crawl_config["tokens_file"])
     if service is None:
         configure(service="api")
-        service = ManualBulkCrawlService(
-            crawl_config, route_urls=ManualBulkCrawlRouter(config),
-        )
-    app.state.manual_bulk_crawl = service
+        service = CrawlRequestService(crawl_config, route_urls=ManualBulkCrawlRouter(config))
+    app.state.crawl_requests = service
+    retry_after = {"Retry-After": str(service.retry_after_s)}
+
+    def authenticate(request: Request) -> str:
+        scheme, _, token = request.headers.get("authorization", "").partition(" ")
+        if scheme.lower() == "bearer" and token:
+            for known, name in tokens.items():
+                if hmac.compare_digest(known.encode(), token.strip().encode()):
+                    return name
+        raise HTTPException(401, "Missing or unknown bearer token", headers={"WWW-Authenticate": "Bearer"})
 
     @app.get("/healthz")
     def health():
         return {"status": "ok"}
 
-    @app.post("/v1/manual-bulk-crawls", dependencies=[Depends(require_json)])
-    def create_manual_bulk_crawl(payload: ManualBulkCrawlRequest):
-        # Synchronous handlers run in FastAPI's thread pool, including routing
-        # and file operations. Shared validation runs before any work is published.
-        payload = payload.model_dump()
-        try:
-            urls, ttl_days = validate_manual_bulk_crawl_request(payload, max_urls, max_url_length)
-        except ValueError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=400)
-        try:
-            return {"job_id": service.submit(urls, ttl_days=ttl_days)}
-        except (OSError, SQLAlchemyError, psycopg2.Error) as exc:
-            logger.exception("submission.storage_failed")
-            if temporary_storage_error(exc):
-                return JSONResponse({"error": "Submission unavailable; no URLs accepted"}, status_code=503)
-            return JSONResponse({"error": "Submission failed; no URLs accepted"}, status_code=500)
-        except Exception:
-            logger.exception("submission.failed")
-            return JSONResponse({"error": "Submission failed; no URLs accepted"}, status_code=500)
+    @app.post("/v1/crawl-requests", status_code=201, dependencies=[Depends(require_json)])
+    def create_crawl_request(payload: CreateCrawlRequest, tenant: str = Depends(authenticate)):
+        return service.create(tenant, payload.name, payload.result_quota_gb, payload.expires_days)
 
-    @app.delete("/v1/manual-bulk-crawls/{job_id}", status_code=204)
-    def delete_manual_bulk_crawl(job_id: str):
-        service.delete(job_id)
-        return Response(status_code=204)
+    @app.get("/v1/crawl-requests")
+    def list_crawl_requests(tenant: str = Depends(authenticate)):
+        return {"requests": service.list(tenant)}
 
-    @app.get("/v1/manual-bulk-crawls/{job_id}")
-    def manual_bulk_crawl_status(job_id: str):
-        try:
-            status = service.status(job_id)
-            status.pop("result_dir", None)
-            status["results_url"] = (
-                str(app.url_path_for("list_manual_bulk_crawl_results", job_id=job_id))
-                if status["status"] == "completed" else None
-            )
-            return status
-        except FileNotFoundError:
-            return JSONResponse({"error": "Job not found"}, status_code=404)
-        except OSError:
-            logger.exception("manual_bulk_crawl.status_unavailable")
-            return JSONResponse({"error": "Job status unavailable"}, status_code=503)
+    @app.post("/v1/crawl-requests/{request_id}/urls", status_code=202, dependencies=[Depends(require_json)])
+    def submit_urls(request_id: str, payload: UrlBatch, tenant: str = Depends(authenticate)):
+        # Synchronous handlers run in FastAPI's thread pool, including routing and file writes.
+        if not 1 <= len(payload.urls) <= service.max_urls:
+            return JSONResponse({"error": f'"urls" must contain 1 to {service.max_urls} items'},
+                                status_code=400)
+        return service.submit(tenant, request_id, payload.batch_id,
+                              [item.model_dump() for item in payload.urls])
 
-    @app.get("/v1/manual-bulk-crawls/{job_id}/results")
-    def list_manual_bulk_crawl_results(job_id: str):
-        files = service.result_files(job_id)
-        for file in files:
-            file["download_url"] = str(app.url_path_for(
-                "download_manual_bulk_crawl_result", job_id=job_id, filename=file["name"],
-            ))
-        return {"job_id": job_id, "files": files}
+    @app.post("/v1/crawl-requests/{request_id}/seal")
+    def seal_crawl_request(request_id: str, tenant: str = Depends(authenticate)):
+        service.seal(tenant, request_id)
+        return {"sealed": True}
 
-    @app.get("/v1/manual-bulk-crawls/{job_id}/results/{filename}")
-    def download_manual_bulk_crawl_result(job_id: str, filename: str):
-        path = service.result_file(job_id, filename)
-        return FileResponse(path.resolve(), filename=filename,
-                            media_type="application/octet-stream",
+    @app.delete("/v1/crawl-requests/{request_id}", status_code=202)
+    def cancel_crawl_request(request_id: str, tenant: str = Depends(authenticate)):
+        service.cancel(tenant, request_id)
+        return {"cancelled": True}
+
+    @app.get("/v1/crawl-requests/{request_id}")
+    def crawl_request_status(request_id: str, tenant: str = Depends(authenticate)):
+        return service.status(tenant, request_id)
+
+    @app.get("/v1/crawl-requests/{request_id}/segments")
+    async def list_segments(request_id: str, wait: float = Query(0, ge=0), tenant: str = Depends(authenticate)):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + min(wait, service.long_poll_max_s)
+        while True:
+            segments = await run_in_threadpool(service.list_segments, tenant, request_id)
+            remaining = deadline - loop.time()
+            if segments or remaining <= 0:
+                return {"segments": segments}
+            # Sleep on the event loop so a long poll holds no worker thread.
+            await asyncio.sleep(min(service.long_poll_interval_s, remaining))
+
+    @app.get("/v1/crawl-requests/{request_id}/segments/{name}")
+    def download_segment(request_id: str, name: str, tenant: str = Depends(authenticate)):
+        return FileResponse(service.segment_path(tenant, request_id, name).resolve(),
+                            media_type="application/gzip", filename=name,
                             headers={"X-Content-Type-Options": "nosniff"})
 
-    @app.exception_handler(JobNotCompleted)
-    def incomplete_job(request: Request, error):
-        return JSONResponse({"error": "Job results are not ready"}, status_code=409)
+    @app.post("/v1/crawl-requests/{request_id}/ack", dependencies=[Depends(require_json)])
+    def ack_segments(request_id: str, payload: AckSegments, tenant: str = Depends(authenticate)):
+        return {"deleted": service.ack(tenant, request_id, payload.segments)}
 
-    @app.exception_handler(FileNotFoundError)
-    def missing_result(request: Request, error):
-        return JSONResponse({"error": "Job or result file not found"}, status_code=404)
+    @app.exception_handler(RequestNotFound)
+    def request_not_found(request: Request, error):
+        return JSONResponse({"error": "Crawl request or segment not found"}, status_code=404)
+
+    @app.exception_handler(RequestClosed)
+    def request_closed(request: Request, error):
+        return JSONResponse({"error": "Crawl request is sealed, cancelled or expired"}, status_code=409)
+
+    @app.exception_handler(Unavailable)
+    def unavailable(request: Request, error):
+        return JSONResponse({"error": "Submission unavailable; retry later", "reason": str(error)},
+                            status_code=503, headers=retry_after)
 
     @app.exception_handler(OSError)
-    def unavailable_result(request: Request, error):
-        logger.error("manual_bulk_crawl.results_unavailable", exc_info=error)
-        return JSONResponse({"error": "Job results unavailable"}, status_code=503)
+    def storage_error(request: Request, error):
+        logger.error("crawl_requests.storage_failed", exc_info=error)
+        if temporary_storage_error(error):
+            return JSONResponse({"error": "Storage unavailable; retry later"}, status_code=503,
+                                headers=retry_after)
+        return JSONResponse({"error": "Storage failed"}, status_code=500)
+
+    @app.exception_handler(SQLAlchemyError)
+    def database_error(request: Request, error):
+        logger.error("crawl_requests.database_failed", exc_info=error)
+        return JSONResponse({"error": "Routing unavailable; retry later"}, status_code=503,
+                            headers=retry_after)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, error):
