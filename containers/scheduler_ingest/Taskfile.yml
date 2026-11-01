@@ -1,0 +1,24 @@
+version: '3'
+
+vars:
+  REPO_ROOT: '{{.TASKFILE_DIR}}/../..'
+  PYTHON_BIN: python3
+
+tasks:
+  install:
+    desc: Install requirements into a service-local Python virtual environment
+    dir: '{{.TASKFILE_DIR}}'
+    cmds:
+      - '{{.PYTHON_BIN}} -m venv .venv'
+      - .venv/bin/python -m pip install -r requirements.txt
+
+  test:
+    desc: Run scheduler_ingest pytest tests on the host
+    dir: '{{.REPO_ROOT}}'
+    preconditions:
+      - sh: test -x '{{.TASKFILE_DIR}}/.venv/bin/python'
+        msg: Run task install first
+    cmds:
+      - >-
+        '{{.TASKFILE_DIR}}/.venv/bin/python'
+        -m pytest containers/scheduler_ingest/tests -q -p no:cacheprovider {{.CLI_ARGS}}

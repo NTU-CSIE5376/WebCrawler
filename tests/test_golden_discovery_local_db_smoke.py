@@ -52,7 +52,10 @@ class GoldenDiscoveryLocalDBSmokeTest(unittest.TestCase):
                         domain_id BIGINT,
                         domain_score DOUBLE PRECISION,
                         last_scheduled TIMESTAMPTZ,
-                        num_scheduled_90d INTEGER NOT NULL DEFAULT 0
+                        num_scheduled_90d INTEGER NOT NULL DEFAULT 0,
+                        inlink_count_approx INTEGER NOT NULL DEFAULT 0,
+                        inlink_count_external INTEGER NOT NULL DEFAULT 0,
+                        anchor_text VARCHAR
                     )
                     """
                 )

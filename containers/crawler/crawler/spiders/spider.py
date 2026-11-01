@@ -6,7 +6,6 @@ import tldextract
 from w3lib.url import canonicalize_url
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import urlparse
 
 import scrapy
 from scrapy import signals
@@ -18,7 +17,9 @@ from twisted.internet import task as twisted_task
 from crawler.items import PageItem
 from crawler.queue_consumer import QueueConsumer
 from crawler.youtube_extractor import extract_youtube_outlinks
+from crawler.manual_bulk_crawls import ManualBulkCrawlConsumer
 from libs.obslog import configure as configure_logging
+from libs.urls import host_of
 
 logger = logging.getLogger("crawler")
 
@@ -49,6 +50,7 @@ class HtmlSpider(scrapy.Spider):
 
         qtpl = crawler.settings["URL_QUEUE_TEMPLATE"]
         spider.queue = QueueConsumer(queue_dir=qtpl.format(id=spider.crawler_id))
+        spider.manual_bulk_crawls = ManualBulkCrawlConsumer(spider)
         spider.link_extractor = LinkExtractor(canonicalize=True)
 
         spider.domain_low_watermark = max(
@@ -278,6 +280,7 @@ class HtmlSpider(scrapy.Spider):
             self._maybe_top_up(reason=f"{reason}_low_watermark")
 
     def spider_opened(self, spider=None):
+        self.manual_bulk_crawls.start()
         settings = self.crawler.settings
         logger.info(
             "crawler.config",
@@ -310,6 +313,7 @@ class HtmlSpider(scrapy.Spider):
             self._heartbeat_task.start(self.heartbeat_interval_sec, now=False)
 
     def spider_closed(self, spider=None, reason: str | None = None):
+        self.manual_bulk_crawls.close()
         if self._heartbeat_task is not None and self._heartbeat_task.running:
             self._heartbeat_task.stop()
         self._heartbeat_task = None
@@ -394,7 +398,7 @@ class HtmlSpider(scrapy.Spider):
                 "anchor": (link.text or "").strip()[:200]
             })
 
-        host = urlparse(response.url).hostname or ""
+        host = host_of(response.url)
         if host == "youtube.com" or host.endswith(".youtube.com"):
             extract_youtube_outlinks(response, outlinks)
 
@@ -454,7 +458,7 @@ class HtmlSpider(scrapy.Spider):
             extra={
                 "event": "request.fail",
                 "url": url,
-                "domain": self._host(url),
+                "domain": host_of(url),
                 "fail_reason": item["fail_reason"],
                 "status": status,
             },
@@ -462,16 +466,13 @@ class HtmlSpider(scrapy.Spider):
         self._finish_owned_request(reason="errback", domain_id=track_domain_id)
         yield item
 
-    def _host(self, url: str) -> str:
-        return (urlparse(url).hostname or "").lower()
-
     def req_scheduled(self, request):
         logger.info(
             "request.scheduled",
             extra={
                 "event": "request.scheduled",
                 "url": request.url,
-                "domain": self._host(request.url),
+                "domain": host_of(request.url),
             },
         )
     def req_start(self, request):
@@ -482,7 +483,7 @@ class HtmlSpider(scrapy.Spider):
             extra={
                 "event": "request.start",
                 "url": request.url,
-                "domain": self._host(request.url),
+                "domain": host_of(request.url),
             },
         )
     def req_end(self, response, request):
@@ -499,7 +500,7 @@ class HtmlSpider(scrapy.Spider):
             extra={
                 "event": "request.end",
                 "url": request.url,
-                "domain": self._host(request.url),
+                "domain": host_of(request.url),
                 "status": response.status,
                 "latency_ms": downloader_total_ms,
                 "download_latency_ms": download_latency_ms,

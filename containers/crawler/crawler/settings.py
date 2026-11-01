@@ -11,6 +11,17 @@ ROBOTSTXT_OBEY = True
 
 DUPEFILTER_CLASS = "scrapy.dupefilters.BaseDupeFilter" # Disable dupefilter
 
+# One dispatch policy for all jobs on this crawler; balanced alternates sources.
+MANUAL_BULK_CRAWL_SCHEDULING_POLICY = os.getenv("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", "manual_first")
+# FIFO keeps newly fed
+# requests from overtaking older ones at the same priority, including startup.
+SCHEDULER = "crawler.fair_scheduler.FairScheduler"
+SCHEDULER_MEMORY_QUEUE = "scrapy.squeues.FifoMemoryQueue"
+SCHEDULER_DISK_QUEUE = "scrapy.squeues.PickleFifoDiskQueue"
+SCHEDULER_START_MEMORY_QUEUE = None
+SCHEDULER_START_DISK_QUEUE = None
+RETRY_PRIORITY_ADJUST = 0
+
 # Default Scrapy headers trip Akamai / Cloudflare bot fingerprints (e.g.
 # wapo silently RSTs HTTP/2 streams that lack Sec-Fetch-*, surfacing as
 # TimeoutError rather than a 4xx). Match a real Chrome request.
@@ -111,4 +122,10 @@ ITEM_PIPELINES = {
 
 URL_QUEUE_TEMPLATE = "/data/ipc/url_queue/crawler_{id:02d}"
 RESULT_DIR_TEMPLATE = "/data/ipc/crawl_result/crawler_{id:02d}"
+# Transport location and resource limits belong to the crawler. Per-job output
+# destinations arrive in the queue payload, without reading API configuration.
+MANUAL_BULK_CRAWL_QUEUE_DIR = os.getenv(
+    "CRAWLER_MANUAL_BULK_CRAWL_QUEUE_DIR", "/data/manual_bulk_crawls/pending",
+)
+MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS = int(os.getenv("CRAWLER_MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS", "64"))
 INTERVAL_MINUTES = 10

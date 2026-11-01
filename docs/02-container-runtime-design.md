@@ -99,7 +99,7 @@ Crawler worker behavior:
 
 ## 2.4 `scheduler_ingest` Container
 
-Runs 4 program families via `supervisord`:
+The container has an 8-CPU limit shared by 4 program families via `supervisord`:
 
 - `router` x16
 - `ingestor` x16
@@ -160,3 +160,21 @@ Responsibilities:
 - Aggregate `fail_reasons` JSONB maps via `jsonb_set` increments.
 - Move malformed/unprocessable files into `/data/ipc/stats/bad`.
 - Emit `stats_error` delta if aggregation fails.
+
+## 2.5 `api` Container
+
+The `api` container hosts the system's external HTTP APIs using FastAPI and Uvicorn.
+It has an 8-CPU limit. Compose binds host `127.0.0.1:4000` to container port `8080`;
+set `API_BIND_ADDRESS` and `API_PORT` to change the host binding.
+
+### API Server (x5)
+
+Input: external HTTP requests.
+
+Responsibilities:
+
+- Run 1 Uvicorn parent and 4 API workers, configured in `containers/api/config/config.yml`.
+- Route requests to the registered FastAPI endpoint handlers.
+- Return JSON error responses and enforce the configured request body limit
+  (default 300 MiB), including streamed uploads.
+- Load server and feature settings from `containers/api/config/config.yml`.

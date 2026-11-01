@@ -12,6 +12,12 @@ from libs.scoring.golden_discovery_runtime import GoldenDiscoveryRuntimeScorer
 
 logger = logging.getLogger("golden_discovery_ranker_v1")
 
+# Ranker scores are clipped to [0, 1]; url_score > 1 is a manually assigned
+# priority (golden_inject = 3.0, wiki_pageview_inject = 1 + views/max) that the
+# ranker must not overwrite. Both inject scripts stamp url_score_updated_at, so
+# without this the steering TTL refresh would rescore them after a few days.
+MANUAL_PRIORITY_EXCLUDED = "(url_score IS NULL OR url_score <= 1.0)"
+
 
 @dataclass(frozen=True)
 class GoldenDiscoveryRankerConfig:
@@ -145,6 +151,7 @@ class GoldenDiscoveryRankerService:
                               AND u.should_crawl = TRUE
                               AND u.first_seen < NOW() - make_interval(days => %s)
                               AND {ttl_clause}
+                              AND {MANUAL_PRIORITY_EXCLUDED}
                             ORDER BY u.url_score_updated_at ASC NULLS FIRST
                             LIMIT %s
                             FOR UPDATE OF u SKIP LOCKED
@@ -164,6 +171,7 @@ class GoldenDiscoveryRankerService:
                         FROM {table}
                         WHERE should_crawl = TRUE
                           AND url_score_updated_at IS NULL
+                          AND {MANUAL_PRIORITY_EXCLUDED}
                         ORDER BY first_seen ASC NULLS LAST
                         FOR UPDATE SKIP LOCKED
                         LIMIT %s

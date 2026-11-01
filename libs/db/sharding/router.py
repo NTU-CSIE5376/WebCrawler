@@ -14,16 +14,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, Set, Tuple
-from urllib.parse import urlparse
+
+from libs.urls import host_of
 
 from .key import compute_shard, shard_key
-
-
-def host_of(url: str | None) -> str:
-    """Lowercased hostname for a URL string. Empty input returns ''."""
-    if not url:
-        return ""
-    return (urlparse(url).hostname or "").lower()
 
 
 @dataclass(frozen=True)

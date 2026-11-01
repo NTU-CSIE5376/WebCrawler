@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
+from libs.urls import host_of
+
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 
@@ -31,7 +33,7 @@ def normalize_url(url: object) -> str:
 
 def domain_of(url: str) -> str:
     try:
-        return normalize_domain(urlsplit(url).hostname or "")
+        return normalize_domain(host_of(url))
     except Exception:
         return ""
 

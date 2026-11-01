@@ -2,7 +2,7 @@
 
 NUM_SHARDS = 256
 
-CRAWLERDB = dict(host="172.16.191.1", port=5432, user="crawler", password="crawler", dbname="crawlerdb")
+CRAWLERDB = dict(host="172.16.191.3", port=5433, user="yugabyte", password="yugabyte", dbname="crawlerdb")
 METRICDB = dict(host="172.16.191.1", port=5433, user="metric", password="metric", dbname="metricdb")
 
 # url_state_current.source values

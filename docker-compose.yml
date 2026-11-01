@@ -76,11 +76,32 @@ services:
       - OFFERER_STRATEGY=golden_discovery_ranker_v1
     logging: *loki-logging
 
+  api:
+    build:
+      context: .
+      dockerfile: containers/api/Dockerfile
+    container_name: api
+    cpus: 8
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 140s
+    ports:
+      - "${API_BIND_ADDRESS:-127.0.0.1}:${API_PORT:-4000}:8080"
+    volumes:
+      - ./:/app:ro
+      - ${MANUAL_BULK_CRAWL_DATA_DIR:-/data/manual_bulk_crawls}:/data/manual_bulk_crawls
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
   scheduler_ingest:
     build:
       context: .
       dockerfile: containers/scheduler_ingest/Dockerfile
     container_name: scheduler_ingest
+    cpus: 8
     init: true
     restart: unless-stopped
     volumes:
@@ -96,6 +117,8 @@ services:
       dockerfile: containers/crawler/Dockerfile
     container_name: crawler
     init: true
+    environment:
+      - MANUAL_BULK_CRAWL_SCHEDULING_POLICY
     dns:
       - 8.8.8.8
       - 1.1.1.1
@@ -103,6 +126,7 @@ services:
     volumes:
       - ./:/app
       - /data/ipc:/data/ipc
+      - ${MANUAL_BULK_CRAWL_DATA_DIR:-/data/manual_bulk_crawls}:/data/manual_bulk_crawls
     logging: *loki-logging
 
   sitemap_patroller:

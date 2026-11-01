@@ -38,33 +38,28 @@ PAUSE_INTERVAL = "100 years"
 
 
 def find_targets(cur, cap: int, floor: float, sample_pct: float) -> list[dict]:
-    """Estimate per-domain pending/yield from a per-shard sample, scaled by the
-    table row estimate. Sampling keeps this off the full multi-hundred-million
-    row scans that exhaust temp space on the (nearly full) DB host."""
+    """Exact per-domain pending/yield, computed per shard.
+
+    Originally used TABLESAMPLE to avoid the full multi-hundred-million row
+    scan, but YSQL does not support TABLESAMPLE -- this now does the full
+    GROUP BY per shard (sample_pct is accepted but unused, kept so callers
+    and the CLI flag don't need to change)."""
     targets: list[dict] = []
     for shard in range(NUM_SHARDS):
         tcur = f"url_state_current_{shard:03d}"
-        cur.execute(f"SELECT reltuples::bigint FROM pg_class WHERE relname = '{tcur}'")
-        reltuples = cur.fetchone()[0]
         cur.execute(
             f"""
             SELECT domain_id,
                    count(*) AS total,
                    count(*) FILTER (WHERE should_crawl) AS pending,
                    count(*) FILTER (WHERE last_fetch_ok IS NOT NULL) AS ok
-            FROM {tcur} TABLESAMPLE SYSTEM (%s)
+            FROM {tcur}
             GROUP BY domain_id
-            """,
-            (sample_pct,),
+            """
         )
         rows = cur.fetchall()
-        sampled = sum(r[1] for r in rows)
-        if not sampled:
-            continue
-        scale = reltuples / sampled
-        for domain_id, s_total, s_pending, s_ok in rows:
-            pending = int(s_pending * scale)
-            yield_rate = s_ok / s_total if s_total else 0.0
+        for domain_id, total, pending, ok in rows:
+            yield_rate = ok / total if total else 0.0
             if pending > cap and yield_rate < floor:
                 cur.execute(
                     "SELECT domain FROM domain_state WHERE domain_id = %s", (domain_id,)
@@ -73,8 +68,8 @@ def find_targets(cur, cap: int, floor: float, sample_pct: float) -> list[dict]:
                 targets.append({
                     "shard": shard, "domain_id": domain_id,
                     "domain": row[0] if row else "?",
-                    "pending": pending, "total": int(s_total * scale),
-                    "ok": int(s_ok * scale), "yield": yield_rate,
+                    "pending": pending, "total": total,
+                    "ok": ok, "yield": yield_rate,
                 })
     return targets
 
@@ -95,15 +90,17 @@ def drain_frontier(conn, cur, t: dict, batch: int, include_history: bool) -> int
     tcur = f"url_state_current_{t['shard']:03d}"
     deleted = 0
     while True:
+        # url is the real PK of url_state_current; ctid is not available on
+        # all PG-wire-compatible targets (e.g. YSQL).
         cur.execute(
             f"""
             WITH picked AS (
-                SELECT ctid FROM {tcur}
+                SELECT url FROM {tcur}
                 WHERE domain_id = %s AND should_crawl = TRUE
                 LIMIT %s
                 FOR UPDATE SKIP LOCKED
             )
-            DELETE FROM {tcur} WHERE ctid IN (SELECT ctid FROM picked)
+            DELETE FROM {tcur} WHERE url IN (SELECT url FROM picked)
             """,
             (t["domain_id"], batch),
         )
@@ -116,14 +113,17 @@ def drain_frontier(conn, cur, t: dict, batch: int, include_history: bool) -> int
     if include_history:
         thist = f"url_state_history_{t['shard']:03d}"
         while True:
+            # url_state_history is append-only (many rows per url); its real
+            # PK is snapshot_id, not url -- ctid is not available on all
+            # PG-wire-compatible targets (e.g. YSQL).
             cur.execute(
                 f"""
                 WITH picked AS (
-                    SELECT ctid FROM {thist}
+                    SELECT snapshot_id FROM {thist}
                     WHERE domain_id = %s
                     LIMIT %s
                 )
-                DELETE FROM {thist} WHERE ctid IN (SELECT ctid FROM picked)
+                DELETE FROM {thist} WHERE snapshot_id IN (SELECT snapshot_id FROM picked)
                 """,
                 (t["domain_id"], batch),
             )

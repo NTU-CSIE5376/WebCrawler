@@ -6,12 +6,14 @@ from dataclasses import dataclass
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from libs.db.sharding.history_partition import (
     month_start,
     next_month,
     partition_month,
+    partition_name,
     partition_of_sql,
     list_partitions_sql,
 )
@@ -77,18 +79,42 @@ class CounterRolloffService:
             if kind != "p":  # not partitioned yet -> nothing to do
                 return 0
 
-            # Keep the write target ahead of the clock.
+            existing = {child for (child,) in sess.execute(text(list_partitions_sql(name)))}
+
+            # Keep the write target ahead of the clock. Checked against the
+            # existing-partitions list rather than relying on CREATE TABLE IF
+            # NOT EXISTS: on YSQL that clause does not suppress the
+            # duplicate-composite-type error when the partition already
+            # exists, so it is not actually idempotent there.
             for m in (month_start(now), next_month(now)):
-                sess.execute(text(partition_of_sql(name, name, m)))
+                child_name = partition_name(name, m)
+                if child_name not in existing:
+                    self._exec_with_retry(sess, partition_of_sql(name, name, m))
+                    existing.add(child_name)
 
             dropped = 0
-            for (child,) in sess.execute(text(list_partitions_sql(name))):
+            for child in sorted(existing):
                 month = partition_month(child)
                 if month is not None and next_month(month) <= cutoff:  # fully aged out
-                    sess.execute(text(f"DROP TABLE {child}"))
+                    self._exec_with_retry(sess, f"DROP TABLE {child}")
                     dropped += 1
-            sess.commit()
         return dropped
+
+    def _exec_with_retry(self, sess, sql: str, attempts: int = 3) -> None:
+        """Run one DDL statement, retrying on YugabyteDB's distributed-read
+        conflict error ("Restart read required"), which PostgreSQL has no
+        equivalent of and which the driver does not retry on its own."""
+        for attempt in range(attempts):
+            try:
+                sess.execute(text(sql))
+                sess.commit()
+                return
+            except OperationalError as e:
+                sess.rollback()
+                if "restart read required" in str(e).lower() and attempt < attempts - 1:
+                    time.sleep(0.3 * (attempt + 1))
+                    continue
+                raise
 
     def _process_batch(self, shard_id: int, cutoff_date: date) -> dict[str, int]:
         tcur = self._tcur(shard_id)

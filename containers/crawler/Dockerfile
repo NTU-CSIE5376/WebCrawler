@@ -11,7 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir scrapy requests tldextract python-json-logger==2.0.7
+COPY containers/crawler/requirements.txt /app/containers/crawler/requirements.txt
+RUN pip install --no-cache-dir -r /app/containers/crawler/requirements.txt
 
 COPY containers/crawler/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 

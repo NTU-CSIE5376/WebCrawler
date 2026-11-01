@@ -10,16 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir \
-    tldextract==5.1.1 \
-    pyyaml==6.0.2 \
-    sqlalchemy==2.0.44 \
-    psycopg2-binary==2.9.11 \
-    python-json-logger==2.0.7 \
-    joblib==1.5.3 \
-    numpy==2.1.2 \
-    scipy==1.17.0 \
-    scikit-learn==1.8.0
+COPY containers/scheduler_ingest/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 COPY containers/scheduler_ingest/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 

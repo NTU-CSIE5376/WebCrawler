@@ -38,7 +38,7 @@ stats:
   bad_dir: "/data/ipc/stats/bad"
 
 postgres:
-  dsn: "postgresql+psycopg2://crawler:crawler@172.16.191.1:5432/crawlerdb"
+  dsn: "postgresql+psycopg2://yugabyte:yugabyte@172.16.191.3:5433/crawlerdb"
 
 golden_discovery_ranker_v1:
   # Optional inline scoring for newly discovered URLs. Keep disabled until the
