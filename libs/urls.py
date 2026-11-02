@@ -1,9 +1,33 @@
 """Shared URL hostname extraction, validation and canonicalization."""
 from ipaddress import ip_address
-from urllib.parse import urlsplit
+from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
 
 MAX_URL_LEN = 2500
+
+
+def strip_srsltid(url: str) -> str:
+    """Return `url` without Google's `srsltid` tracking parameter.
+
+    Google appends `srsltid` to organic search result links for Merchant
+    Center conversion attribution; the server does not use it to render the
+    page, and every search yields a new value. All other query pieces keep
+    their original encoding and order. Returns `url` unchanged if absent.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    if "srsltid" not in parts.query.lower():
+        return url
+    kept = [
+        piece for piece in parts.query.split("&")
+        if unquote_plus(piece.partition("=")[0]).lower() != "srsltid"
+    ]
+    query = "&".join(kept)
+    if query == parts.query:
+        return url
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
 
 
 def host_of(url: str | None) -> str:
