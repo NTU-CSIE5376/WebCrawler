@@ -16,7 +16,7 @@ from twisted.internet import task as twisted_task
 
 from crawler.items import PageItem
 from crawler.queue_consumer import QueueConsumer
-from crawler.youtube_extractor import extract_youtube_outlinks
+from crawler.youtube_extractor import extract_youtube_outlinks, normalize_youtube_url
 from crawler.manual_bulk_crawls import ManualBulkCrawlConsumer
 from libs.obslog import configure as configure_logging
 from libs.urls import host_of
@@ -385,13 +385,16 @@ class HtmlSpider(scrapy.Spider):
             return
 
         outlinks = []
+        seen_urls: set[str] = set()
 
         for link in self.link_extractor.extract_links(response):
             if link.nofollow:
                 continue
-            u = canonicalize_url(link.url)
-            if len(u) > MAX_URL_LEN:
+            # watch?v=ID&t=.., /shorts/ID and youtu.be/ID collapse to one URL.
+            u = normalize_youtube_url(canonicalize_url(link.url))
+            if len(u) > MAX_URL_LEN or u in seen_urls:
                 continue
+            seen_urls.add(u)
             outlinks.append({
                 "url": u,
                 "domain": self._extract_domain(u),
