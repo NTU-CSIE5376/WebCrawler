@@ -127,7 +127,7 @@ Key columns:
 - quality/failure: `num_consecutive_fail`, `last_fail_reason`, `content_hash`
 - scheduling flags/signals: `should_crawl`, `url_score`, `url_score_updated_at`, `domain_score`
 - link signals: `inlink_count_approx INTEGER NOT NULL DEFAULT 0`, `inlink_count_external INTEGER NOT NULL DEFAULT 0` (non-deduplicated observed outlink counters from crawler discovery; no historical backfill)
-- provenance: `source SMALLINT NOT NULL DEFAULT 0` (`0` = natural discovery, `1` = golden set membership, `2` = weekly pageview injection)
+- provenance: `source SMALLINT NOT NULL DEFAULT 0` (`0` = natural discovery, `1` = golden set membership, `2` = weekly pageview injection, `3` = golden parent patrol, `4` = YouTube channel priority, see [09-youtube-discovery.md](./09-youtube-discovery.md))
 - provenance: `discovered_from VARCHAR` (URL of the highest-scoring parent observed for this URL; NULL for golden-injected and seed URLs; on conflict the parent with the higher `parent_page_score` wins, NULL score ranks lowest, ties keep the existing parent)
 - discovery metadata: `discovery_source_type SMALLINT NOT NULL DEFAULT 0` (`0` = unknown/seed, `1` = page outlink), `parent_page_score DOUBLE PRECISION` (url_score of the winning parent page; NULL when the parent page was not yet in url_state_current), `anchor_text VARCHAR` (first non-null outlink anchor observed for this URL)
 - robots metadata: `robots_bits SMALLINT NOT NULL DEFAULT 0` (`0` = unknown, `1` = crawl allowed, `2` = crawl disallowed by robots.txt)
@@ -142,7 +142,8 @@ Write patterns:
 - Router-discovered links: inserted with initial `domain_score`.
 - Golden set injection (`scripts/golden_inject.py`): inserts new URLs with `source=1`, or upserts `source=1` onto existing rows so that golden set membership is identifiable even when the crawler discovered the URL naturally first.
 - Weekly pageview injection (`scripts/wiki_pageview_inject.py`): upserts the top-K Wikipedia articles (default 1M, `user` agent dump, views summed across access methods) with `source=2`, `url_score = 1 + pageview / max_pageview` and `url_score_updated_at = NOW()`. Rows never fetched successfully are re-queued (`should_crawl = TRUE`) unless scheduled within the last day or failing 3+ times in a row; already-fetched rows and golden rows (`source=1`) are left untouched; new rows get a history snapshot. URLs on the previous run's priority list that dropped out are reset to `url_score = NULL, url_score_updated_at = NULL` (pending, non-golden, `url_score > 1` only) so the ranker scorer rescores them.
-- Score tiers in the offerer's per-domain pick: golden `3.0` > pageview priority `(1, 2]` > ranker `[0, 1]`. The ranker scorer never picks rows with `url_score > 1`, so it cannot overwrite either manual tier.
+- YouTube channel priority (ingestor, from crawler outlinks carrying `priority`): channel uploads playlist / home / `/playlists` URLs and the playlists on that channel's pages are inserted with `source=4`, `url_score = 1 + min(subscribers / 10M, 1)` and `url_score_updated_at = NOW()`. On conflict the score is only raised, and only on `source` 0/4 rows. See [09-youtube-discovery.md](./09-youtube-discovery.md).
+- Score tiers in the offerer's per-domain pick: golden `3.0` > pageview / YouTube channel priority `(1, 2]` > ranker `[0, 1]`. The ranker scorer never picks rows with `url_score > 1`, so it cannot overwrite any manual tier.
 
 ### `url_state_history_{shard}`
 

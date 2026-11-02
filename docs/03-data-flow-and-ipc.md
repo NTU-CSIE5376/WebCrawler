@@ -112,7 +112,8 @@ priority and ranked by the model like any outlink. The router accepts values in 
 for these rows and writes `url_score = url_priority`, `url_score_updated_at =
 now()`, `source = 4`; on conflict it only raises the score of `source` 0/4 rows,
 never lowering a score or touching golden (1), pageview (2) or patrol (3) rows.
-Because `url_score > 1`, the background ranker never rescores them.
+Because `url_score > 1`, the background ranker never rescores them. Design
+and rationale: [09-youtube-discovery.md](./09-youtube-discovery.md).
 
 The single canonical builder for this record lives at
 `libs/ipc/new_link_record.py:build_new_link_record(...)`. Both the
