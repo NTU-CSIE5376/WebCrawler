@@ -48,7 +48,7 @@ class RouterPriorityFieldsTest(unittest.TestCase):
 
 class AggregatePriorityTest(unittest.TestCase):
     def test_keeps_max_priority_regardless_of_order(self):
-        recs = [_link(CHANNEL), _link(CHANNEL, 1.2), _link(CHANNEL, 1.8), _link(CHANNEL, 1.000001)]
+        recs = [_link(CHANNEL), _link(CHANNEL, 1.2), _link(CHANNEL, 1.8), _link(CHANNEL, 1.001)]
         (out,) = IngestDB.aggregate_links(recs)
         self.assertEqual(out["url_priority"], 1.8)
         self.assertEqual(out["source"], SOURCE_YOUTUBE_CHANNEL)

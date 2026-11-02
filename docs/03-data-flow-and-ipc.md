@@ -104,8 +104,9 @@ Notes:
 `priority` field (today: YouTube channel uploads playlists,
 `https://www.youtube.com/playlist?list=UU…`, emitted by
 `containers/crawler/crawler/youtube_extractor.py` with
-`priority = 1 + min(subscribers / 10M, 1)`, or `1 + 1e-6` when the page does
-not show the count). The router accepts values in `(1.0, 2.0]` and tags them
+`priority = 1 + min(subscribers / 10M, 1)` when the page shows the channel's
+subscriber count and it is at least 10K; other channels are emitted without a
+priority and ranked by the model like any outlink). The router accepts values in `(1.0, 2.0]` and tags them
 `source = 4` (`SOURCE_YOUTUBE_CHANNEL`). The ingestor skips the inline ranker
 for these rows and writes `url_score = url_priority`, `url_score_updated_at =
 now()`, `source = 4`; on conflict it only raises the score of `source` 0/4 rows,

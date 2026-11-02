@@ -32,6 +32,10 @@ def _priorities(outlinks):
     return {o["url"]: o["priority"] for o in outlinks if "priority" in o}
 
 
+def _urls(outlinks):
+    return {o["url"] for o in outlinks}
+
+
 WATCH_DATA = {
     "contents": [
         {"videoSecondaryInfoRenderer": {"owner": {"videoOwnerRenderer": {
@@ -54,12 +58,18 @@ def test_watch_page_emits_videos_and_channel_playlists():
     urls = {o["url"] for o in out}
     assert "https://www.youtube.com/watch?v=aaaaaaaaaaa" in urls
     assert "https://www.youtube.com/watch?v=bbbbbbbbbbb" in urls
-    prios = _priorities(out)
     # Owner seen both with and without a subscriber count: the count wins.
-    assert prios[_uu(OWNER)] == pytest.approx(1.455)
-    # Recommended-video channel without a count: just above the ranker range.
-    assert prios[_uu(OTHER)] == pytest.approx(1.000001)
-    assert len(prios) == 2
+    assert _priorities(out) == {_uu(OWNER): pytest.approx(1.455)}
+    # Recommended-video channel without a count: still emitted, but left to the
+    # model (no priority), so it does not jump ahead of video pages.
+    assert _uu(OTHER) in _urls(out)
+
+
+def test_small_owner_channel_has_no_priority():
+    data = json.loads(json.dumps(WATCH_DATA).replace("4.55M subscribers", "9.9K subscribers"))
+    out = extract_youtube_outlinks(_page("https://www.youtube.com/watch?v=xxxxxxxxxxx", data), [])
+    assert _priorities(out) == {}
+    assert {_uu(OWNER), _uu(OTHER)} <= _urls(out)
 
 
 def test_channel_page_header_subscribers_and_cap():
@@ -97,12 +107,13 @@ def test_parse_subscriber_count(text, expected):
 
 
 def test_channel_priority_range():
-    assert channel_priority(None) == pytest.approx(1.000001)
-    assert channel_priority(0) == pytest.approx(1.000001)
+    assert channel_priority(None) is None
+    assert channel_priority(0) is None
+    assert channel_priority(9_999) is None
+    assert channel_priority(10_000) == pytest.approx(1.001)
     assert channel_priority(5_000_000) == pytest.approx(1.5)
     assert channel_priority(10_000_000) == 2.0
     assert channel_priority(400_000_000) == 2.0
-    assert channel_priority(1) > 1.0
 
 
 @pytest.mark.parametrize("url,expected", [

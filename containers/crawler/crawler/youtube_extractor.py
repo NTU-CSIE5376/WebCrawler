@@ -19,13 +19,18 @@ CHANNEL_ID_RE = re.compile(r"^UC[a-zA-Z0-9_-]{22}$")
 UPLOADS_PLAYLIST_URL = "https://www.youtube.com/playlist?list=UU{suffix}"
 
 # Channel priority sits on the manual tier (url_score > 1), which the ranker
-# never rescores: 1 + subscribers / 10M, capped at 2.0 so it stays below
-# golden_inject's 3.0. Channels whose subscriber count the page does not show
-# get the floor, which must stay strictly above 1.0 for the same reason.
+# never rescores and the offerer picks before any model-scored URL:
+# 1 + subscribers / 10M, capped at 2.0 so it stays below golden_inject's 3.0.
+# Only channels with a known count >= CHANNEL_PRIORITY_MIN_SUBSCRIBERS get it.
+# Subscriber counts only show for a watch page's owner and on the channel page
+# itself, so at most one channel per watch fetch enters the tier and it drains
+# instead of starving video pages. Other channels (recommended-video bylines,
+# small channels) are emitted without priority and ranked by the model; the
+# ingestor raises them later once a crawl shows their subscriber count.
 CHANNEL_PRIORITY_BASE = 1.0
 CHANNEL_PRIORITY_SUBSCRIBER_SCALE = 10_000_000
 CHANNEL_PRIORITY_MAX_BONUS = 1.0
-CHANNEL_PRIORITY_UNKNOWN_BONUS = 1e-6
+CHANNEL_PRIORITY_MIN_SUBSCRIBERS = 10_000
 
 # The crawler sends Accept-Language: en-US, so counts render as "4.55M subscribers".
 _SUBSCRIBER_RE = re.compile(r"^([0-9][0-9,]*(?:\.[0-9]+)?)\s*([KMB]?)\s+subscribers?$", re.IGNORECASE)
@@ -73,8 +78,9 @@ def extract_youtube_outlinks(
     discovers video IDs and channel IDs from every renderer type.  Falls back
     to regex scanning of raw HTML for video IDs if JSON parsing failed.
 
-    Channels are emitted as uploads-playlist URLs carrying a ``priority``
-    field (see ``channel_priority``).
+    Channels are emitted as uploads-playlist URLs; those with a known,
+    large enough subscriber count carry a ``priority`` field (see
+    ``channel_priority``).
 
     Mutates and returns *outlinks*.
     """
@@ -104,7 +110,7 @@ def extract_youtube_outlinks(
         if existing is None:
             by_url[link["url"]] = link
             outlinks.append(link)
-        elif link["priority"] > (existing.get("priority") or 0.0):
+        elif "priority" in link and link["priority"] > (existing.get("priority") or 0.0):
             existing["priority"] = link["priority"]
 
     if ids or channels:
@@ -121,12 +127,12 @@ def extract_youtube_outlinks(
     return outlinks
 
 
-def channel_priority(subscribers: int | None) -> float:
-    if subscribers is None:
-        bonus = CHANNEL_PRIORITY_UNKNOWN_BONUS
-    else:
-        bonus = min(subscribers / CHANNEL_PRIORITY_SUBSCRIBER_SCALE, CHANNEL_PRIORITY_MAX_BONUS)
-        bonus = max(bonus, CHANNEL_PRIORITY_UNKNOWN_BONUS)
+def channel_priority(subscribers: int | None) -> float | None:
+    """Manual-tier priority for a channel, or None when it should be left to
+    the model (unknown count or below CHANNEL_PRIORITY_MIN_SUBSCRIBERS)."""
+    if subscribers is None or subscribers < CHANNEL_PRIORITY_MIN_SUBSCRIBERS:
+        return None
+    bonus = min(subscribers / CHANNEL_PRIORITY_SUBSCRIBER_SCALE, CHANNEL_PRIORITY_MAX_BONUS)
     return CHANNEL_PRIORITY_BASE + bonus
 
 
@@ -278,12 +284,15 @@ def _extract_from_html(text: str, ids: dict[str, None]) -> None:
 
 
 def _channel_outlink(channel_id: str, subscribers: int | None) -> dict[str, Any]:
-    return {
+    link: dict[str, Any] = {
         "url": UPLOADS_PLAYLIST_URL.format(suffix=channel_id[2:]),
         "domain": "youtube.com",
         "anchor": "",
-        "priority": channel_priority(subscribers),
     }
+    priority = channel_priority(subscribers)
+    if priority is not None:
+        link["priority"] = priority
+    return link
 
 
 def _yt_outlink(video_id: str) -> dict[str, str | None]:
