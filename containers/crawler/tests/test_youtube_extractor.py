@@ -23,6 +23,19 @@ def _uu(channel_id):
     return f"https://www.youtube.com/playlist?list=UU{channel_id[2:]}"
 
 
+def _channel_urls(channel_id):
+    return {
+        _uu(channel_id),
+        f"https://www.youtube.com/channel/{channel_id}",
+        f"https://www.youtube.com/channel/{channel_id}/playlists",
+    }
+
+
+PL = "PLlaN88a7y2_plecYoJxvRFTLHVbIVAOoc"
+PL2 = "PLlaN88a7y2_qkZOyrrqZ1IqJdZp3Cf0Fp"
+ALBUM = "OLAK5uy_kiH7PZ7mOp6E1W4kZb1E8GTVnJrJ1hJ3s"
+
+
 def _page(url, data):
     body = f"<html><script>var ytInitialData = {json.dumps(data)};</script></html>"
     return HtmlResponse(url=url, body=body.encode(), encoding="utf-8")
@@ -58,8 +71,9 @@ def test_watch_page_emits_videos_and_channel_playlists():
     urls = {o["url"] for o in out}
     assert "https://www.youtube.com/watch?v=aaaaaaaaaaa" in urls
     assert "https://www.youtube.com/watch?v=bbbbbbbbbbb" in urls
-    # Owner seen both with and without a subscriber count: the count wins.
-    assert _priorities(out) == {_uu(OWNER): pytest.approx(1.455)}
+    # Owner seen both with and without a subscriber count: the count wins, and
+    # its uploads playlist, home and /playlists tabs share the priority.
+    assert _priorities(out) == {u: pytest.approx(1.455) for u in _channel_urls(OWNER)}
     # Recommended-video channel without a count: still emitted, but left to the
     # model (no priority), so it does not jump ahead of video pages.
     assert _uu(OTHER) in _urls(out)
@@ -72,6 +86,37 @@ def test_small_owner_channel_has_no_priority():
     assert {_uu(OWNER), _uu(OTHER)} <= _urls(out)
 
 
+def test_channel_page_playlists_inherit_channel_priority():
+    data = {
+        "metadata": {"channelMetadataRenderer": {"externalId": OWNER}},
+        "header": {"pageHeaderRenderer": {"content": {"metadataRows": [
+            {"metadataParts": [{"text": {"content": "4.55M subscribers"}}]},
+        ]}}},
+        "contents": [
+            {"lockupViewModel": {"contentId": PL, "contentType": "LOCKUP_CONTENT_TYPE_PLAYLIST"}},
+            {"watchEndpoint": {"videoId": "aaaaaaaaaaa", "playlistId": PL2}},
+            {"lockupViewModel": {"contentId": ALBUM, "contentType": "LOCKUP_CONTENT_TYPE_PLAYLIST"}},
+            {"watchEndpoint": {"videoId": "bbbbbbbbbbb", "playlistId": "RDdQw4w9WgXcQ"}},
+            {"playlistId": "WL"},
+            {"shelf": {"browseEndpoint": {"browseId": OTHER}}},
+        ],
+    }
+    out = extract_youtube_outlinks(_page(f"https://www.youtube.com/channel/{OWNER}/playlists", data), [])
+    playlists = {f"https://www.youtube.com/playlist?list={p}" for p in (PL, PL2, ALBUM)}
+    assert _priorities(out) == {u: pytest.approx(1.455) for u in _channel_urls(OWNER) | playlists}
+    # Mixes / Watch Later are not emitted; the featured channel has no count.
+    assert not any("list=RD" in u or "list=WL" in u for u in _urls(out))
+    assert _uu(OTHER) in _urls(out)
+    assert f"https://www.youtube.com/channel/{OTHER}" not in _urls(out)
+
+
+def test_playlists_off_channel_pages_have_no_priority():
+    data = {"contents": [{"watchEndpoint": {"videoId": "aaaaaaaaaaa", "playlistId": PL}}]}
+    out = extract_youtube_outlinks(_page("https://www.youtube.com/watch?v=xxxxxxxxxxx", data), [])
+    assert f"https://www.youtube.com/playlist?list={PL}" in _urls(out)
+    assert _priorities(out) == {}
+
+
 def test_channel_page_header_subscribers_and_cap():
     data = {
         "metadata": {"channelMetadataRenderer": {"externalId": BIG}},
@@ -82,7 +127,7 @@ def test_channel_page_header_subscribers_and_cap():
         ]}}},
     }
     out = extract_youtube_outlinks(_page(f"https://www.youtube.com/channel/{BIG}/videos", data), [])
-    assert _priorities(out) == {_uu(BIG): 2.0}
+    assert _priorities(out) == {u: 2.0 for u in _channel_urls(BIG)}
 
 
 def test_existing_outlink_keeps_highest_priority():
