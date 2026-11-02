@@ -19,7 +19,7 @@ domains:
     middleware: crawler.middlewares.wikipedia.WikipediaMiddleware
     request_limits:
       download_slot: wikipedia
-      max_concurrent_requests: 10 # Per crawler process; no shared request budget.
+      max_concurrent_requests: 9 # Per crawler process; no shared request budget.
       max_qps: 15 # ref: https://wikitech.wikimedia.org/wiki/Robot_policy
     headers:
       User-Agent: "WebCrawlerBot/1.0 (+https://github.com/NTU-CSIE5376/WebCrawler)"
