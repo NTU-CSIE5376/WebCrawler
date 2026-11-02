@@ -94,9 +94,23 @@ Notes:
   "parent_page_score": 0.5,
   "inlink_count_approx": 1,
   "inlink_count_external": 0,
-  "anchor_text": "click here"
+  "anchor_text": "click here",
+  "url_priority": null,
+  "source": 0
 }
 ```
+
+`url_priority` / `source` are set only for crawler outlinks that carry a
+`priority` field (today: YouTube channel uploads playlists,
+`https://www.youtube.com/playlist?list=UU…`, emitted by
+`containers/crawler/crawler/youtube_extractor.py` with
+`priority = 1 + min(subscribers / 10M, 1)`, or `1 + 1e-6` when the page does
+not show the count). The router accepts values in `(1.0, 2.0]` and tags them
+`source = 4` (`SOURCE_YOUTUBE_CHANNEL`). The ingestor skips the inline ranker
+for these rows and writes `url_score = url_priority`, `url_score_updated_at =
+now()`, `source = 4`; on conflict it only raises the score of `source` 0/4 rows,
+never lowering a score or touching golden (1), pageview (2) or patrol (3) rows.
+Because `url_score > 1`, the background ranker never rescores them.
 
 The single canonical builder for this record lives at
 `libs/ipc/new_link_record.py:build_new_link_record(...)`. Both the
