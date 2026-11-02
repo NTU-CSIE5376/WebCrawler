@@ -162,7 +162,7 @@ Shared constants:
 
 - `NUM_SHARDS = 256`
 - `CRAWLERDB`, `METRICDB`: psycopg2 connection kwargs
-- `SOURCE_NATURAL = 0`, `SOURCE_GOLDEN = 1`, `SOURCE_PAGEVIEW = 2`: values for `url_state_current.source`
+- `SOURCE_NATURAL = 0`, `SOURCE_GOLDEN = 1`, `SOURCE_PAGEVIEW = 2`, `SOURCE_GOLDEN_PARENT_PATROL = 3`, `SOURCE_YOUTUBE_CHANNEL = 4`: values for `url_state_current.source` (`4` is written by the ingestor, mirrored in `libs/ipc/new_link_record.py`; see [09-youtube-discovery.md](./09-youtube-discovery.md))
 
 The `DISCOVERY_SOURCE_*` constants for the "new outlink candidate" IPC
 record live in `libs/ipc/new_link_record.py` (`DISCOVERY_SOURCE_UNKNOWN = 0`,

@@ -93,6 +93,7 @@ Crawler worker behavior:
    - Scrapy scraper-slot backpressure defaults to `SCRAPER_SLOT_MAX_ACTIVE_SIZE=50000000` for every crawler worker.
 4. For each response:
    - if HTML/XHTML: save full content + extracted outlinks.
+   - on `youtube.com` pages, outlinks also include videos, channels and playlists parsed from the embedded `ytInitialData` JSON, with an optional `priority` for high-subscriber channels (see [09-youtube-discovery.md](./09-youtube-discovery.md)).
    - otherwise: emit failure record (`NonHTML content-type`).
 5. For request errors: emit failure record with normalized reason (`HttpError`, `IgnoreRequest`, etc.).
 6. Write records as JSONL into `/data/ipc/crawl_result/crawler_{id:02d}/{YYYYMMDD}/{HHMM}/HHMM.jsonl`.

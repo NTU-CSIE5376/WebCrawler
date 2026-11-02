@@ -10,3 +10,4 @@ SOURCE_NATURAL = 0
 SOURCE_GOLDEN = 1
 SOURCE_PAGEVIEW = 2
 SOURCE_GOLDEN_PARENT_PATROL = 3
+SOURCE_YOUTUBE_CHANNEL = 4  # set by the ingestor, see libs/ipc/new_link_record.py

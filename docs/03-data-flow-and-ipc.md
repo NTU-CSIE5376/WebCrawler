@@ -94,9 +94,26 @@ Notes:
   "parent_page_score": 0.5,
   "inlink_count_approx": 1,
   "inlink_count_external": 0,
-  "anchor_text": "click here"
+  "anchor_text": "click here",
+  "url_priority": null,
+  "source": 0
 }
 ```
+
+`url_priority` / `source` are set only for crawler outlinks that carry a
+`priority` field. Today only `containers/crawler/crawler/youtube_extractor.py`
+sets it, as `priority = 1 + min(subscribers / 10M, 1)` for channels whose page
+shows a subscriber count of at least 10K; each such channel gets its uploads
+playlist (`/playlist?list=UU…`), home (`/channel/UC…`) and `/channel/UC…/playlists`
+URLs, and playlists (`PL…` / `OLAK5uy_…`) listed on that channel's own pages
+inherit the same priority. Other channels and playlists are emitted without a
+priority and ranked by the model like any outlink. The router accepts values in `(1.0, 2.0]` and tags them
+`source = 4` (`SOURCE_YOUTUBE_CHANNEL`). The ingestor skips the inline ranker
+for these rows and writes `url_score = url_priority`, `url_score_updated_at =
+now()`, `source = 4`; on conflict it only raises the score of `source` 0/4 rows,
+never lowering a score or touching golden (1), pageview (2) or patrol (3) rows.
+Because `url_score > 1`, the background ranker never rescores them. Design
+and rationale: [09-youtube-discovery.md](./09-youtube-discovery.md).
 
 The single canonical builder for this record lives at
 `libs/ipc/new_link_record.py:build_new_link_record(...)`. Both the
