@@ -86,6 +86,125 @@ false positives were removed:
 | `B_long_url` | percent-encoded Arabic / Hindi URLs: 0.43% of golden | length measured after decoding (0.012%) |
 | tracking params | mixed into `random_token` | split out as `B_tracking_params`, classed as duplicate |
 
+## Evidence for the high-confidence rules (2026-11-03)
+
+These rules are heuristics: the claim is not zero false positives but that
+what they reject is overwhelmingly repeat or low-value pages, at a measured
+cost. Computed from the phase 1 samples with `trap_rule_evidence.py` (kept
+with the eviction analysis, outside this repo, along with the per-domain and
+example CSVs); re-run it after any rule change.
+
+**Data.** Phase 1 `TABLESAMPLE SYSTEM (0.05%) REPEATABLE (42)` per shard on the
+pre-YB3 PostgreSQL crawlerdb: 2,308,263 pending rows and 1,000,122
+ever-scheduled rows (with fetch outcome, title, `content_hash`), scaled ×2000.
+Golden: 138,459 distinct metricdb `metric_url` URLs. Pages are sampled by heap
+page, so one domain's rows cluster: totals are reliable, single-domain counts
+are rough (exact counts come from the full scan in `top_domains.csv`).
+
+### Volume and fetch outcome
+
+"Repeat title" = share of successfully fetched pages whose (domain, title)
+occurs at least twice among that rule's sampled pages, i.e. the crawler got a
+page it already had under another URL. The control row is pages from the same
+domains that hit no rule.
+
+| Rule | Est. pending | Share | Domains | Top-10 domain share | Fetched in sample | Fetch OK | Repeat title (OK pages) | Golden hits |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `A_path_repeat` | 1.11e8 | 2.39% | 248 | 57% | 11,638 | 80% | **96%** | 1 |
+| `A_too_many_segments` | 0.50e8 | 1.09% | 142 | 57% | 7,387 | 79% | **95%** | 1 |
+| `B_nested_redirect` | 0.57e8 | 1.24% | 832 | 29% | 5,093 | 55% | **95%** | 0 |
+| `B_faceted` | 0.18e8 | 0.40% | 126 | 55% | 2,763 | 87% | **90%** | 2 |
+| `B_calendar` | 0.08e8 | 0.18% | 418 | 26% | 15,649 | 83% | 43% | 0 |
+| any of the above | **1.95e8** | **4.22%** | 1,581 | 33% | 35,306 | 78% | 70% | **4** |
+| control: same domains, no rule hit | — | — | — | — | 58,799 | 73% | 48% | — |
+
+Reading it:
+- Path recursion, nested redirects and faceted listings return a page the
+  crawler already has 90–96% of the time, against 48% for other URLs of the
+  same sites. `B_nested_redirect` also fails to fetch far more often (55% OK).
+- `B_calendar` does not look like duplication by this measure (43%, below the
+  control): each day / month view is a distinct listing. It is kept because the
+  space is unbounded (every date, forwards and backwards), the pages are event
+  listings rather than content, volume is small, and no golden URL hits it. It
+  is the weakest of the five and the first to demote if the audit log shows
+  golden hits.
+
+### Where the volume comes from
+
+Top domains by sampled hits (`exact_pending` / `fetch_yield` from the full scan):
+
+| Rule | Domain | Share of rule | Exact pending | Fetch yield | Pattern |
+|---|---|---:|---:|---:|---|
+| `A_path_repeat` | goeshard.org | 13% | 19.6M | 1.5% | relative-link recursion |
+| | anthropic.com | 9% | 10.0M | 2.0% | |
+| | jma.go.jp | 9% | 9.7M | 3.3% | |
+| | metropolia.fi | 9% | 11.9M | 2.8% | |
+| `A_too_many_segments` | anthropic.com | 20% | 10.0M | 2.0% | same recursion, deeper |
+| | eia.gov | 5% | 3.2M | 9.0% | |
+| | ticket360.com.br | 5% | 2.3M | 3.9% | |
+| `B_nested_redirect` | google.com | 5% | 33.3M | 1.8% | `plus.google.com/share?url=`, `calendar.google.com/calendar/event?action=TEMPLATE&details=…` |
+| | bsky.app | 5% | 10.6M | 2.2% | `intent/compose?text=…https%3A…` share links |
+| | wordpress.com | 4% | 10.5M | 3.9% | `log-in?redirect_to=…remote-login.php%3F…` |
+| `B_faceted` | wisc.edu, ufgd.edu.br, bndes.gov.br, gwu.edu, uefs.br | 5–8% each | 1.1–3.5M | 5–17% | DSpace `browse?sort_by=&order=&rpp=&starts_with=` |
+| `B_calendar` | vpa.uncg.edu, ccce.calpoly.edu, portal.ema.alabama.gov | ~3% each | — | — | The Events Calendar day / list views |
+
+Several of these domains also have golden URLs (anthropic.com, jma.go.jp,
+eia.gov). Only the URLs matching a rule are rejected; the rest of the domain
+is crawled as before, which is why these rules work per URL rather than
+freezing domains.
+
+### Thresholds
+
+| Threshold | Value | Why |
+|---|---|---|
+| `PATH_REPEAT_MAX` | 3 | Nutch `regex-urlfilter` default (`(/[^/]+)/[^/]+\1/[^/]+\1/`). 2 hits legitimate paths like `/news/region/news/`. Numeric segments of up to 4 chars are skipped so `/2022/02/02/` dates do not count |
+| `MAX_PATH_SEGMENTS` | 20 | Heritrix `TooManyPathSegmentsDecideRule` default |
+| `B_nested_redirect` | embedded URL that itself has a query, or 2+ embedded URLs | A plain `?url=https://site/page` is often a legitimate share link; one carrying its own query (`?returnUrl=…%3Fpage%3D40`) is a login / redirect wrapper that mirrors every page |
+| `MIN_FACET_PARAMS` | 3 | 1–2 (`?sort=&page=`) is ordinary navigation; 3+ facet params is the combinatorial browse space |
+| `B_calendar` | plugin signatures only | v1 matched any 4-digit "year" and news titles containing "calendario" (see v1 → v2 fixes) |
+
+### Resource savings
+
+- **Frontier storage**: 1.95e8 pending rows, 4.2% of the frontier. At ~820
+  bytes per `url_state_current` row (table + indexes + TOAST ÷ rows on the
+  pre-YB3 PostgreSQL, 2026-10-19) that is about **160 GB**. YugabyteDB's
+  on-disk footprint per row differs; the row count is the stable number.
+- **Fetch budget**: 3.5% of all sampled fetches (35,306 / 1,000,122) went to
+  URLs these rules match, and 70% of those that succeeded returned a page the
+  crawler already had (95% of 14,575 OK pages when `B_calendar` is left out).
+- **Inflow**: the rules apply at ingest, so the rejected share of new links is
+  measured per day by `ingest.folder_done.trap_dropped`.
+
+### Useful pages rejected
+
+**Golden URLs rejected (4 of 138,459, 0.0029%).** Kept explicit so the
+tradeoff stays visible:
+
+| Golden URL | Rule | Assessment |
+|---|---|---|
+| `nottinghamshire.police.uk/news/nottinghamshire/news/news/2026/may/incident-next-to-a617-rainworth-bypass/` | `A_path_repeat` | **Real article**: the site's own path repeats `news` three times. Accepted loss; golden injection still adds it |
+| `codabench.org/competitions/12555/3aI2jK6zU4u8GcU52gVu3Qwebinterface---%3E/2.39.1%3C%2Fa%3E%29/…` | `A_too_many_segments` | Broken URL built from escaped HTML fragments; golden only because a search engine indexed it |
+| `olivenoele.com/de/tests/auswahl/oekotest?dir=desc&limit=all&order=position` | `B_faceted` | **Real listing page**, sorted / unpaged variant of `/de/tests/auswahl/oekotest` |
+| `sigmaaldrich.com/US/en/search/b27-supplement?focus=products&page=1&perpage=30&sort=relevance&term=…&type=product` | `B_faceted` | Site search results page |
+
+**Non-golden pages with a unique title** (the candidates for useful content
+the rules reject). Patterns
+seen in samples:
+
+| Rule | OK pages with unique title | What they are |
+|---|---:|---|
+| `A_path_repeat` | 348 of 9,253 (3.8%) | Real articles / pages served at a recursive URL (`wbtv.com/news/affordable-housing/www.wbtv.com/www.wbtv.com/…`). The content is real, but the same page exists at its canonical URL |
+| `A_too_many_segments` | 288 of 5,863 (4.9%) | Same as above, deeper (`hindi.newslaundry.com/2026/02/12/2023/03/10/…`) |
+| `B_nested_redirect` | 112 of 2,775 (4.0%) | Mostly login / sign-up pages; occasionally an article with a `?redirect_to=` suffix (`ruhrnachrichten.de/...?redirect_to=…`), whose canonical URL is linked elsewhere |
+| `B_faceted` | 224 of 2,414 (9.3%) | Distinct browse / search permutations (DSpace author browse, shop price bands). Listing pages, not items |
+| `B_calendar` | 7,394 of 12,973 (57%) | Distinct day / list views of event calendars. Real listings of low search value; see the note above |
+
+Limits: the fetched sample only covers URLs the scheduler chose to fetch, the
+repeat-title signal misses pages whose duplicate was never fetched, and golden
+is biased towards popular pages, so long-tail false positives may be higher
+than 0.0029%. The ingest audit log plus `trap_filter_golden_check.py` measures
+the production rate.
+
 ## Normalization
 
 Stripping changes a URL's identity, and every entry point (ingest,
