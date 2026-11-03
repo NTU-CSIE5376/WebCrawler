@@ -1,4 +1,4 @@
-# 09. Frontier Trap Rules
+# 10. Frontier Trap Rules
 
 URL-only heuristics that flag crawler traps (URL spaces that grow without
 bound while serving little new content) and duplicate URLs (the same page
@@ -107,7 +107,7 @@ The stripped set is `trap_filter.normalize_params`
 same-page check on the shadow-logged URLs look clean.
 
 The rest of the query keeps its original encoding and order byte for byte.
-With PR #103, `scripts/golden_inject.py` strips `srsltid` from golden URLs
+`scripts/golden_inject.py` strips `srsltid` from golden URLs (#103)
 the same way (`libs/urls.strip_srsltid`), so an injected golden row and the
 link the crawler discovers end up as the same URL.
 

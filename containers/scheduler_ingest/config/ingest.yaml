@@ -35,7 +35,7 @@ ingestor:
 #     (libs/frontier/trap_rules.py HIGH_CONFIDENCE).
 # Every affected link goes to a daily gzip JSONL audit log;
 # scripts/trap_filter_golden_check.py measures golden false kills. Rules and
-# validation: docs/09-frontier-trap-rules.md.
+# validation: docs/10-frontier-trap-rules.md.
 trap_filter:
   enabled: true
   normalize: true

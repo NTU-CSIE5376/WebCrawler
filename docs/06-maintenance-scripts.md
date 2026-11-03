@@ -21,6 +21,7 @@ uv run scripts/migrate_add_source.py [--dry-run]
 - Shard resolution: goes through `libs.db.sharding.key.compute_shard` (single source of truth), which honors `domain_overrides` in `ingest.yaml` and `split_etld1` in `shard_split.yaml`; overrides for split eTLD+1s are stripped automatically.
 - Writes to `domain_state`, `url_state_current_{shard}`, `url_state_history_{shard}`.
 - Existing rows are flipped to `source = 1` so golden set membership is identifiable. New rows are also mirrored into history (matches `db_ops.process_link`).
+- Google's `srsltid` is stripped before injecting (`libs.urls.strip_srsltid`); a URL with and without `srsltid` counts as the same page. If crawlerdb only holds the `srsltid` form, that row is marked golden instead of inserting the stripped URL, so the page is not stored or fetched twice.
 - Does not write to metricdb.
 
 ```bash
@@ -162,7 +163,7 @@ Shared constants:
 
 - `NUM_SHARDS = 256`
 - `CRAWLERDB`, `METRICDB`: psycopg2 connection kwargs
-- `SOURCE_NATURAL = 0`, `SOURCE_GOLDEN = 1`, `SOURCE_PAGEVIEW = 2`: values for `url_state_current.source`
+- `SOURCE_NATURAL = 0`, `SOURCE_GOLDEN = 1`, `SOURCE_PAGEVIEW = 2`, `SOURCE_GOLDEN_PARENT_PATROL = 3`, `SOURCE_YOUTUBE_CHANNEL = 4`: values for `url_state_current.source` (`4` is written by the ingestor, mirrored in `libs/ipc/new_link_record.py`; see [09-youtube-discovery.md](./09-youtube-discovery.md))
 
 The `DISCOVERY_SOURCE_*` constants for the "new outlink candidate" IPC
 record live in `libs/ipc/new_link_record.py` (`DISCOVERY_SOURCE_UNKNOWN = 0`,
@@ -348,7 +349,7 @@ docker compose exec scheduler_ingest python scripts/wiki_pageview_inject.py
 ## 6.18 `trap_filter_golden_check.py`
 
 - Reads the ingest trap filter's audit logs (`/data/ipc/trap_filter/ingestor_*/YYYY-MM-DD.jsonl.gz`, one JSON object per dropped / normalized / would-be-normalized discovery link: `ts`, `action` (`drop`, `normalize`, `would_normalize`), `url`, `normalized_url`, `would_normalize_url`, `rules`, `domain_id`, `shard_id`, `discovered_from`) and checks them against the golden set (metricdb `metric_url`, read-only, or `--golden-file`).
-- Golden URLs are also matched by their normalized form: metricdb stores them as copied from search results (often with `srsltid`), while the crawler discovers the clean URL. With PR #103, `golden_inject.py` strips `srsltid` on its side, so both converge on the same row. Rule definitions and validation: [09-frontier-trap-rules.md](09-frontier-trap-rules.md).
+- Golden URLs are also matched by their normalized form: metricdb stores them as copied from search results (often with `srsltid`), while the crawler discovers the clean URL. `golden_inject.py` strips `srsltid` on its side (#103), so both converge on the same row. Rule definitions and validation: [10-frontier-trap-rules.md](10-frontier-trap-rules.md).
 - Reports per rule: drop events, distinct golden URLs dropped, and the false-kill rate (`golden dropped / golden total`). Golden URLs that were only normalized are listed separately: the stripped URL is still inserted, so they are not kills. Golden URLs that shadow normalization would rewrite (`WOULD_NORMALIZE`) show what widening `normalize_params` would touch.
 - Streams the logs; only the golden set is held in memory. `--out DIR` writes `summary.csv` and `golden_hits.csv` (each golden hit with its rules, parent URL and first timestamp).
 - Baseline before rollout: running the filter over the 138,459 metricdb golden URLs drops 4 (0.0029%), normalizes 1,291 (`srsltid`, `;jsessionid=`) and shadow-logs 37 (`utm_*`, `_gl`, …).

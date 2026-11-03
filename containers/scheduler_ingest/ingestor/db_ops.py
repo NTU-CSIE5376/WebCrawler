@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from psycopg2.extras import execute_values
 from sqlalchemy.orm import sessionmaker
 
+from libs.ipc.new_link_record import SOURCE_NATURAL, SOURCE_YOUTUBE_CHANNEL
 from libs.scoring.golden_discovery_runtime import GoldenDiscoveryRuntimeScorer
 
 
@@ -136,6 +137,16 @@ def _prefer_higher_parent(dst: dict, src: dict) -> None:
         dst["discovered_from"] = src.get("discovered_from")
         dst["parent_page_score"] = new_s
         dst["discovery_source_type"] = src.get("discovery_source_type")
+
+
+def _prefer_higher_priority(dst: dict, src: dict) -> None:
+    """Keep the highest crawler-assigned url_priority (and its source) seen
+    for a url; records without one never clear it."""
+    new_p = src.get("url_priority")
+    cur_p = dst.get("url_priority")
+    if new_p is not None and (cur_p is None or new_p > cur_p):
+        dst["url_priority"] = new_p
+        dst["source"] = src.get("source", SOURCE_NATURAL)
 
 
 class IngestDB:
@@ -515,6 +526,7 @@ class IngestDB:
                 by_url[url]["inlink_count_approx"] += inc_approx
                 by_url[url]["inlink_count_external"] += inc_external
                 _prefer_higher_parent(by_url[url], rec)
+                _prefer_higher_priority(by_url[url], rec)
                 dup_results.append((idx, False))
             else:
                 first_idx_by_url[url] = idx
@@ -546,7 +558,10 @@ class IngestDB:
         score_by_url: dict[str, float] = {}
         score_updated_at = None
         if self.inline_ranker is not None:
-            unique_urls = [rec["url"] for _, rec in unique_items]
+            # Crawler-assigned priorities bypass the model.
+            unique_urls = [
+                rec["url"] for _, rec in unique_items if rec.get("url_priority") is None
+            ]
             if self.inline_score_timeout_sec > 0:
                 existing_urls = self._existing_urls(cur, tcur, unique_urls)
                 score_urls = [url for url in unique_urls if url not in existing_urls]
@@ -554,23 +569,33 @@ class IngestDB:
                 score_urls = unique_urls
             score_by_url, score_updated_at = self._score_new_links(score_urls)
 
+        priority_at = datetime.now(timezone.utc)
         link_rows = []
         for _, rec in unique_items:
             url = rec["url"]
-            scored = url in score_by_url
+            priority = rec.get("url_priority")
+            if priority is not None:
+                url_score, url_score_at = float(priority), priority_at
+                source = int(rec.get("source", SOURCE_YOUTUBE_CHANNEL))
+            else:
+                scored = url in score_by_url
+                url_score = float(score_by_url.get(url, 0.0))
+                url_score_at = score_updated_at if scored else None
+                source = SOURCE_NATURAL
             link_rows.append(
                 (
                     url,
                     int(rec["domain_id"]),
                     float(rec.get("domain_score", 0.0)),
-                    float(score_by_url.get(url, 0.0)),
-                    score_updated_at if scored else None,
+                    url_score,
+                    url_score_at,
                     rec.get("discovered_from"),
                     int(rec.get("discovery_source_type", 0)),
                     rec.get("parent_page_score"),
                     int(rec.get("inlink_count_approx", 0)),
                     int(rec.get("inlink_count_external", 0)),
                     (rec.get("anchor_text") or None),
+                    source,
                 )
             )
         # New parent wins only when it has a strictly higher score; a NULL
@@ -579,6 +604,16 @@ class IngestDB:
             f"EXCLUDED.parent_page_score IS NOT NULL AND "
             f"({tcur}.parent_page_score IS NULL OR "
             f"EXCLUDED.parent_page_score > {tcur}.parent_page_score)"
+        )
+        # A crawler-assigned priority may raise an existing natural or YouTube
+        # channel row (e.g. once the channel's subscriber count is known) but
+        # never touches inject-managed rows (golden / pageview / patrol) and
+        # never lowers a score. Natural records carry source 0, so they never
+        # match and leave url_score to the ranker as before.
+        prio = (
+            f"EXCLUDED.source = {SOURCE_YOUTUBE_CHANNEL} AND "
+            f"{tcur}.source IN ({SOURCE_NATURAL}, {SOURCE_YOUTUBE_CHANNEL}) AND "
+            f"EXCLUDED.url_score > COALESCE({tcur}.url_score, 0)"
         )
         # xmax is not available on all PG-wire-compatible targets (e.g. YSQL),
         # so "newly inserted vs. pre-existing" is determined from a pre-upsert
@@ -590,7 +625,7 @@ class IngestDB:
             INSERT INTO {tcur}
               (url, domain_id, domain_score, url_score, url_score_updated_at, discovered_from,
                discovery_source_type, parent_page_score,
-               inlink_count_approx, inlink_count_external, anchor_text)
+               inlink_count_approx, inlink_count_external, anchor_text, source)
             VALUES %s
             ON CONFLICT (url) DO UPDATE SET
               inlink_count_approx = {tcur}.inlink_count_approx + EXCLUDED.inlink_count_approx,
@@ -604,7 +639,13 @@ class IngestDB:
               discovery_source_type = CASE WHEN {pref}
                 THEN EXCLUDED.discovery_source_type ELSE {tcur}.discovery_source_type END,
               parent_page_score = CASE WHEN {pref}
-                THEN EXCLUDED.parent_page_score ELSE {tcur}.parent_page_score END
+                THEN EXCLUDED.parent_page_score ELSE {tcur}.parent_page_score END,
+              url_score = CASE WHEN {prio}
+                THEN EXCLUDED.url_score ELSE {tcur}.url_score END,
+              url_score_updated_at = CASE WHEN {prio}
+                THEN EXCLUDED.url_score_updated_at ELSE {tcur}.url_score_updated_at END,
+              source = CASE WHEN {prio}
+                THEN EXCLUDED.source ELSE {tcur}.source END
             RETURNING url
             """,
             link_rows,
@@ -621,7 +662,7 @@ class IngestDB:
                 INSERT INTO {this}
                   (url, domain_id, domain_score, url_score, url_score_updated_at, discovered_from,
                    discovery_source_type, parent_page_score,
-                   inlink_count_approx, inlink_count_external, anchor_text)
+                   inlink_count_approx, inlink_count_external, anchor_text, source)
                 VALUES %s
                 """,
                 history_rows,
@@ -656,6 +697,7 @@ class IngestDB:
                 if not existing.get("anchor_text") and rec.get("anchor_text"):
                     existing["anchor_text"] = rec["anchor_text"]
                 _prefer_higher_parent(existing, rec)
+                _prefer_higher_priority(existing, rec)
         return list(by_url.values())
 
     def process_batch(self, recs: list[dict]) -> list[IngestResult | bool | None]:

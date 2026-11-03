@@ -26,6 +26,15 @@ DISCOVERY_SOURCE_UNKNOWN = 0
 DISCOVERY_SOURCE_PAGE_OUTLINK = 1
 DISCOVERY_SOURCE_SITEMAP = 2
 
+# `url_state_current_{shard}.source` values written through this path. Keep in
+# sync with scripts/constants.py (0-3 are written by the inject scripts).
+#
+#   0 — natural discovery (default)
+#   4 — YouTube channel uploads playlist; url_score is the crawler-assigned
+#       channel priority (> 1.0, so the ranker never rescores it)
+SOURCE_NATURAL = 0
+SOURCE_YOUTUBE_CHANNEL = 4
+
 
 def build_new_link_record(
     *,
@@ -39,6 +48,8 @@ def build_new_link_record(
     inlink_count_approx: int = 1,
     inlink_count_external: int = 0,
     anchor_text: Optional[str] = None,
+    url_priority: Optional[float] = None,
+    source: int = SOURCE_NATURAL,
 ) -> dict:
     """Return the JSON-serializable dict the ingestor's `_bulk_links` expects.
 
@@ -58,4 +69,6 @@ def build_new_link_record(
         "inlink_count_approx": inlink_count_approx,
         "inlink_count_external": inlink_count_external,
         "anchor_text": anchor_text,
+        "url_priority": url_priority,
+        "source": source,
     }

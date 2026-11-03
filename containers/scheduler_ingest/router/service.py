@@ -22,12 +22,29 @@ from libs.db.sharding.router import ShardRouter, host_of
 from libs.ipc.jsonio import read_json, read_jsonl, append_jsonl
 from libs.ipc.new_link_record import (
     DISCOVERY_SOURCE_PAGE_OUTLINK,
+    SOURCE_YOUTUBE_CHANNEL,
     build_new_link_record,
 )
 from libs.stats.delta_writer import StatsDeltaWriter
 from libs.ipc.folder_reader import current_interval
 
 from .domain_resolver import DomainResolver
+
+# Crawler-assigned priorities (only YouTube channel links today) live on the
+# manual tier: strictly above the ranker's [0, 1] range, below golden's 3.0.
+MANUAL_PRIORITY_MIN = 1.0
+MANUAL_PRIORITY_MAX = 2.0
+
+
+def _priority_fields(link: Dict[str, Any]) -> Dict[str, Any]:
+    """url_priority / source for a crawler outlink that carries a priority;
+    {} (natural discovery) for everything else or an out-of-range value."""
+    priority = link.get("priority")
+    if not isinstance(priority, (int, float)) or isinstance(priority, bool):
+        return {}
+    if not MANUAL_PRIORITY_MIN < priority <= MANUAL_PRIORITY_MAX:
+        return {}
+    return {"url_priority": float(priority), "source": SOURCE_YOUTUBE_CHANNEL}
 
 
 def sha1_hex(s: str) -> str:
@@ -270,6 +287,7 @@ class RouterService:
                 parent_page_score=parent_page_score,
                 inlink_count_external=int(src_domain != domain),
                 anchor_text=anchor,
+                **_priority_fields(link),
             )
 
             out_dir = self._out_dir(ingestor_id)
