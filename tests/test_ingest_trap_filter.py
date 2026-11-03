@@ -53,17 +53,18 @@ class TrapFilterTest(unittest.TestCase):
         self.assertEqual([r["url"] for r in kept], [url])
         self.assertEqual(stats.dropped, 0)
 
-    def test_only_validated_params_are_stripped(self):
+    def test_only_srsltid_is_stripped_by_default(self):
         kept, stats = _filter().apply([
             _link("https://example.com/a?id=5&srsltid=abc"),
             _link("https://example.com/b;jsessionid=ABC123?x=1"),
             _link("https://example.com/c?PHPSESSID=f00&t=2"),
         ])
         self.assertEqual([r["url"] for r in kept], [
-            "https://example.com/a?id=5", "https://example.com/b?x=1",
-            "https://example.com/c?t=2",
+            "https://example.com/a?id=5", "https://example.com/b;jsessionid=ABC123?x=1",
+            "https://example.com/c?PHPSESSID=f00&t=2",
         ])
-        self.assertEqual((stats.normalized, stats.would_normalize), (3, 0))
+        # Session ids are only shadow-logged.
+        self.assertEqual((stats.normalized, stats.would_normalize), (1, 2))
         # Other fields are carried over unchanged.
         self.assertEqual(kept[0]["domain_id"], 7)
         self.assertEqual(kept[0]["discovered_from"], "https://example.com/")
@@ -176,7 +177,7 @@ class IngestServiceTrapFilterTest(unittest.TestCase):
     def test_process_folder_filters_links_but_not_results(self):
         recs = [
             _link("https://example.com/a?srsltid=x", inlink_count_approx=1),
-            _link("https://example.com/a;jsessionid=2", inlink_count_approx=1),
+            _link("https://example.com/a?srsltid=y", inlink_count_approx=1),
             _link("https://example.com/x/x/x/"),
             {"url": "https://example.com/x/x/x/?utm_source=y", "status": "ok",
              "shard_id": 3, "domain_id": 7},
@@ -238,6 +239,25 @@ class TrapRulesNumericTest(unittest.TestCase):
         # Arabic-Indic "٥٠٠١" = 5001 is a real decimal number.
         self.assertIn("B_big_page", match_rules("https://e.com/a?page=%D9%A5%D9%A0%D9%A0%D9%A1"))
         self.assertIn("B_big_page", match_rules("https://e.com/a?page=5001"))
+
+
+class SameSrsltidPolicyAsGoldenInjectTest(unittest.TestCase):
+    def test_ingest_normalization_matches_libs_urls_strip_srsltid(self):
+        # golden_inject (#103) and ingest must turn a URL into the same row.
+        from libs.urls import strip_srsltid
+        urls = [
+            "https://ew.com/story-12174222?srsltid=AfmBOoq",
+            "https://a.com/s?term=b27%20supplement&sort=relevance&srsltid=x",
+            "https://a.com/s?b=2&SrsLtId=x&a=1",
+            "https://a.com/p?srsltid=x#reviews",
+            "https://a.com/p?q=srsltid&xsrsltid=1",
+            "https://a.com/b;jsessionid=1?utm_source=x&srsltid=y",
+            "/goto?url=relative",
+        ]
+        f = _filter()
+        for url in urls:
+            kept, _ = f.apply([_link(url)])
+            self.assertEqual(kept[0]["url"], strip_srsltid(url), url)
 
 
 class GoldenMatchTest(unittest.TestCase):

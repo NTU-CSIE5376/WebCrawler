@@ -15,7 +15,7 @@ template analysis instead).
 | Group | Rules | Action at ingest (`trap_filter`, see [02.4](02-container-runtime-design.md)) |
 |---|---|---|
 | High confidence | `A_path_repeat`, `A_too_many_segments`, `B_nested_redirect`, `B_faceted`, `B_calendar` | Link dropped |
-| Duplicate class | `A_session_id`, `B_tracking_params` | `srsltid`, `jsessionid`, `phpsessid` stripped (`normalize_params`); every other tracking / session param only logged as `would_normalize`. Link kept |
+| Duplicate class | `A_session_id`, `B_tracking_params` | Only `srsltid` stripped (`normalize_params`); every other tracking / session param only logged as `would_normalize`. Link kept |
 | Medium / low | `B_big_page`, `B_big_offset`, `B_future_date`, `B_many_params`, `B_long_url`, `B_random_token` | Not acted on; signal only |
 
 The groups are `HIGH_CONFIDENCE` and `DUPLICATE_CLASS` in `trap_rules.py`.
@@ -88,20 +88,25 @@ false positives were removed:
 
 ## Normalization
 
-Stripping changes a URL's identity, so ingest only strips params with strong
-evidence that the page is the same without them, and shadow-logs the rest.
+Stripping changes a URL's identity, and every entry point (ingest,
+`golden_inject.py`, the coverage metric) has to agree on it, so ingest strips
+only `srsltid` for now and shadow-logs every other candidate.
 
 | Param | Ingest | Evidence |
 |---|---|---|
 | `srsltid` | **stripped** | Google documents it as Merchant Center attribution only; a new value per search |
-| `;jsessionid=`, `jsessionid`, `phpsessid` | **stripped** | phase 2 duplicate check: two session variants of a page matched in 92.5% / 95.8% of fetched pairs (different-page baseline 4.9%) |
+| `;jsessionid=`, `jsessionid`, `phpsessid` | logged (pending) | phase 2 duplicate check: two session variants of a page matched in 92.5% / 95.8% of fetched pairs (different-page baseline 4.9%). Strong evidence, but stripping waits until `golden_inject` and the coverage metric apply the same policy |
 | `utm_*`, `fbclid`, `_gl`, other tracking params | logged (`would_normalize`) | stripped vs. original matched 83% / 92% / 83% within 30 days, but most domains had no fetched pair to check |
 | `gclid` | logged | 59% match, 15 domains |
 | `oscsid`, `cfid`, `cftoken`, `zenid`, `aspsessionid*` | logged | `oscsid` 63% (3 domains); others too rare to measure |
 | `sid`, `s`, `sessionid`, … holding a 32-hex token | logged | often a session (`sid` 97% in variant pairs), but `saskatchewan.ca/…?s=<32 hex>` is a search id |
 
 The stripped set is `trap_filter.normalize_params`
-(`url_normalize.strip_named_params`); the shadow form is the full
+(`url_normalize.strip_named_params`). It must stay identical across entry
+points: `golden_inject.py` strips `srsltid` with `libs/urls.strip_srsltid`
+(#103) and the coverage metric matches the same forms (WebSearchEngine #19);
+a test checks that ingest produces the same URL as `strip_srsltid`. Adding a
+param means changing all three together. The shadow form is the full
 `url_normalize.strip_params(..., generic_session_tokens=True)`. Widen
 `normalize_params` only after the `would_normalize` golden hits and a
 same-page check on the shadow-logged URLs look clean.

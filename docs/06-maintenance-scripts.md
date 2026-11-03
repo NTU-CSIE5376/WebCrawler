@@ -352,7 +352,7 @@ docker compose exec scheduler_ingest python scripts/wiki_pageview_inject.py
 - Golden URLs are also matched by their normalized form: metricdb stores them as copied from search results (often with `srsltid`), while the crawler discovers the clean URL. `golden_inject.py` strips `srsltid` on its side (#103), so both converge on the same row. Rule definitions and validation: [10-frontier-trap-rules.md](10-frontier-trap-rules.md).
 - Reports per rule: drop events, distinct golden URLs dropped, and the false-kill rate (`golden dropped / golden total`). Golden URLs that were only normalized are listed separately: the stripped URL is still inserted, so they are not kills. Golden URLs that shadow normalization would rewrite (`WOULD_NORMALIZE`) show what widening `normalize_params` would touch.
 - Streams the logs; only the golden set is held in memory. `--out DIR` writes `summary.csv` and `golden_hits.csv` (each golden hit with its rules, parent URL and first timestamp).
-- Baseline before rollout: running the filter over the 138,459 metricdb golden URLs drops 4 (0.0029%), normalizes 1,291 (`srsltid`, `;jsessionid=`) and shadow-logs 37 (`utm_*`, `_gl`, …).
+- Baseline before rollout: running the filter over the 138,459 metricdb golden URLs drops 4 (0.0029%), normalizes 1,290 (`srsltid`) and shadow-logs 38 (`utm_*`, `_gl`, `;jsessionid=`, …).
 - Log volume: inflow is logged before the DB existence check, so a trap URL rediscovered in many folders is logged each time. Delete old log files by hand once the review is done.
 
 ```bash

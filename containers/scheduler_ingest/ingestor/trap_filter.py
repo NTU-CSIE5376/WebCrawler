@@ -1,10 +1,10 @@
 """Ingest-side frontier filter for newly discovered links (status == "new").
 
 Applied before links reach the DB, in this order:
-  1. normalize: strip a validated set of params (default `srsltid`,
-     `jsessionid`, `phpsessid`; libs.frontier.url_normalize.strip_named_params).
-     The same page otherwise re-enters the frontier under a new URL on every
-     visit.
+  1. normalize: strip an approved set of params (default only `srsltid`,
+     the same policy golden_inject applies via libs.urls.strip_srsltid;
+     libs.frontier.url_normalize.strip_named_params). The same page otherwise
+     re-enters the frontier under a new URL on every visit.
   2. shadow normalize: compute what the full strip_params (all tracking params,
      every named session param, 32-hex `sid` / `s` tokens) would remove beyond
      step 1 and only log it, so the remaining params can be validated before
@@ -40,11 +40,11 @@ from libs.frontier.url_normalize import strip_named_params, strip_params
 LOGGER = logging.getLogger("ingestor")
 
 
-# Params stripped for real. Google documents srsltid as attribution only;
-# jsessionid / phpsessid matched the stripped page in 93% / 96% of fetched
-# session-variant pairs (phase 2 duplicate check). Other tracking params
-# (gclid 59%) and oscsid (63%) are shadow-logged until validated.
-DEFAULT_NORMALIZE_PARAMS = frozenset({"srsltid", "jsessionid", "phpsessid"})
+# Params stripped for real: only srsltid (Google documents it as attribution
+# only), matching golden_inject (#103) and the coverage metric
+# (WebSearchEngine #19). Session ids and other tracking params are
+# shadow-logged until golden_inject and coverage support the same policy.
+DEFAULT_NORMALIZE_PARAMS = frozenset({"srsltid"})
 
 
 @dataclass(frozen=True)

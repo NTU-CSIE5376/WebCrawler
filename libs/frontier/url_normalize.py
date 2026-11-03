@@ -6,9 +6,9 @@ session id (`;jsessionid=`, phpBB `sid`) or a tracking parameter (`utm_*`,
 before a URL enters the frontier would stop that inflow.
 
 The ingest trap filter (containers/scheduler_ingest/ingestor/trap_filter.py)
-strips only a configured, validated subset with `strip_named_params`
-(`srsltid`, `jsessionid`, `phpsessid`) and logs what `strip_params` would
-remove beyond that, without applying it.
+strips only an approved subset with `strip_named_params` (default `srsltid`,
+identical to libs.urls.strip_srsltid used by golden_inject) and logs what
+`strip_params` would remove beyond that, without applying it.
 
 Stripping changes a URL's identity, so the rules are stricter than the trap
 report (`trap_rules.A_session_id`):

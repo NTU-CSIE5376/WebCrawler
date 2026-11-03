@@ -39,7 +39,7 @@ ingestor:
 trap_filter:
   enabled: true
   normalize: true
-  normalize_params: [srsltid, jsessionid, phpsessid]
+  normalize_params: [srsltid]
   shadow_normalize: true
   drop: true
   log_dir_template: "/data/ipc/trap_filter/ingestor_{id:02d}"
