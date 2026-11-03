@@ -77,8 +77,10 @@ def path_repeat(path: str) -> bool:
 
 
 def _int(v: str) -> int | None:
+    # isdecimal, not isdigit: "²" and "①" pass isdigit() but int() rejects
+    # them. Every isdecimal() string is accepted by int().
     v = v.strip()
-    if not v.isdigit() or len(v) >= 12 or (len(v) > 1 and v[0] == "0"):
+    if not v.isdecimal() or len(v) >= 12 or (len(v) > 1 and v[0] == "0"):
         return None
     return int(v)
 

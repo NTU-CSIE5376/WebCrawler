@@ -199,6 +199,47 @@ class IngestServiceTrapFilterTest(unittest.TestCase):
         self.assertEqual(sorted(e["action"] for e in events), ["drop", "normalize", "normalize"])
 
 
+    def test_unconvertible_numeric_param_does_not_stall_folder(self):
+        # "%C2%B2" decodes to "²": str.isdigit() is true but int() raises.
+        # The link must be evaluated (kept, no rule hit) and the rest of the
+        # folder ingested, instead of the folder failing on every restart.
+        recs = [
+            _link("https://example.com/article?page=%C2%B2"),
+            _link("https://example.com/list?offset=%E2%91%A0"),
+            _link("https://example.com/news/ok"),
+            {"url": "https://example.com/done", "status": "ok",
+             "shard_id": 3, "domain_id": 7},
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d) / "in"
+            folder.mkdir()
+            (folder / "part.jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs))
+            db = _FakeDB()
+            svc = IngestService(1, db, _FakeStats(), trap_filter=_filter(log_dir=str(Path(d) / "log")))
+            svc.process_folder(folder)
+        links, results = db.batches
+        self.assertEqual(sorted(r["url"] for r in links), [
+            "https://example.com/article?page=%C2%B2",
+            "https://example.com/list?offset=%E2%91%A0",
+            "https://example.com/news/ok",
+        ])
+        self.assertEqual([r["url"] for r in results], ["https://example.com/done"])
+
+
+class TrapRulesNumericTest(unittest.TestCase):
+    def test_non_decimal_digits_are_not_numbers(self):
+        from libs.frontier.trap_rules import match_rules
+        for value in ("%C2%B2", "%E2%91%A0", "1%C2%B2", "%C2%B9%C2%B2%C2%B3%C2%B9"):
+            self.assertEqual(match_rules(f"https://e.com/a?page={value}"), [])
+            self.assertEqual(match_rules(f"https://e.com/a?start={value}"), [])
+
+    def test_unicode_decimal_digits_still_parsed(self):
+        from libs.frontier.trap_rules import match_rules
+        # Arabic-Indic "٥٠٠١" = 5001 is a real decimal number.
+        self.assertIn("B_big_page", match_rules("https://e.com/a?page=%D9%A5%D9%A0%D9%A0%D9%A1"))
+        self.assertIn("B_big_page", match_rules("https://e.com/a?page=5001"))
+
+
 class GoldenMatchTest(unittest.TestCase):
     def test_golden_with_srsltid_matches_clean_discovered_link(self):
         from scripts.trap_filter_golden_check import golden_index, match_golden
