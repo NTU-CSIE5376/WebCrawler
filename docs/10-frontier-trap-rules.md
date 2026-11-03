@@ -122,12 +122,56 @@ Reading it:
 - Path recursion, nested redirects and faceted listings return a page the
   crawler already has 90–96% of the time, against 48% for other URLs of the
   same sites. `B_nested_redirect` also fails to fetch far more often (55% OK).
-- `B_calendar` does not look like duplication by this measure (43%, below the
-  control): each day / month view is a distinct listing. It is kept because the
-  space is unbounded (every date, forwards and backwards), the pages are event
-  listings rather than content, volume is small, and no golden URL hits it. It
-  is the weakest of the five and the first to demote if the audit log shows
-  golden hits.
+- `B_calendar` scores only 43% here, but the title measure does not fit it:
+  the calendar plugin writes the date and page number into the title
+  ("Events for May 10, 2023", "Upcoming Events – Page 13"), so even identical
+  pages get distinct titles. Day views, the largest group, score 24% for that
+  reason. See [B_calendar](#b_calendar-page-length-instead-of-title) below for
+  a page-length check that does fit.
+
+#### B_calendar: page length instead of title
+
+Pages rendered from the same template with nothing to list ("no events")
+differ only in title and date, so their byte length is nearly identical.
+Share of successfully fetched pages whose length is within 1% of another page
+of the same domain (domains with 5+ calendar pages; the control takes the
+same number of non-calendar pages from the same domains):
+
+| | Pages | Length within 1% of another page |
+|---|---:|---:|
+| `B_calendar` hits | 12,415 (359 domains) | **90%** |
+| control: same domains, non-calendar pages | 2,703 | 56% |
+
+Example, scboston.org (a skating club; 252 calendar pages in the sample):
+
+| Bytes | Title | URL |
+|---:|---|---|
+| 134,987 | Club Calendar – Page 73 | `/events/category/club-calendar/page/73/?tribe-bar-date=2026-06-20` |
+| 134,987 | Member Events – Page 14 | `/events/category/member-events/page/14/?tribe-bar-date=2026-04-05` |
+| 134,987 | Public Events – Page 13 | `/events/category/public-events/page/13/?tribe-bar-date=2026-06-19` |
+| 134,987 | Public Events – Page 39 | `/events/category/public-events/page/39/?tribe-bar-date=2026-06-26` |
+| 135,001 | Club Calendar – Page 100 | `/events/category/club-calendar/page/100/?tribe-bar-date=2026-04-01` |
+
+Four pages from different categories, page numbers and dates are byte-for-byte
+the same length: the empty template. A skating club has no 100th page of
+events; the URLs are category × page × any date, generated without limit.
+
+The space is unbounded in time as well: pending calendar URLs carry dates from
+2014 to 2030 (36% in 2023 or earlier, 10% in 2027 or later), and the five
+largest sites show 80–118 distinct dates among roughly 100–150 sampled URLs
+each, so nearly every date becomes a new URL. `ical` exports fetch
+successfully only 2% of the time.
+
+The rule only matches the plugin's view pages (`/events/…/day/`, `list`,
+`photo`, `map`, `tribe-bar-date`, `eventDisplay`, `ical`). A single event's
+own page (`/event/<slug>/`) does not match, so event content is still
+crawled. What is lost are day / list views that do contain events; those
+events stay reachable through their own pages.
+
+`B_calendar` remains the rule with the least direct evidence (length is a
+proxy, and the control is 56%, not 0%). It is kept because the URL space is
+unbounded, 90% of its pages look like an empty template and no golden URL
+hits it; it is the first to demote if the audit log shows golden hits.
 
 ### Where the volume comes from
 
@@ -197,7 +241,7 @@ seen in samples:
 | `A_too_many_segments` | 288 of 5,863 (4.9%) | Same as above, deeper (`hindi.newslaundry.com/2026/02/12/2023/03/10/…`) |
 | `B_nested_redirect` | 112 of 2,775 (4.0%) | Mostly login / sign-up pages; occasionally an article with a `?redirect_to=` suffix (`ruhrnachrichten.de/...?redirect_to=…`), whose canonical URL is linked elsewhere |
 | `B_faceted` | 224 of 2,414 (9.3%) | Distinct browse / search permutations (DSpace author browse, shop price bands). Listing pages, not items |
-| `B_calendar` | 7,394 of 12,973 (57%) | Distinct day / list views of event calendars. Real listings of low search value; see the note above |
+| `B_calendar` | 7,394 of 12,973 (57%) | Day / list views whose title carries the date, so titles are unique by construction; 90% match another page's length (empty template, see above). Views that do list events lose nothing their event pages do not cover |
 
 Limits: the fetched sample only covers URLs the scheduler chose to fetch, the
 repeat-title signal misses pages whose duplicate was never fetched, and golden
