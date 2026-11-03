@@ -3,10 +3,12 @@
 Retention on these tables is purely time-based (drop snapshots older than N
 days) and they have no pipeline read path, so RANGE partitioning on
 ``snapshot_at`` + ``DROP PARTITION`` is the right tool: O(1) metadata drop, no
-dead tuples, space returned to the OS immediately. This module holds the pure
+dead tuples, space returned to the OS immediately. This module holds the
 SQL-string builders shared by the one-off migration
 (``scripts/migrate_partition_history.py``) and the daily prune in the accounting
-service, so both agree on partition naming and bounds.
+service, so both agree on partition naming and bounds, plus
+``ensure_partitions``, which the accounting pass and the ingestor use to create
+missing month partitions.
 
 Partitions are monthly: ``{table}_p{YYYYMM}`` covering ``[month, next month)``.
 Monthly granularity keeps the partition count small (256 shards x a few months);
@@ -17,10 +19,24 @@ retention window, so up to ~1 extra month is retained.
 from __future__ import annotations
 
 import re
+import time
 from datetime import datetime, timezone
+from typing import Iterable
+
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
 # Partition child name suffix, e.g. ``..._p202605``.
 _PART_RE = re.compile(r"_p(\d{6})$")
+
+# PostgreSQL / YSQL error for an INSERT whose snapshot_at has no partition:
+#   no partition of relation "url_state_history_123" found for row
+#   DETAIL:  Partition key of the failing row contains (snapshot_at) = (2026-11-03 ...).
+_MISSING_PART_RE = re.compile(
+    r'no partition of relation "((?:url_state|content_feature)_history_\d{3})" found for row'
+    r".*?\(snapshot_at\)\s*=\s*\((\d{4})-(\d{2})-",
+    re.S,
+)
 
 
 def month_start(dt: datetime) -> datetime:
@@ -92,3 +108,79 @@ def months_covering(lo: datetime, hi: datetime) -> list[datetime]:
         out.append(m)
         m = next_month(m)
     return out
+
+
+def missing_partition_target(message: str) -> tuple[str, datetime] | None:
+    """``(parent, month)`` named by a "no partition of relation" error on a
+    ``*_history`` table, or None for any other error."""
+    m = _MISSING_PART_RE.search(message)
+    if not m:
+        return None
+    return m.group(1), datetime(int(m.group(2)), int(m.group(3)), 1, tzinfo=timezone.utc)
+
+
+def _exec_ddl_with_retry(sess, sql: str, attempts: int = 3) -> None:
+    """Run one DDL statement, retrying on YugabyteDB's distributed-read
+    conflict error ("Restart read required"), which PostgreSQL has no
+    equivalent of and which the driver does not retry on its own."""
+    for attempt in range(attempts):
+        try:
+            sess.execute(text(sql))
+            sess.commit()
+            return
+        except OperationalError as e:
+            sess.rollback()
+            if "restart read required" in str(e).lower() and attempt < attempts - 1:
+                time.sleep(0.3 * (attempt + 1))
+                continue
+            raise
+
+
+def ensure_partitions(Session, parents: Iterable[str], months: Iterable[datetime]) -> list[str]:
+    """Create each missing ``{parent}_pYYYYMM`` partition for ``months``.
+
+    Parents that are not partitioned yet (``scripts/migrate_partition_history.py``
+    not run) are skipped. Existence is checked against the catalog rather than
+    relying on CREATE TABLE IF NOT EXISTS: on YSQL that clause does not suppress
+    the duplicate-composite-type error when the partition already exists. Each
+    partition is created in its own transaction, and a failure does not stop the
+    rest; the first error is re-raised once every partition has been tried.
+    Returns the names of the partitions created.
+    """
+    parents = sorted(set(parents))
+    months = sorted(set(months))
+    if not parents or not months:
+        return []
+
+    with Session() as sess:
+        partitioned = {
+            name for (name,) in sess.execute(
+                text("SELECT relname FROM pg_class WHERE relkind = 'p' AND relname = ANY(:names)"),
+                {"names": parents},
+            )
+        }
+        wanted = {
+            partition_name(parent, month): (parent, month)
+            for parent in parents if parent in partitioned
+            for month in months
+        }
+        existing = {
+            name for (name,) in sess.execute(
+                text("SELECT relname FROM pg_class WHERE relname = ANY(:names)"),
+                {"names": list(wanted)},
+            )
+        } if wanted else set()
+        sess.rollback()  # end the catalog read before running DDL
+
+        created, first_error = [], None
+        for name in sorted(set(wanted) - existing):
+            parent, month = wanted[name]
+            try:
+                _exec_ddl_with_retry(sess, partition_of_sql(parent, parent, month))
+                created.append(name)
+            except Exception as e:
+                sess.rollback()
+                first_error = first_error or e
+        if first_error is not None:
+            raise first_error
+        return created
