@@ -101,7 +101,7 @@ services:
       context: .
       dockerfile: containers/scheduler_ingest/Dockerfile
     container_name: scheduler_ingest
-    cpus: 8
+    cpus: 32
     init: true
     restart: unless-stopped
     volumes:
