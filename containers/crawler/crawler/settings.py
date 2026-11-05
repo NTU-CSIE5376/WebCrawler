@@ -116,6 +116,15 @@ EXTENSIONS = {
     "scrapy.extensions.memusage.MemoryUsage": 500,
 }
 
+DOWNLOADER_MIDDLEWARES = {
+    "crawler.redirect_dedup.RedirectTargetDedupMiddleware": 50,
+}
+# Skip re-fetching a redirect target fetched successfully within the TTL; the
+# queued URL is still reported (ok, no content). See crawler/redirect_dedup.py.
+REDIRECT_DEDUP_ENABLED = _env_bool("CRAWLER_REDIRECT_DEDUP_ENABLED", True)
+REDIRECT_DEDUP_TTL_SEC = float(os.getenv("CRAWLER_REDIRECT_DEDUP_TTL_SEC", "3600"))
+REDIRECT_DEDUP_MAX_ENTRIES = int(os.getenv("CRAWLER_REDIRECT_DEDUP_MAX_ENTRIES", "200000"))
+
 ITEM_PIPELINES = {
     "crawler.pipelines.JsonPipeline": 500,
 }

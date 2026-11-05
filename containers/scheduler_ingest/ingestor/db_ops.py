@@ -24,6 +24,11 @@ class IngestResult:
     is_ok: bool = False
     is_upd: bool = False
     fail_reason: str | None = None
+    # Redirect-source outcomes (router `redirect_source`) update the queued
+    # row but are not an extra fetch: they skip the global counters, and the
+    # per-domain ones unless the redirect crossed domains.
+    count_global: bool = True
+    count_domain: bool = True
 
 
 BATCH_SIZE = 2000
@@ -333,6 +338,11 @@ class IngestDB:
                 "is_redirect": rec.get("is_redirect"),
                 "redirect_hop_count": rec.get("redirect_hop_count"),
                 "robots_bits": self._robots_bits(is_ok, rec.get("fail_reason")),
+                "redirect_source": bool(rec.get("redirect_source")),
+                "count_domain": (
+                    bool(rec.get("count_domain_stats"))
+                    if rec.get("redirect_source") else True
+                ),
             })
             if is_ok and content_hash is not None:
                 check_urls.append(url)
@@ -455,6 +465,8 @@ class IngestDB:
         ok_counts: Counter[int] = Counter()
         fail_counts: Counter[int] = Counter()
         for d in decoded:
+            if not d["count_domain"]:
+                continue
             if d["is_ok"]:
                 ok_counts[d["domain_id"]] += 1
                 continue
@@ -494,6 +506,8 @@ class IngestDB:
                 is_ok=d["is_ok"],
                 is_upd=d["is_upd"],
                 fail_reason=d["fail_reason"],
+                count_global=not d["redirect_source"],
+                count_domain=d["count_domain"],
             ))
             for d in decoded
         ]

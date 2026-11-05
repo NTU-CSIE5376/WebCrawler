@@ -27,22 +27,27 @@ class IngestService:
         if not result:
             return
 
-        domains.setdefault(result.domain_id, defaultdict(int))
-
         if result.new_link:
             counters["new_links"] += 1
-        if result.is_ok:
-            counters["num_fetch_ok"] += 1
-            domains[result.domain_id]["num_fetch_ok"] += 1
-        else:
-            counters["num_fetch_fail"] += 1
-            domains[result.domain_id]["num_fetch_fail"] += 1
-        if result.is_upd:
-            counters["num_content_update"] += 1
-            domains[result.domain_id]["num_content_update"] += 1
-        if result.fail_reason:
-            counters.setdefault("fail_reasons", defaultdict(int))[result.fail_reason] += 1
-            domains[result.domain_id].setdefault("fail_reasons", defaultdict(int))[result.fail_reason] += 1
+
+        # Redirect-source outcomes are not extra fetches (see IngestResult).
+        targets = []
+        if result.count_global:
+            targets.append(counters)
+        if result.count_domain:
+            targets.append(domains.setdefault(result.domain_id, defaultdict(int)))
+        if not result.count_global:
+            counters["num_redirect_source"] += 1
+
+        for t in targets:
+            if result.is_ok:
+                t["num_fetch_ok"] += 1
+            else:
+                t["num_fetch_fail"] += 1
+            if result.is_upd:
+                t["num_content_update"] += 1
+            if result.fail_reason:
+                t.setdefault("fail_reasons", defaultdict(int))[result.fail_reason] += 1
 
     def process_folder(self, folder: Path):
         logger.info(
@@ -107,6 +112,7 @@ class IngestService:
                 "num_fetch_fail": counters.get("num_fetch_fail", 0),
                 "num_content_update": counters.get("num_content_update", 0),
                 "new_links": counters.get("new_links", 0),
+                "num_redirect_source": counters.get("num_redirect_source", 0),
             },
         )
 
