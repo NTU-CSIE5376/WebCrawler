@@ -4,6 +4,10 @@ router:
   ingestor_dir_template: "/data/ipc/crawl_result/ingestor_{id:02d}"
   stats_dir: "/data/ipc/stats"
   interval_minutes: 10
+  # When a result arrives under a different URL than the one queued (redirect
+  # target, canonicalized form), also record the outcome on the queued row.
+  # Adds one result record per redirect. Env: ROUTER_EMIT_REDIRECT_SOURCE.
+  emit_redirect_source: true
 
   num_shards: 256
   shards_per_ingestor: 16

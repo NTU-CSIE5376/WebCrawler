@@ -80,6 +80,41 @@ Notes:
 }
 ```
 
+### Redirects: queued URL vs final URL
+
+`url` in a crawler result is the canonicalized final URL. When it differs
+from the URL the offerer queued, the record also carries `source_url` (the
+queued string, i.e. the `url_state_current_*` key). Both URLs are recorded,
+and the content is stored once:
+
+- Final URL: the usual result record (content, outlinks, features). Its row
+  is created with `should_crawl = FALSE`, so it is not queued again.
+- Queued URL: the router emits one more record, `"redirect_source": true`,
+  routed to the queued URL's shard. It carries status, `fail_reason`,
+  `is_redirect` and `redirect_hop_count`, but no content and no outlinks.
+  The ingestor uses it to close out the queued row (`last_fetch_ok` /
+  fail counters). The feature extractor skips it. It is left out of the
+  global fetch counters. In per-domain counters it counts only when the
+  redirect crossed domains, so the scheduled domain gets credit without
+  counting the same fetch twice. Switch: `router.emit_redirect_source` /
+  `ROUTER_EMIT_REDIRECT_SOURCE`.
+- Redirect target dedup: each crawler remembers canonical URLs it fetched
+  successfully in the last `CRAWLER_REDIRECT_DEDUP_TTL_SEC` (default 1 h).
+  A redirect to one of them is not fetched again. The crawler reports
+  `"status": "ok", "redirect_deduped": true` with no content, and the router
+  then emits only the queued URL's record. First-hop requests are never
+  skipped. Switch: `CRAWLER_REDIRECT_DEDUP_ENABLED`.
+
+```json
+{
+  "url": "https://www.weee.com/vi/explore/gao-vang",
+  "source_url": "https://www.sayweee.com/vi/explore/gao-vang",
+  "status": "ok",
+  "is_redirect": true,
+  "redirect_hop_count": 1
+}
+```
+
 ### Router Output Record (new outlink candidate)
 
 ```json

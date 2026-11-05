@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -69,6 +70,10 @@ class RouterConfig:
     split_subdomains: Set[str]
 
     postgres_dsn: str
+
+    # Also write the fetch outcome to the queued URL's row when the crawler
+    # reported it under another URL (redirect target / canonical form).
+    emit_redirect_source: bool = True
 
 
 class RouterService:
@@ -167,6 +172,16 @@ class RouterService:
                                     if l:
                                         new_outlinks.append(l)
 
+                                source_out = None
+                                source_url = rec.get("source_url")
+                                if (
+                                    self.cfg.emit_redirect_source
+                                    and source_url and source_url != src_url
+                                ):
+                                    source_out = self._redirect_source_record(
+                                        domain_resolver, rec, source_url, domain_id,
+                                    )
+
                         out = {
                             "url": rec.get("url"),
                             "status": status,
@@ -187,10 +202,12 @@ class RouterService:
                             "redirect_hop_count": rec.get("redirect_hop_count"),
                         }
 
-                        out_dir = self._out_dir(ingestor_id)
-                        out_dir.mkdir(parents=True, exist_ok=True)
-                        out_path = out_dir / f"{datetime.now(timezone.utc).strftime('%H%M')}_router{self.cfg.router_id:02d}.jsonl"
-                        append_jsonl(out_path, out)
+                        # A deduped redirect did not fetch the target again:
+                        # only the queued URL gets an outcome.
+                        if not (rec.get("redirect_deduped") and source_out is not None):
+                            self._append_out(ingestor_id, out)
+                        if source_out is not None:
+                            self._append_out(source_out.pop("_ingestor_id"), source_out)
                         break # success
 
                     except (OperationalError, InterfaceError) as e:
@@ -242,6 +259,50 @@ class RouterService:
                 "errors": error,
             },
         )
+
+    def _append_out(self, ingestor_id: int, out: dict) -> None:
+        out_dir = self._out_dir(ingestor_id)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{datetime.now(timezone.utc).strftime('%H%M')}_router{self.cfg.router_id:02d}.jsonl"
+        append_jsonl(out_path, out)
+
+    def _redirect_source_record(
+        self, domain_resolver, rec: dict, source_url: str, final_domain_id: int,
+    ) -> dict:
+        """Fetch outcome for the URL the offerer queued, when the crawler
+        reported the result under a different URL (redirect target or
+        canonicalized form). Without it the queued row never gets a result:
+        it stays should_crawl=FALSE with last_fetch_ok NULL forever.
+
+        Carries status and HTTP metadata only. Content, outlinks and features
+        stay on the final URL's record.
+        """
+        host = host_of(source_url)
+        domain = self.sharder.domain_key(host)
+        shard_id = self.sharder.domain_to_shard(host)
+        domain_id, _ = domain_resolver.ensure_and_get(domain, shard_id)
+        return {
+            "_ingestor_id": self.sharder.shard_to_ingestor(shard_id),
+            "url": source_url,
+            "status": rec.get("status"),
+            "fetched_at": rec.get("fetched_at"),
+            "fail_reason": rec.get("fail_reason"),
+            "content": None,
+            "outlinks": [],
+            "shard_id": shard_id,
+            "domain_id": domain_id,
+            "content_hash": None,
+            "is_redirect": rec.get("is_redirect"),
+            "redirect_hop_count": rec.get("redirect_hop_count"),
+            "redirect_source": True,
+            # A same-domain redirect is already counted on the final URL's
+            # record; count only cross-domain sources in per-domain stats so
+            # the scheduled domain is credited without double counting. A
+            # deduped redirect emits no final record, so it always counts.
+            "count_domain_stats": (
+                domain_id != final_domain_id or bool(rec.get("redirect_deduped"))
+            ),
+        }
 
     def _parent_url_score(self, sess, shard_id: int, src_url: Optional[str]) -> Optional[float]:
         """url_score of the parent page (the crawled page that emitted these
@@ -334,4 +395,9 @@ def load_router_config(path: str, router_id: int) -> RouterConfig:
         domain_overrides=overrides,
         split_subdomains=split_subdomains,
         postgres_dsn=dsn,
+        emit_redirect_source=(
+            os.environ["ROUTER_EMIT_REDIRECT_SOURCE"].strip().lower() in {"1", "true", "yes", "on"}
+            if "ROUTER_EMIT_REDIRECT_SOURCE" in os.environ
+            else bool(r.get("emit_redirect_source", True))
+        ),
     )
