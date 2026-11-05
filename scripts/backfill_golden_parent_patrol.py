@@ -38,6 +38,8 @@ from __future__ import annotations
 
 import argparse
 import logging
+import time
+from collections import defaultdict
 from pathlib import Path
 
 import psycopg2
@@ -80,23 +82,66 @@ def fetch_max_metric_batch_id(metric_conn) -> int:
         return int(cur.fetchone()[0])
 
 
+# Rows fetched per FETCH from the server-side cursor. Small enough that any
+# transient cancellation only loses a single FETCH worth of work; large
+# enough that 256 shards × ~150 M rows complete in reasonable wall-time.
+SCAN_PAGE_SIZE = 10_000
+
+
+def disable_statement_timeout(crawler_conn) -> None:
+    """Per-role / pgbouncer / monitoring tools can cancel long-running
+    statements even when the database itself has `statement_timeout = 0`
+    (the symptom we hit in PR review: psycopg2.errors.QueryCanceled while
+    scanning a ~150 M-row shard). Explicitly disable both timeouts on
+    this connection so the maintenance scan only stops when the data is
+    exhausted.
+    """
+    with crawler_conn.cursor() as cur:
+        cur.execute("SET statement_timeout = 0")
+        cur.execute("SET idle_in_transaction_session_timeout = 0")
+    crawler_conn.commit()
+
+
 def scan_shard_for_live_parents(
     crawler_conn, shard_id: int
 ) -> list[tuple[str, int]]:
-    """Returns (raw_parent_url, distinct_child_count) per raw parent URL."""
+    """Returns (raw_parent_url, child_count) per raw parent URL by streaming
+    the shard with a server-side cursor and aggregating in Python.
+
+    Replaces the prior `GROUP BY discovered_from` per shard, which built a
+    giant hash-aggregate in DB memory and ran as one ~10-minute statement
+    over ~150 M rows — fragile against client / pgbouncer / DBA-tool
+    cancellation. Streaming spreads the work across many short FETCH
+    calls; Python-side aggregation is one int per parent_url (small).
+
+    `url` is the shard's PRIMARY KEY, so `COUNT(*)` over rows matching
+    `WHERE source = SOURCE_GOLDEN AND discovered_from = X` is the same as
+    the prior `COUNT(DISTINCT url)` — the DISTINCT was redundant.
+
+    Caller must call `disable_statement_timeout(crawler_conn)` once
+    before invoking this for any shard.
+    """
     table = f"url_state_current_{shard_id:03d}"
-    with crawler_conn.cursor() as cur:
+    counts: dict[str, int] = defaultdict(int)
+    cursor_name = f"patrol_backfill_scan_{shard_id:03d}"
+    with crawler_conn.cursor(name=cursor_name) as cur:
+        cur.itersize = SCAN_PAGE_SIZE
         cur.execute(
             f"""
-            SELECT discovered_from, COUNT(DISTINCT url) AS children
+            SELECT discovered_from
             FROM {table}
             WHERE source = %s
               AND discovered_from IS NOT NULL
-            GROUP BY discovered_from
             """,
             (SOURCE_GOLDEN,),
         )
-        return [(row[0], int(row[1])) for row in cur.fetchall()]
+        for (discovered_from,) in cur:
+            counts[discovered_from] += 1
+    # Close the per-shard read transaction so the snapshot is not held
+    # across all 256 shards (which would block VACUUM for hours and bloat
+    # the heap on a live production table).
+    crawler_conn.commit()
+    return list(counts.items())
 
 
 class ParentAggregate:
@@ -236,10 +281,26 @@ def main():
         help="Aggregate but do not write to crawlerdb",
     )
     parser.add_argument(
+        "--start-shard",
+        type=int,
+        default=0,
+        help=(
+            "Resume from this shard id (default 0). If a prior run died "
+            "partway through the 256-shard scan, restart with the next "
+            "unscanned id; the script will scan from there. Note: upsert "
+            "still requires a full scan in one process (cross-shard "
+            "aggregation lives in memory), so the typical use is "
+            "smoke-testing a single shard before the full run."
+        ),
+    )
+    parser.add_argument(
         "--limit-shards",
         type=int,
         default=None,
-        help="Only scan the first N shards (smoke testing).",
+        help=(
+            "Only scan this many shards starting from --start-shard "
+            "(default: all 256)."
+        ),
     )
     args = parser.parse_args()
 
@@ -261,17 +322,41 @@ def main():
             last_eval_batch_id,
         )
 
-        max_shard = NUM_SHARDS if args.limit_shards is None else args.limit_shards
+        disable_statement_timeout(crawler_conn)
+
+        end_shard = (
+            NUM_SHARDS
+            if args.limit_shards is None
+            else min(args.start_shard + args.limit_shards, NUM_SHARDS)
+        )
+        log.info(
+            "scanning shards [%d, %d) of %d",
+            args.start_shard,
+            end_shard,
+            NUM_SHARDS,
+        )
 
         # Aggregate across all shards before upserting so a parent that
         # appears in multiple shards (split_etld1 case) collapses into one
         # patrol_state row with the union of aliases.
         all_rows: list[tuple[str, int]] = []
         scanned_shards = 0
-        for shard_id in range(max_shard):
+        run_started = time.monotonic()
+        for shard_id in range(args.start_shard, end_shard):
+            shard_started = time.monotonic()
             rows = scan_shard_for_live_parents(crawler_conn, shard_id)
+            shard_elapsed = time.monotonic() - shard_started
             scanned_shards += 1
             all_rows.extend(rows)
+            log.info(
+                "shard %3d: %5d parents, %.1fs (cumulative %.1f min, %d/%d shards)",
+                shard_id,
+                len(rows),
+                shard_elapsed,
+                (time.monotonic() - run_started) / 60.0,
+                scanned_shards,
+                end_shard - args.start_shard,
+            )
 
         log.info(
             "scanned %d shards; %d raw discovered_from groups",
