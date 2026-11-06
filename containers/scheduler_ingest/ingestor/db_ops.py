@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from psycopg2.extras import execute_values
 from sqlalchemy.orm import sessionmaker
 
+from libs.db.sharding.history_partition import ensure_partitions, missing_partition_target
 from libs.ipc.new_link_record import SOURCE_NATURAL, SOURCE_YOUTUBE_CHANNEL
 from libs.scoring.golden_discovery_runtime import GoldenDiscoveryRuntimeScorer
 
@@ -732,6 +733,42 @@ class IngestDB:
         return list(by_url.values())
 
     def process_batch(self, recs: list[dict]) -> list[IngestResult | bool | None]:
+        """Ingest one batch; if it fails only because a ``*_history`` month
+        partition is missing, create that month's partition for every shard in
+        the batch and retry once, so ingestion does not wait on the accounting
+        pass to provision it."""
+        try:
+            return self._process_batch_once(recs)
+        except Exception as e:
+            target = missing_partition_target(str(e))
+            if target is None:
+                raise
+        parent, month = target
+        table = parent[: -len("_000")]
+        shard_ids = {int(rec["shard_id"]) for rec in recs} | {int(parent[-3:])}
+        try:
+            created = ensure_partitions(
+                self.Session, [f"{table}_{sid:03d}" for sid in shard_ids], [month]
+            )
+            LOGGER.warning(
+                "ingest.history_partition_provisioned",
+                extra={
+                    "event": "ingest.history_partition_provisioned",
+                    "table": table,
+                    "month": f"{month:%Y-%m}",
+                    "created": len(created),
+                },
+            )
+        except Exception as e:
+            # Most likely another ingestor created the same partition first;
+            # the retry below tells whether the partition is there now.
+            LOGGER.warning(
+                "ingest.history_partition_provision_error",
+                extra={"event": "ingest.history_partition_provision_error", "error": str(e)},
+            )
+        return self._process_batch_once(recs)
+
+    def _process_batch_once(self, recs: list[dict]) -> list[IngestResult | bool | None]:
         """Group records by (kind, shard_id) and dispatch to bulk paths.
 
         All-or-nothing: any failure rolls back and re-raises.
