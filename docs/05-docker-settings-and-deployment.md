@@ -88,7 +88,7 @@ domains:
     request_limits:
       download_slot: wikipedia
       max_qps: 15
-      max_concurrent_requests: 10
+      max_concurrent_requests: 8
   youtube.com:
     middleware: crawler.middlewares.youtube.YouTubeMiddleware
 hosts:
@@ -122,7 +122,32 @@ the old `domain_qps.json`, `CRAWLER_USE_AUTOTHROTTLE`, `CRAWLER_DOWNLOAD_DELAY`,
 #### Wikipedia
 
 Wikipedia uses AutoThrottle with `max_qps: 15` (a minimum interval of about
-0.0667 seconds) and a shared `wikipedia` slot with concurrency 10 per process.
+0.0667 seconds) and `max_concurrent_requests: 8`. When explicitly configured
+under `domains`, `max_concurrent_requests` is enforced by the generic
+`SharedConcurrencyMiddleware` across all crawler processes and subdomains.
+This includes robots.txt, redirects, retries, and manual jobs, regardless of
+shard routing. Host overrides cannot relax a domain's shared cap; a lower host
+limit still applies locally. Default and host-only concurrency limits remain
+per process. Domain rules without an explicit concurrency setting do not
+create a shared budget.
+
+The shared limit covers crawler requests. The unchanged synchronous sitemap
+discovery and patrol workers can each add one concurrent request; with a crawler
+cap of eight, the combined maximum is ten. Use a crawler cap of seven to keep
+the combined maximum at nine for the current one-instance-per-worker deployment.
+
+The middleware uses file locks under `/data/ipc/request_budgets`, on the IPC
+bind mount shared by the crawler containers. Workers wait asynchronously for a
+lease and fail closed if the shared directory is unavailable. Responses and
+download exceptions release leases; process death releases locks automatically.
+For local runs, set `SHARED_REQUEST_BUDGET_DIR` to a writable directory shared by
+all participating processes. Do not delete lock files while crawlers run.
+Deploy by restarting all crawler processes together so no old workers bypass
+the middleware. Existing split whitelist entries can remain: all crawler
+processes share the same domain budget regardless of their shard assignment.
+The whitelist refresh script excludes Wikipedia from all scopes, avoiding
+additional parallel probes and new language-host split entries.
+
 The middleware normalizes `/wiki/Title` URLs by removing query parameters and
 fragments, trimming surrounding title whitespace, and replacing title spaces
 with underscores. It converts `/w/index.php?title=Title` URLs to `/wiki/Title`.

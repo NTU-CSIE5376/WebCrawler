@@ -194,6 +194,7 @@ tldextract.extract = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)
 dnscache["en.wikipedia.org"] = "127.0.0.1"
 settings = Settings()
 settings.setmodule("crawler.settings")
+settings.set("SHARED_REQUEST_BUDGET_DIR", sys.argv[1] + "/request_budgets")
 settings.set("DOWNLOAD_DELAY", 0.1)
 settings.set("RANDOMIZE_DOWNLOAD_DELAY", False)
 settings.set("AUTOTHROTTLE_ENABLED", False)

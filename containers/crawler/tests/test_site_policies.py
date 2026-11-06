@@ -248,6 +248,9 @@ def test_bundled_config_uses_autothrottle_with_wikipedia_minimum(monkeypatch):
     assert settings["DOWNLOAD_DELAY"] == 0.25
     assert policies.resolve("en.wikipedia.org").crawler_mode == "autothrottle"
     assert policies.resolve("en.wikipedia.org").request_limits.max_qps == 15
+    assert policies.shared_budgets("en.wikipedia.org") == (("domain:wikipedia.org", 8),)
+    assert policies.shared_budgets("zh.wikipedia.org") == (("domain:wikipedia.org", 8),)
+    assert "crawler.middlewares.shared_concurrency.SharedConcurrencyMiddleware" in settings["DOWNLOADER_MIDDLEWARES"]
     assert policies.resolve("en.wikipedia.org").request_limits.min_request_delay_sec == pytest.approx(1 / 15)
 
 

@@ -124,6 +124,21 @@ class SitePolicies:
         return slots
 
     @lru_cache(maxsize=4096)
+    def shared_budgets(self, hostname):
+        """An explicit domain concurrency limit is shared across all workers.
+
+        Host overrides cannot relax the domain budget. Default and host-only
+        concurrency limits remain local to each crawler process.
+        """
+        hostname = normalize_hostname(hostname)
+        domain = get_registered_domain(hostname)
+        rule = self.config.domains.get(domain)
+        if (rule is None or rule.request_limits is None
+                or "max_concurrent_requests" not in rule.request_limits.model_fields_set):
+            return ()
+        return ((f"domain:{domain}", rule.request_limits.max_concurrent_requests),)
+
+    @lru_cache(maxsize=4096)
     def resolve(self, hostname):
         hostname = normalize_hostname(hostname)
         domain = get_registered_domain(hostname)
