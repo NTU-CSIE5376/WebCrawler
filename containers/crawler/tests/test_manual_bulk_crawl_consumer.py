@@ -9,12 +9,13 @@ from scrapy.http import HtmlResponse
 from scrapy.settings import Settings
 
 from containers.crawler.crawler.manual_bulk_crawls import ManualBulkCrawlConsumer
+from containers.crawler.crawler.site_policies import SitePolicies
 from libs.ipc import manual_bulk_crawl as storage
 from libs.ipc.manual_bulk_crawl import next_batch, prepare_job, job_status
 
 
 @pytest.fixture
-def queue(tmp_path):
+def queue(tmp_path, monkeypatch):
     pending = tmp_path / "pending"
     pending.mkdir()
 
@@ -28,7 +29,8 @@ def queue(tmp_path):
         prepare_job(path, json.loads(path.read_text()))
         return path
 
-    def consumer(concurrency=2, *, domain_concurrency=None, slot_settings=None, **limits):
+    def consumer(concurrency=2, *, domain_concurrency=None, slot_settings=None, site_policies=None, **limits):
+        monkeypatch.setattr(SitePolicies, "load", classmethod(lambda cls: site_policies or SitePolicies({})))
         requests = []
         spider = SimpleNamespace(crawler_id=0, logger=Mock(), crawler=SimpleNamespace(
             settings=Settings({"CONCURRENT_REQUESTS": concurrency,
@@ -456,6 +458,131 @@ def test_domain_cap_is_shared_across_jobs_and_failure_releases_it(queue):
         assert consumer.domains["example.com"].outstanding == 2
         for request in requests:
             assert "download_slot" not in request.meta, "Do not pin redirect requests to original slots"
+    finally:
+        consumer.close()
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_language_hosts_share_configured_slot_backlog_and_dispatch_cap(queue, failure):
+    from twisted.python.failure import Failure
+    from twisted.internet.error import TimeoutError
+
+    enqueue, factory, _ = queue
+    enqueue("english", urls=[f"https://en.wikipedia.org/wiki/{i}" for i in range(3)])
+    enqueue("chinese", urls=[f"https://zh.wikipedia.org/wiki/{i}" for i in range(3)])
+    enqueue("other", urls=["https://other.example/0"])
+    registry = SitePolicies({"domains": {"wikipedia.org": {"request_limits": {
+        "download_slot": "wikipedia", "max_concurrent_requests": 2}}}})
+    consumer, requests = factory(concurrency=8, site_policies=registry,
+                                 slot_settings={"wikipedia": {"concurrency": 2, "delay": 10}})
+    try:
+        consumer._load_jobs()
+        assert set(consumer.domains) == {"wikipedia", "other.example"}
+        shared = consumer.domains["wikipedia"]
+        shared.jitter = 0
+        consumer._refresh_priorities()
+        assert len(shared.pending) == 6
+        assert consumer.ready["wikipedia"] == 60
+
+        consumer.refill()
+        assert len(requests) == 3  # Two Wikipedia URLs plus the unrelated host.
+        assert shared.outstanding == 2
+        assert len(shared.pending) == 4
+        assert "wikipedia" not in consumer.ready
+        assert all("download_slot" not in request.meta for request in requests)
+        # Once language hosts share a slot, completions can admit the next
+        # language/job while retaining the original job and result index.
+        for request in list(requests[:2]):
+            complete(consumer, request)
+        assert requests[-1].url == "https://zh.wikipedia.org/wiki/0"
+        assert requests[-1].meta["manual_bulk_crawl_job_id"] == "chinese"
+        assert requests[-1].meta["manual_bulk_crawl_index"] == 0
+
+        request = requests[-1]
+        before = len(requests)
+        if failure:
+            error = Failure(TimeoutError())
+            error.request = request
+            consumer.fetch_failed(error)
+        else:
+            request.meta["download_latency"] = 5
+            # Release the original admission slot even after a cross-host redirect.
+            consumer.parse(HtmlResponse("https://external.example/redirected", request=request,
+                                        body=b"<html>saved</html>",
+                                        headers={"Content-Type": "text/html"}))
+            assert shared.latency == pytest.approx(1.8)
+        assert len(requests) == before + 1
+        assert shared.outstanding == 2
+        assert set(consumer.inflight_domains.values()) == {"wikipedia", "other.example"}
+    finally:
+        consumer.close()
+
+
+def test_shared_slot_uses_live_autothrottle_delay_for_service_time(queue):
+    enqueue, factory, _ = queue
+    enqueue("wiki", urls=["https://en.wikipedia.org/wiki/0", "https://zh.wikipedia.org/wiki/1"])
+    enqueue("other", urls=[f"https://other.example/{i}" for i in range(5)])
+    registry = SitePolicies({"domains": {"wikipedia.org": {"request_limits": {
+        "download_slot": "wikipedia", "max_concurrent_requests": 2}}}})
+    consumer, requests = factory(concurrency=1, site_policies=registry,
+                                 slot_settings={"wikipedia": {"concurrency": 8, "delay": 0}})
+    live = SimpleNamespace(concurrency=2, delay=10)
+    consumer.spider.crawler.engine.downloader = SimpleNamespace(slots={"wikipedia": live})
+    try:
+        consumer._load_jobs()
+        consumer.domains["wikipedia"].jitter = 0
+        consumer._refresh_priorities()
+        assert consumer.ready["wikipedia"] == 20
+        consumer.refill()
+        assert requests[0].url == "https://en.wikipedia.org/wiki/0"
+        live.delay = 0
+        complete(consumer, requests[0])
+        assert requests[1].url.startswith("https://other.example/"), "Live delay changes must reprioritize work"
+    finally:
+        consumer.close()
+
+
+def test_shared_slot_live_concurrency_caps_all_language_hosts(queue):
+    enqueue, factory, _ = queue
+    enqueue("wiki", urls=[f"https://{language}.wikipedia.org/wiki/{i}"
+                          for i, language in enumerate(("en", "zh", "fr", "de"))])
+    registry = SitePolicies({"domains": {"wikipedia.org": {"request_limits": {
+        "download_slot": "wikipedia", "max_concurrent_requests": 8}}}})
+    consumer, requests = factory(concurrency=8, site_policies=registry,
+                                 slot_settings={"wikipedia": {"concurrency": 8, "delay": 0}})
+    live = SimpleNamespace(concurrency=1, delay=0)
+    consumer.spider.crawler.engine.downloader = SimpleNamespace(slots={"wikipedia": live})
+    try:
+        consumer.poll()
+        assert len(requests) == 1
+        assert consumer.domains["wikipedia"].outstanding == 1
+        live.concurrency = 2
+        consumer.poll()
+        assert len(requests) == 2
+        assert consumer.domains["wikipedia"].outstanding == 2
+        live.concurrency = 1
+        complete(consumer, requests[0])
+        assert len(requests) == 2, "Do not refill while the remaining request fills the reduced cap"
+        complete(consumer, requests[1])
+        assert len(requests) == 3
+        assert requests[-1].url == "https://fr.wikipedia.org/wiki/2"
+    finally:
+        consumer.close()
+
+
+def test_slot_grouping_respects_exact_host_overrides(queue):
+    enqueue, factory, _ = queue
+    enqueue("wiki", urls=[f"https://{language}.wikipedia.org/wiki/0" for language in ("en", "zh", "fr")])
+    registry = SitePolicies({
+        "domains": {"wikipedia.org": {"request_limits": {"download_slot": "wikipedia"}}},
+        "hosts": {"fr.wikipedia.org": {"request_limits": {"download_slot": "french"}}},
+    })
+    consumer, _ = factory(site_policies=registry)
+    try:
+        consumer._load_jobs()
+        assert set(consumer.domains) == {"wikipedia", "french"}
+        assert list(consumer.domains["wikipedia"].pending) == [("wiki", 0), ("wiki", 1)]
+        assert list(consumer.domains["french"].pending) == [("wiki", 2)]
     finally:
         consumer.close()
 

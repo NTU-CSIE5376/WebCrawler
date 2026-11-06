@@ -379,15 +379,18 @@ Responsibilities:
   by `MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS` (default 64), overridable with
   `CRAWLER_MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS`.
 - Admit manual jobs in submission order up to the active-job limit, then group
-  their unfinished URLs by Scrapy downloader slot (normally hostname). Within a
-  slot, preserve submission order and original URL indexes. Across slots, prefer
+  their unfinished URLs by Scrapy downloader slot (normally hostname). In a
+  configured shared slot, such as `wikipedia`, language hosts share pending and
+  outstanding counts and the same dispatch cap. Slot names resolve through site
+  policies, including exact host overrides. Within a slot, preserve submission
+  order and original URL indexes. Across slots, prefer
   the longest estimated remaining service time: remaining URLs divided by
   estimated QPS. QPS is estimated as `1 / max(delay, latency / concurrency)`,
   using live downloader slot settings when available, otherwise crawler settings
   and `DOWNLOAD_SLOTS` overrides. Latency starts at one second and uses an
   exponentially smoothed `download_latency` from responses (20% new sample).
   Among slots below their prefetch cap, select the largest estimated remaining
-  service time plus a fixed random jitter of less than one second per domain.
+  service time plus a fixed random jitter of less than one second per slot.
   An indexed priority queue (`pqdict`) keeps one entry per eligible slot and
   updates its priority in place.
   Each slot's manual outstanding URLs (queued, downloading or retrying), across
