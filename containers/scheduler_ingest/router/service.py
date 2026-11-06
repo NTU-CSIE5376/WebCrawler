@@ -19,7 +19,7 @@ from sqlalchemy.exc import OperationalError, InterfaceError
 from libs.config.loader import load_yaml, require
 from libs.db.sharding.key import load_sharding_config
 from libs.db.sharding.router import ShardRouter, host_of
-from libs.ipc.jsonio import read_json, read_jsonl, append_jsonl
+from libs.ipc.jsonio import read_json, read_jsonl, append_jsonl_many
 from libs.ipc.new_link_record import (
     DISCOVERY_SOURCE_PAGE_OUTLINK,
     SOURCE_YOUTUBE_CHANNEL,
@@ -34,6 +34,12 @@ from .domain_resolver import DomainResolver
 # manual tier: strictly above the ranker's [0, 1] range, below golden's 3.0.
 MANUAL_PRIORITY_MIN = 1.0
 MANUAL_PRIORITY_MAX = 2.0
+
+# Process-lifetime cap on the domain_id/score cache. Without this it grows
+# unboundedly across folders for a long-lived router process; a handful of
+# hugely popular domains dominate most pages' outlinks, so even a full reset
+# at the cap re-warms itself within the next few folders.
+DOMAIN_CACHE_CAP = 500_000
 
 
 def _priority_fields(link: Dict[str, Any]) -> Dict[str, Any]:
@@ -97,6 +103,9 @@ class RouterService:
         )
         self.Session = sessionmaker(bind=self.engine, autoflush=False, autocommit=False, future=True)
         self.stats = StatsDeltaWriter(self.cfg.stats_dir)
+        # Persists across process_folder calls (not reset per folder) so
+        # repeat domains across folders skip the DB entirely.
+        self.domain_cache: Dict[str, "tuple[int, float]"] = {}
 
     def _out_dir(self, ingestor_id: int) -> Path:
         base = Path(self.cfg.ingestor_dir_template.format(id=ingestor_id))
@@ -114,7 +123,9 @@ class RouterService:
         error = 0
         file_cnt = 0
 
-        domain_cache = {}
+        if len(self.domain_cache) > DOMAIN_CACHE_CAP:
+            self.domain_cache.clear()
+        domain_cache = self.domain_cache
 
         for f in folder.iterdir():
             if not f.is_file():
@@ -145,11 +156,29 @@ class RouterService:
 
                 for attempt in range(3):
                     try:
+                        # Resolve every domain this record touches (its own +
+                        # every outlink's) in one batched round trip instead
+                        # of one DB call per outlink. host_of() can return
+                        # None for a malformed link URL; such links are
+                        # skipped when the batch result is consumed below,
+                        # same as the old per-link code implicitly dropped
+                        # them via the `if not url` guard.
+                        outlink_hosts = [
+                            (link, host_of(link.get("url")))
+                            for link in outlinks if link.get("url")
+                        ]
+                        domains_needed: Dict[str, int] = {domain: shard_id}
+                        for _, lhost in outlink_hosts:
+                            if lhost is None:
+                                continue
+                            ldomain = self.sharder.domain_key(lhost)
+                            domains_needed[ldomain] = self.sharder.domain_to_shard(lhost)
+
                         with self.Session() as sess:
                             domain_resolver = DomainResolver(sess, domain_cache)
                             with sess.begin():
-                                # resolve domain_id from DB (insert if missing)
-                                domain_id, _ = domain_resolver.ensure_and_get(domain, shard_id)
+                                resolved = domain_resolver.batch_ensure_and_get(domains_needed)
+                                domain_id, _ = resolved[domain]
 
                                 src_url = rec.get("url")
                                 # Score of the page these outlinks were found on,
@@ -160,12 +189,21 @@ class RouterService:
                                     if outlinks else None
                                 )
                                 new_outlinks = []
-                                for link in outlinks:
-                                    l = self._process_link(
-                                        domain_resolver, link, src_url, domain, parent_page_score
+                                # Buffer every outlink's output record by its
+                                # target ingestor instead of writing (and
+                                # opening/closing the file) once per link.
+                                by_ingestor: Dict[int, list] = {}
+                                for link, lhost in outlink_hosts:
+                                    if lhost is None:
+                                        continue
+                                    built = self._build_link_record(
+                                        resolved, link, lhost, src_url, domain, parent_page_score,
                                     )
-                                    if l:
-                                        new_outlinks.append(l)
+                                    if built is None:
+                                        continue
+                                    link_ingestor_id, link_out, summary = built
+                                    by_ingestor.setdefault(link_ingestor_id, []).append(link_out)
+                                    new_outlinks.append(summary)
 
                         out = {
                             "url": rec.get("url"),
@@ -186,11 +224,16 @@ class RouterService:
                             "is_redirect": rec.get("is_redirect"),
                             "redirect_hop_count": rec.get("redirect_hop_count"),
                         }
+                        by_ingestor.setdefault(ingestor_id, []).append(out)
 
-                        out_dir = self._out_dir(ingestor_id)
-                        out_dir.mkdir(parents=True, exist_ok=True)
-                        out_path = out_dir / f"{datetime.now(timezone.utc).strftime('%H%M')}_router{self.cfg.router_id:02d}.jsonl"
-                        append_jsonl(out_path, out)
+                        # DB work for this record has already succeeded at
+                        # this point, so write every ingestor's batch now
+                        # (one open/write/close per target file, not per
+                        # record within it).
+                        for out_ingestor_id, records in by_ingestor.items():
+                            out_dir = self._out_dir(out_ingestor_id)
+                            out_path = out_dir / f"{datetime.now(timezone.utc).strftime('%H%M')}_router{self.cfg.router_id:02d}.jsonl"
+                            append_jsonl_many(out_path, records)
                         break # success
 
                     except (OperationalError, InterfaceError) as e:
@@ -257,59 +300,49 @@ class RouterService:
         ).first()
         return float(row.url_score) if row and row.url_score is not None else None
 
-    def _process_link(
+    def _build_link_record(
         self,
-        domain_resolver: DomainResolver,
+        resolved: Dict[str, "tuple[int, float]"],
         link: Dict[str, str],
+        host: str,
         src_url: Optional[str],
         src_domain: str,
         parent_page_score: Optional[float],
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional["tuple[int, Dict[str, Any], Dict[str, Any]]"]:
+        """Build one outlink's new-link record from an already-resolved
+        domain map (see batch_ensure_and_get in process_folder). Pure:
+        no DB calls, no file I/O, so a bad link can't leave a partial
+        write behind.
+        """
         url = link.get("url")
         anchor = link.get("anchor")
         if not url:
             return None
 
-        host = host_of(url)
         domain = self.sharder.domain_key(host)
         shard_id = self.sharder.domain_to_shard(host)
         ingestor_id = self.sharder.shard_to_ingestor(shard_id)
+        domain_id, domain_score = resolved[domain]
 
-        try:
-            domain_id, domain_score = domain_resolver.ensure_and_get(domain, shard_id)
-            out = build_new_link_record(
-                url=url,
-                shard_id=shard_id,
-                domain_id=domain_id,
-                domain_score=domain_score,
-                discovered_from=src_url,
-                discovery_source_type=DISCOVERY_SOURCE_PAGE_OUTLINK,
-                parent_page_score=parent_page_score,
-                inlink_count_external=int(src_domain != domain),
-                anchor_text=anchor,
-                **_priority_fields(link),
-            )
+        out = build_new_link_record(
+            url=url,
+            shard_id=shard_id,
+            domain_id=domain_id,
+            domain_score=domain_score,
+            discovered_from=src_url,
+            discovery_source_type=DISCOVERY_SOURCE_PAGE_OUTLINK,
+            parent_page_score=parent_page_score,
+            inlink_count_external=int(src_domain != domain),
+            anchor_text=anchor,
+            **_priority_fields(link),
+        )
 
-            out_dir = self._out_dir(ingestor_id)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / f"{datetime.now(timezone.utc).strftime('%H%M')}_router{self.cfg.router_id:02d}.jsonl"
-            append_jsonl(out_path, out)
-
-            return {
-                "url": url,
-                "domain_id": domain_id,
-                "anchor": anchor,
-            }
-        except Exception as e:
-            logger.error(
-                "route.link_error",
-                extra={
-                    "event": "route.link_error",
-                    "url": url,
-                    "error": str(e),
-                },
-            )
-            raise
+        summary = {
+            "url": url,
+            "domain_id": domain_id,
+            "anchor": anchor,
+        }
+        return ingestor_id, out, summary
 
 
 def load_router_config(path: str, router_id: int) -> RouterConfig:
