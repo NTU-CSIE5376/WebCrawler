@@ -87,6 +87,7 @@ domains:
     middleware: crawler.middlewares.wikipedia.WikipediaMiddleware
     request_limits:
       download_slot: wikipedia
+      target_concurrent_requests: 8
       max_qps: 15
       max_concurrent_requests: 8
   youtube.com:
@@ -115,14 +116,19 @@ budget. `download_slot` groups requests into a shared slot within a crawler;
 rules sharing a slot must have consistent policies. Normal and manual API
 requests use the same downloader and site policies.
 
+`request_limits.target_concurrent_requests` optionally overrides the AutoThrottle
+target for a domain or exact host, inheriting through the same policy hierarchy.
+When omitted, it uses `AUTOTHROTTLE_TARGET_CONCURRENCY` (2 by default). This target
+controls adaptive pacing; `max_concurrent_requests` remains the hard cap.
+
 The YAML is the source of truth for mode, minimum interval, and slot concurrency;
 the old `domain_qps.json`, `CRAWLER_USE_AUTOTHROTTLE`, `CRAWLER_DOWNLOAD_DELAY`, and
 `CRAWLER_CONCURRENT_REQUESTS_PER_DOMAIN` settings are no longer used.
 
 #### Wikipedia
 
-Wikipedia uses AutoThrottle with `max_qps: 15` (a minimum interval of about
-0.0667 seconds) and `max_concurrent_requests: 8`. When explicitly configured
+Wikipedia uses AutoThrottle with `target_concurrent_requests: 8`, `max_qps: 15`
+(a minimum interval of about 0.0667 seconds), and `max_concurrent_requests: 8`. When explicitly configured
 under `domains`, `max_concurrent_requests` is enforced by the generic
 `SharedConcurrencyMiddleware` across all crawler processes and subdomains.
 This includes robots.txt, redirects, retries, and manual jobs, regardless of

@@ -27,5 +27,12 @@ class SiteAutoThrottle(AutoThrottle):
         policy = self.policies.resolve(hostname) if hostname else self.policies.config.default
         if policy.crawler_mode == "fixed":
             return
-        super()._adjust_delay(slot, latency, response)
+        global_target = self.target_concurrency
+        if policy.request_limits.target_concurrent_requests is not None:
+            self.target_concurrency = policy.request_limits.target_concurrent_requests
+        try:
+            # Scrapy's adjustment is synchronous; scope the override to this slot.
+            super()._adjust_delay(slot, latency, response)
+        finally:
+            self.target_concurrency = global_target
         slot.delay = max(slot.delay, policy.request_limits.min_request_delay_sec)

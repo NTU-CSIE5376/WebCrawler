@@ -52,6 +52,34 @@ def test_fixed_policy_does_not_adapt(throttle):
     assert slot.delay == 0.333
 
 
+def test_domain_target_applies_to_language_hosts_without_leaking_to_other_slots(throttle, policies):
+    document = policies.config.model_dump(exclude_unset=True)
+    document["domains"]["wikipedia.org"]["request_limits"]["target_concurrent_requests"] = 8
+    throttle.policies = SitePolicies(document)
+
+    for hostname, expected_delay in (
+        ("en.wikipedia.org", 0.2), ("unmatched.org", 0.8),
+        ("zh.wikipedia.org", 0.2), ("auto.example.com", 0.8),
+    ):
+        slot = SimpleNamespace(delay=0.05)
+        throttle._adjust_delay(slot, 1.6, Response(f"https://{hostname}/wiki/Test"))
+        assert slot.delay == pytest.approx(expected_delay)
+        assert throttle.target_concurrency == 2
+
+
+def test_domain_target_preserves_error_backoff(throttle, policies):
+    document = policies.config.model_dump(exclude_unset=True)
+    document["domains"]["wikipedia.org"]["request_limits"]["target_concurrent_requests"] = 8
+    throttle.policies = SitePolicies(document)
+    slot = SimpleNamespace(delay=0.05)
+    response = Response("https://en.wikipedia.org/wiki/Test", status=429)
+    throttle._adjust_delay(slot, 1.6, response)
+    assert slot.delay == pytest.approx(0.2)
+    throttle._adjust_delay(slot, 0.001, response)
+    assert slot.delay == pytest.approx(0.2)
+    assert throttle.target_concurrency == 2
+
+
 def test_slow_and_error_responses_preserve_scrapy_backoff(throttle):
     slot = SimpleNamespace(delay=0.05)
     throttle._adjust_delay(slot, 2, Response("https://en.wikipedia.org/wiki/Test", status=429))

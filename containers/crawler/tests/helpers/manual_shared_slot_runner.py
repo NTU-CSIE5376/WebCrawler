@@ -98,7 +98,7 @@ def configure_policies():
         "max_qps": 100, "max_concurrent_requests": 8,
     })
     document["domains"]["wikipedia.org"]["request_limits"].update(
-        max_qps=100, max_concurrent_requests=2)
+        max_qps=100, max_concurrent_requests=2, target_concurrent_requests=0.2)
     policies = SitePolicies(document)
     SitePolicies.load = classmethod(lambda cls: policies)
     return policies

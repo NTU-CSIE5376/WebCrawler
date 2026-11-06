@@ -30,6 +30,7 @@ class RequestLimits(BaseModel):
     download_slot: str | None = Field(default=None, min_length=1, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     max_concurrent_requests: int = Field(default=16, gt=0)
     max_qps: float = Field(default=4, gt=0, allow_inf_nan=False)
+    target_concurrent_requests: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
     @property
     def min_request_delay_sec(self):

@@ -6,6 +6,7 @@
 # Exact host rules inherit the domain middleware; null disables it for that host.
 # Additional options: headers and download_timeout_sec (positive seconds).
 # crawler_mode and request_limits inherit default -> domain -> exact host.
+# request_limits.target_concurrent_requests overrides the global AutoThrottle target.
 # Scrapy delay is calculated as 1 / max_qps; AutoThrottle may slow down further.
 default:
   crawler_mode: autothrottle
@@ -19,6 +20,7 @@ domains:
     middleware: crawler.middlewares.wikipedia.WikipediaMiddleware
     request_limits:
       download_slot: wikipedia
+      target_concurrent_requests: 8
       max_concurrent_requests: 8
       max_qps: 15 # ref: https://wikitech.wikimedia.org/wiki/Robot_policy
     headers:

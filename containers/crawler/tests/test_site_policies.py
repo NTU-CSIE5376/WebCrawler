@@ -248,6 +248,9 @@ def test_bundled_config_uses_autothrottle_with_wikipedia_minimum(monkeypatch):
     assert settings["DOWNLOAD_DELAY"] == 0.25
     assert policies.resolve("en.wikipedia.org").crawler_mode == "autothrottle"
     assert policies.resolve("en.wikipedia.org").request_limits.max_qps == 15
+    assert policies.resolve("en.wikipedia.org").request_limits.target_concurrent_requests == 8
+    assert policies.resolve("zh.wikipedia.org").request_limits.target_concurrent_requests == 8
+    assert policies.resolve("example.com").request_limits.target_concurrent_requests is None
     assert policies.shared_budgets("en.wikipedia.org") == (("domain:wikipedia.org", 8),)
     assert policies.shared_budgets("zh.wikipedia.org") == (("domain:wikipedia.org", 8),)
     assert "crawler.middlewares.shared_concurrency.SharedConcurrencyMiddleware" in settings["DOWNLOADER_MIDDLEWARES"]
@@ -298,3 +301,39 @@ def test_shared_slot_cannot_have_conflicting_limits():
         }}}, "hosts": {"other.example.com": {"request_limits": {
             "download_slot": "shared", "max_qps": 10,
         }}}})
+
+
+def test_target_concurrent_requests_inherits_and_host_can_override_or_reset():
+    policies = SitePolicies({
+        "default": {"request_limits": {"target_concurrent_requests": 2}},
+        "domains": {"wikipedia.org": {"request_limits": {"target_concurrent_requests": 8}}},
+        "hosts": {
+            "slow.wikipedia.org": {"request_limits": {"target_concurrent_requests": 4}},
+            "global.wikipedia.org": {"request_limits": {"target_concurrent_requests": None}},
+        },
+    })
+    assert policies.resolve("en.wikipedia.org").request_limits.target_concurrent_requests == 8
+    assert policies.resolve("zh.wikipedia.org").request_limits.target_concurrent_requests == 8
+    assert policies.resolve("slow.wikipedia.org").request_limits.target_concurrent_requests == 4
+    assert policies.resolve("global.wikipedia.org").request_limits.target_concurrent_requests is None
+    assert policies.resolve("example.com").request_limits.target_concurrent_requests == 2
+
+
+@pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan"), "8", True])
+def test_invalid_target_concurrent_requests_rejected(value):
+    with pytest.raises(ValueError):
+        SitePolicies({"domains": {"wikipedia.org": {"request_limits": {
+            "target_concurrent_requests": value,
+        }}}})
+
+
+def test_shared_slot_cannot_have_conflicting_targets():
+    with pytest.raises(ValueError, match="Conflicting request limits"):
+        SitePolicies({
+            "domains": {"wikipedia.org": {"request_limits": {
+                "download_slot": "wikipedia", "target_concurrent_requests": 8,
+            }}},
+            "hosts": {"zh.wikipedia.org": {"request_limits": {
+                "download_slot": "wikipedia", "target_concurrent_requests": 4,
+            }}},
+        })
