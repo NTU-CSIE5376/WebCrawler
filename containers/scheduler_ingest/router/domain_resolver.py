@@ -65,26 +65,26 @@ class DomainResolver:
         if cached is not None:
             return cached
 
-        # 1) insert if missing; shard_id transitions are owned by
-        # migrate_shard_split.py, so the hot path doesn't need to lock to re-check.
-        self.session.execute(
-            text("""
-                INSERT INTO domain_state(domain, shard_id)
-                VALUES (:domain, :shard_id)
-                ON CONFLICT (domain) DO NOTHING
-            """),
-            {"domain": domain, "shard_id": shard_id},
-        )
-
-        # 2) select id + score
-        row = self.session.execute(
-            text("""
-                SELECT domain_id, COALESCE(domain_score, 0.0) AS domain_score
-                FROM domain_state
-                WHERE domain = :domain
-            """),
-            {"domain": domain},
-        ).first()
+        select = text("""
+            SELECT domain_id, COALESCE(domain_score, 0.0) AS domain_score
+            FROM domain_state
+            WHERE domain = :domain
+        """)
+        # Nearly every domain already exists, so look it up first and only
+        # pay the INSERT round trip for a missing one.
+        row = self.session.execute(select, {"domain": domain}).first()
+        if row is None:
+            # shard_id transitions are owned by migrate_shard_split.py, so the
+            # hot path doesn't need to lock to re-check.
+            self.session.execute(
+                text("""
+                    INSERT INTO domain_state(domain, shard_id)
+                    VALUES (:domain, :shard_id)
+                    ON CONFLICT (domain) DO NOTHING
+                """),
+                {"domain": domain, "shard_id": shard_id},
+            )
+            row = self.session.execute(select, {"domain": domain}).first()
 
         if row is None:
             # Should not happen; fallback

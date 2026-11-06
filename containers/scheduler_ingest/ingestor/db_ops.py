@@ -16,6 +16,11 @@ from libs.scoring.golden_discovery_runtime import GoldenDiscoveryRuntimeScorer
 LOGGER = logging.getLogger("ingestor")
 EXISTING_URL_LOOKUP_BATCH_SIZE = 50000
 
+# discovery_frozen is flipped by the GC service on a slow cadence, so a short
+# per-process cache saves one domain_state round trip per shard per batch.
+FROZEN_DOMAIN_CACHE_TTL_SEC = 300.0
+FROZEN_DOMAIN_CACHE_MAX = 200_000
+
 
 @dataclass
 class IngestResult:
@@ -161,6 +166,8 @@ class IngestDB:
         self.inline_ranker = inline_ranker
         self.inline_score_timeout_sec = inline_score_timeout_sec
         self.inline_score_batch_size = max(1, inline_score_batch_size)
+        # domain_id -> (is_frozen, monotonic time it was read)
+        self._frozen_cache: dict[int, tuple[bool, float]] = {}
 
     def _tcur(self, shard_id: int) -> str:
         return f"url_state_current_{shard_id:03d}"
@@ -186,17 +193,42 @@ class IngestDB:
             existing.update(row[0] for row in cur.fetchall())
         return existing
 
+    def _url_hashes(self, cur, table: str, urls: list[str]) -> dict[str, str | None]:
+        """content_hash of every url already in `table` (None-valued when the
+        row exists without a hash). Keys double as the existence set."""
+        if not urls:
+            return {}
+
+        found: dict[str, str | None] = {}
+        for chunk in self._chunks(urls, EXISTING_URL_LOOKUP_BATCH_SIZE):
+            cur.execute(f"SELECT url, content_hash FROM {table} WHERE url = ANY(%s)", (chunk,))
+            found.update(cur.fetchall())
+        return found
+
     def _frozen_domains(self, cur, domain_ids: set[int]) -> set[int]:
         """Domains whose frontier the GC service has frozen: stop inserting
-        their newly discovered links so the backlog cannot keep growing."""
+        their newly discovered links so the backlog cannot keep growing.
+        Answers are cached for FROZEN_DOMAIN_CACHE_TTL_SEC."""
         if not domain_ids:
             return set()
-        cur.execute(
-            "SELECT domain_id FROM domain_state "
-            "WHERE domain_id = ANY(%s) AND discovery_frozen = TRUE",
-            (list(domain_ids),),
-        )
-        return {row[0] for row in cur.fetchall()}
+        now = time.monotonic()
+        cache = self._frozen_cache
+        stale = [
+            did for did in domain_ids
+            if did not in cache or now - cache[did][1] >= FROZEN_DOMAIN_CACHE_TTL_SEC
+        ]
+        if stale:
+            cur.execute(
+                "SELECT domain_id FROM domain_state "
+                "WHERE domain_id = ANY(%s) AND discovery_frozen = TRUE",
+                (stale,),
+            )
+            frozen_now = {row[0] for row in cur.fetchall()}
+            if len(cache) + len(stale) > FROZEN_DOMAIN_CACHE_MAX:
+                cache.clear()
+            for did in stale:
+                cache[did] = (did in frozen_now, now)
+        return {did for did in domain_ids if cache[did][0]}
 
     def _score_new_links(self, urls: list[str]) -> tuple[dict[str, float], datetime | None]:
         if not urls:
@@ -337,12 +369,12 @@ class IngestDB:
             if is_ok and content_hash is not None:
                 check_urls.append(url)
 
+        # One lookup serves both the content-hash comparison and the
+        # "newly inserted vs. pre-existing" check (xmax is not available on
+        # all PG-wire-compatible targets, e.g. YSQL).
+        old_hashes = self._url_hashes(cur, tcur, [d["url"] for d in decoded])
+        existing_before = old_hashes.keys()
         if check_urls:
-            cur.execute(
-                f"SELECT url, content_hash FROM {tcur} WHERE url = ANY(%s)",
-                (check_urls,),
-            )
-            old_hashes = dict(cur.fetchall())
             for d in decoded:
                 if d["is_ok"] and d["content_hash"] is not None:
                     if old_hashes.get(d["url"]) != d["content_hash"]:
@@ -409,10 +441,6 @@ class IngestDB:
           END
         RETURNING {", ".join(_HIST_COLS)}
         """
-        # xmax is not available on all PG-wire-compatible targets (e.g. YSQL),
-        # so "newly inserted vs. pre-existing" is determined from a pre-upsert
-        # existence check rather than RETURNING ... (xmax = 0).
-        existing_before = self._existing_urls(cur, tcur, [d["url"] for d in decoded])
         returned = execute_values(
             cur, upsert_sql, upsert_rows, page_size=len(upsert_rows), fetch=True,
         )
@@ -555,6 +583,12 @@ class IngestDB:
         if not unique_items:
             return dup_results + frozen_results
 
+        # xmax is not available on all PG-wire-compatible targets (e.g. YSQL),
+        # so "newly inserted vs. pre-existing" is determined from a pre-upsert
+        # existence check rather than RETURNING ... (xmax = 0). The same
+        # lookup also tells the inline ranker which urls are new.
+        existing_before = self._existing_urls(cur, tcur, [rec["url"] for _, rec in unique_items])
+
         score_by_url: dict[str, float] = {}
         score_updated_at = None
         if self.inline_ranker is not None:
@@ -563,8 +597,7 @@ class IngestDB:
                 rec["url"] for _, rec in unique_items if rec.get("url_priority") is None
             ]
             if self.inline_score_timeout_sec > 0:
-                existing_urls = self._existing_urls(cur, tcur, unique_urls)
-                score_urls = [url for url in unique_urls if url not in existing_urls]
+                score_urls = [url for url in unique_urls if url not in existing_before]
             else:
                 score_urls = unique_urls
             score_by_url, score_updated_at = self._score_new_links(score_urls)
@@ -615,10 +648,6 @@ class IngestDB:
             f"{tcur}.source IN ({SOURCE_NATURAL}, {SOURCE_YOUTUBE_CHANNEL}) AND "
             f"EXCLUDED.url_score > COALESCE({tcur}.url_score, 0)"
         )
-        # xmax is not available on all PG-wire-compatible targets (e.g. YSQL),
-        # so "newly inserted vs. pre-existing" is determined from a pre-upsert
-        # existence check rather than RETURNING ... (xmax = 0).
-        existing_before = self._existing_urls(cur, tcur, [r[0] for r in link_rows])
         inserted_rows = execute_values(
             cur,
             f"""
