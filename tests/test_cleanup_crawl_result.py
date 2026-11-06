@@ -145,3 +145,90 @@ def test_max_age_must_cover_min_age(ipc):
     _, _, cfg_path = ipc
     with pytest.raises(SystemExit):
         cleanup.main(["--config", str(cfg_path), "--min-age-hours", "10", "--max-age-hours", "5"])
+
+
+@pytest.mark.parametrize("level", ["worker", "date", "time"])
+def test_symlink_directories_never_delete_outside_data(ipc, tmp_path, level):
+    base, cfg, _ = ipc
+    _progress(base, "router", 0, hours_ago=1)
+    folder = _folder(base, "crawler", 0, hours_ago=12)
+    outside = tmp_path / "outside"
+    target = {"worker": folder.parent.parent, "date": folder.parent, "time": folder}[level]
+    target.rename(outside)
+    target.symlink_to(outside, target_is_directory=True)
+
+    totals, _ = _run(cfg)
+
+    assert (outside / folder.relative_to(target) / "x.jsonl").exists()
+    assert target.is_symlink()
+    assert totals == {"consumed": 0, "unconsumed": 0, "errors": 0}
+
+
+@pytest.mark.parametrize("level", ["worker", "date", "time"])
+def test_symlink_swap_after_planning_cannot_escape_cleanup_root(ipc, tmp_path, monkeypatch, level):
+    base, cfg, _ = ipc
+    _progress(base, "router", 0, hours_ago=1)
+    folder = _folder(base, "crawler", 0, hours_ago=12)
+    target = {"worker": folder.parent.parent, "date": folder.parent, "time": folder}[level]
+    outside = tmp_path / "outside"
+    victim = outside / folder.relative_to(target)
+    victim.mkdir(parents=True)
+    (victim / "unrelated.txt").write_text("not crawler output")
+    original_plan = cleanup.plan
+
+    def swap_after_plan(*args, **kwargs):
+        decisions = original_plan(*args, **kwargs)
+        target.rename(target.with_name(target.name + ".saved"))
+        target.symlink_to(outside, target_is_directory=True)
+        return decisions
+
+    monkeypatch.setattr(cleanup, "plan", swap_after_plan)
+    totals, lines = _run(cfg)
+
+    assert (victim / "unrelated.txt").read_text() == "not crawler output"
+    assert target.is_symlink()
+    assert totals["consumed"] == 0
+    assert totals["errors"] >= 1
+    assert any("ERROR" in line for line in lines)
+
+
+def test_date_swap_during_delete_uses_open_directory_not_replacement(ipc, tmp_path, monkeypatch):
+    base, cfg, _ = ipc
+    _progress(base, "router", 0, hours_ago=1)
+    folder = _folder(base, "crawler", 0, hours_ago=12)
+    date_dir = folder.parent
+    saved = date_dir.with_name(date_dir.name + ".saved")
+    outside = tmp_path / "outside"
+    victim = outside / folder.name
+    victim.mkdir(parents=True)
+    (victim / "unrelated.txt").write_text("not crawler output")
+    original_rmtree = cleanup.shutil.rmtree
+
+    def swap_before_rmtree(*args, **kwargs):
+        date_dir.rename(saved)
+        date_dir.symlink_to(outside, target_is_directory=True)
+        return original_rmtree(*args, **kwargs)
+
+    monkeypatch.setattr(cleanup.shutil, "rmtree", swap_before_rmtree)
+    totals, _ = _run(cfg)
+
+    assert (victim / "unrelated.txt").exists()
+    assert not (saved / folder.name).exists()
+    assert totals == {"consumed": 1, "unconsumed": 0, "errors": 0}
+
+
+def test_delete_refuses_a_planned_folder_outside_its_base(ipc, tmp_path, monkeypatch):
+    base, cfg, _ = ipc
+    _progress(base, "router", 0, hours_ago=1)
+    _folder(base, "crawler", 0, hours_ago=12)
+    outside = tmp_path / "outside/20261105/0800"
+    outside.mkdir(parents=True)
+    (outside / "unrelated.txt").write_text("not crawler output")
+    monkeypatch.setattr(cleanup, "plan", lambda *args: [
+        cleanup.Decision(outside, consumed=True, age=timedelta(hours=12)),
+    ])
+
+    totals, _ = _run(cfg)
+
+    assert (outside / "unrelated.txt").exists()
+    assert totals == {"consumed": 0, "unconsumed": 0, "errors": 1}
