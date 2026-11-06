@@ -159,8 +159,11 @@ class RouterService:
             "route.folder_start",
             extra={"event": "route.folder_start", "folder": str(folder)},
         )
+        started = time.monotonic()
         error = 0
         file_cnt = 0
+        records = 0
+        links = 0
 
         domain_cache = self._domain_cache_for_folder()
 
@@ -248,6 +251,8 @@ class RouterService:
 
                         pending[ingestor_id].append(out)
                         self._flush(pending)
+                        records += 1
+                        links += len(new_outlinks)
                         break # success
 
                     except (OperationalError, InterfaceError) as e:
@@ -297,6 +302,9 @@ class RouterService:
                 "folder": str(folder),
                 "file_cnt": file_cnt,
                 "errors": error,
+                "records": records,
+                "links": links,
+                "duration_s": round(time.monotonic() - started, 1),
             },
         )
 

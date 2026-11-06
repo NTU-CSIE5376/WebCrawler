@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import time
 from pathlib import Path
 
 from libs.ipc.jsonio import read_json, read_jsonl
@@ -24,6 +25,7 @@ class ExtractService:
             "extract.folder_start",
             extra={"event": "extract.folder_start", "folder": str(folder)},
         )
+        started = time.monotonic()
         file_cnt = 0
         error = 0
 
@@ -69,6 +71,7 @@ class ExtractService:
                 "folder": str(folder),
                 "file_cnt": file_cnt,
                 "error": error,
+                "duration_s": round(time.monotonic() - started, 1),
             },
         )
 

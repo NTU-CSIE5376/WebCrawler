@@ -161,3 +161,16 @@ def test_failed_record_writes_nothing(router, monkeypatch):
         tmp_path, "f1", [_record("https://known.example/", ["https://known.example/a"])],
     ))
     assert _output_lines(tmp_path) == []
+
+
+def test_folder_done_reports_records_links_and_duration(router, caplog):
+    svc, _, tmp_path = router
+    folder = _crawl_folder(tmp_path, "f1", [
+        _record("https://known.example/", ["https://known.example/a", "https://b.example/"]),
+        _record("https://known.example/2", ["https://known.example/c"]),
+    ])
+    with caplog.at_level("INFO", logger="router"):
+        svc.process_folder(folder)
+    (done,) = [r for r in caplog.records if getattr(r, "event", None) == "route.folder_done"]
+    assert (done.records, done.links, done.errors) == (2, 3, 0)
+    assert done.duration_s >= 0

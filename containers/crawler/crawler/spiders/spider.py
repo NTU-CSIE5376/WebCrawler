@@ -48,6 +48,9 @@ class HtmlSpider(scrapy.Spider):
         self._domain_pending: dict[int, int] = {}
         self._heartbeat_task: twisted_task.LoopingCall | None = None
         self._top_up_task: twisted_task.LoopingCall | None = None
+        # Results written to crawl_result since the last heartbeat (JsonPipeline).
+        self.items_written = 0
+        self.items_ok = 0
 
     @classmethod
     def from_crawler(cls, crawler, *args, **kwargs):
@@ -344,6 +347,8 @@ class HtmlSpider(scrapy.Spider):
         )
         stats = self.crawler.stats
         consumer = self.manual_bulk_crawls
+        items_written, items_ok = self.items_written, self.items_ok
+        self.items_written = self.items_ok = 0
 
         logger.info(
             "spider.heartbeat",
@@ -373,6 +378,8 @@ class HtmlSpider(scrapy.Spider):
                 "dequeued_manual": stats.get_value("scheduler/dequeued/manual", 0),
                 "manual_saves": consumer.saves,
                 "manual_save_ms": round(consumer.save_seconds * 1000),
+                "items_written": items_written,
+                "items_ok": items_ok,
             },
         )
 

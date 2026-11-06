@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import time
 from pathlib import Path
 from collections import defaultdict
 
@@ -57,6 +58,7 @@ class IngestService:
             "ingest.folder_start",
             extra={"event": "ingest.folder_start", "folder": str(folder)},
         )
+        started = time.monotonic()
         file_cnt = 0
         counters = defaultdict(int)
         domains = {}
@@ -132,6 +134,7 @@ class IngestService:
                 "trap_dropped": trap_dropped,
                 "url_normalized": url_normalized,
                 "url_would_normalize": url_would_normalize,
+                "duration_s": round(time.monotonic() - started, 1),
             },
         )
 
