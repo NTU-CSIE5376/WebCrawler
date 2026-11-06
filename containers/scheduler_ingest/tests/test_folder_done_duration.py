@@ -37,3 +37,17 @@ def test_extract_folder_done_has_duration(tmp_path, caplog):
     with caplog.at_level(logging.INFO):
         svc.process_folder(tmp_path)
     assert _done(caplog, "extract.folder_done").duration_s >= 0
+
+
+def test_extract_folder_done_counts_crawl_results_not_links(tmp_path, caplog):
+    import json
+    (tmp_path / "part.jsonl").write_text("".join(json.dumps(r) + "\n" for r in [
+        {"url": "https://a.example/", "status": "fail", "fail_reason": "HttpError 404"},
+        {"url": "https://a.example/x", "status": "new"},
+        {"url": "https://a.example/y", "status": "new"},
+    ]))
+    svc = ExtractService(0, db=None, stats=_Stats())
+    with caplog.at_level(logging.INFO):
+        svc.process_folder(tmp_path)
+    done = _done(caplog, "extract.folder_done")
+    assert (done.records, done.error) == (1, 0)

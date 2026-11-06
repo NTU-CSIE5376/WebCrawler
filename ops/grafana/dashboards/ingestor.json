@@ -156,27 +156,14 @@
       "title": "Pipeline: crawler -> router -> ingestor (last 24h, hourly)",
       "collapsed": true,
       "id": 200,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 22
-      },
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 22},
       "panels": [
         {
           "type": "timeseries",
-          "title": "Results per hour: crawler -> router -> ingestor",
-          "description": "crawler = results written to crawl_result (spider.heartbeat items_written); router = crawl records routed; ingestor = crawl results written to crawlerdb. All three should track each other. A drop that starts at one stage shows where volume is lost. Crawler and router lines need the logging added in this PR, so they are empty for data logged before deploy.",
-          "datasource": {
-            "type": "loki",
-            "uid": "loki"
-          },
-          "gridPos": {
-            "h": 9,
-            "w": 24,
-            "x": 0,
-            "y": 23
-          },
+          "title": "Results per hour: crawler -> router -> ingestor -> extractor",
+          "description": "Crawl results per hour at each stage. crawler = results written to crawl_result (spider.heartbeat items_written); router = crawl records routed; ingestor = crawl results written to crawlerdb; extractor = crawl results feature-extracted. Healthy: the four lines track each other. The first line that drops below the one before it is the stage that is stuck. crawler / router / extractor need the log fields added in this PR, so they are empty for data logged before it was deployed.",
+          "datasource": {"type": "loki", "uid": "loki"},
+          "gridPos": {"h": 9, "w": 24, "x": 0, "y": 23},
           "id": 201,
           "timeFrom": "24h",
           "interval": "1h",
@@ -186,21 +173,13 @@
               "displayMode": "table",
               "placement": "right",
               "showLegend": true,
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ]
+              "calcs": ["lastNotNull", "max"]
             },
-            "tooltip": {
-              "mode": "multi",
-              "sort": "desc"
-            }
+            "tooltip": {"mode": "multi", "sort": "desc"}
           },
           "fieldConfig": {
             "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
+              "color": {"mode": "palette-classic"},
               "custom": {
                 "drawStyle": "line",
                 "lineInterpolation": "linear",
@@ -210,35 +189,50 @@
                 "spanNulls": true
               },
               "unit": "short"
-            }
+            },
+            "overrides": [
+              {
+                "matcher": {"id": "byName", "options": "crawler"},
+                "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]
+              },
+              {
+                "matcher": {"id": "byName", "options": "router"},
+                "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]
+              },
+              {
+                "matcher": {"id": "byName", "options": "ingestor"},
+                "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]
+              },
+              {
+                "matcher": {"id": "byName", "options": "extractor"},
+                "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "purple"}}]
+              }
+            ]
           },
           "targets": [
             {
-              "datasource": {
-                "type": "loki",
-                "uid": "loki"
-              },
-              "expr": "sum(sum_over_time({service=\"crawler\", event=\"spider.heartbeat\"} | json items_written | __error__=\"\" | unwrap items_written [1h]))",
+              "datasource": {"type": "loki", "uid": "loki"},
+              "refId": "A",
               "legendFormat": "crawler",
-              "refId": "A"
+              "expr": "sum(sum_over_time({service=\"crawler\", event=\"spider.heartbeat\"} | json items_written | __error__=\"\" | unwrap items_written [1h]))"
             },
             {
-              "datasource": {
-                "type": "loki",
-                "uid": "loki"
-              },
-              "expr": "sum(sum_over_time({service=\"router\", event=\"route.folder_done\"} | json records | __error__=\"\" | unwrap records [1h]))",
+              "datasource": {"type": "loki", "uid": "loki"},
+              "refId": "B",
               "legendFormat": "router",
-              "refId": "B"
+              "expr": "sum(sum_over_time({service=\"router\", event=\"route.folder_done\"} | json records | __error__=\"\" | unwrap records [1h]))"
             },
             {
-              "datasource": {
-                "type": "loki",
-                "uid": "loki"
-              },
-              "expr": "sum(sum_over_time({service=\"ingestor\", event=\"ingest.folder_done\"} | json ok=\"num_fetch_ok\", fail=\"num_fetch_fail\" | label_format n=`{{ add .ok .fail }}` | __error__=\"\" | unwrap n [1h]))",
+              "datasource": {"type": "loki", "uid": "loki"},
+              "refId": "C",
               "legendFormat": "ingestor",
-              "refId": "C"
+              "expr": "sum(sum_over_time({service=\"ingestor\", event=\"ingest.folder_done\"} | json ok=\"num_fetch_ok\", fail=\"num_fetch_fail\" | label_format n=`{{ add .ok .fail }}` | __error__=\"\" | unwrap n [1h]))"
+            },
+            {
+              "datasource": {"type": "loki", "uid": "loki"},
+              "refId": "D",
+              "legendFormat": "extractor",
+              "expr": "sum(sum_over_time({service=\"extractor\", event=\"extract.folder_done\"} | json records | __error__=\"\" | unwrap records [1h]))"
             }
           ]
         },
@@ -246,16 +240,8 @@
           "type": "timeseries",
           "title": "Folders done per hour",
           "description": "10-minute folders finished per stage. Healthy is ~96 per hour (16 workers x 6). Below that for hours means the stage is falling behind.",
-          "datasource": {
-            "type": "loki",
-            "uid": "loki"
-          },
-          "gridPos": {
-            "h": 9,
-            "w": 12,
-            "x": 0,
-            "y": 32
-          },
+          "datasource": {"type": "loki", "uid": "loki"},
+          "gridPos": {"h": 9, "w": 12, "x": 0, "y": 32},
           "id": 202,
           "timeFrom": "24h",
           "interval": "1h",
@@ -265,21 +251,13 @@
               "displayMode": "table",
               "placement": "right",
               "showLegend": true,
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ]
+              "calcs": ["lastNotNull", "max"]
             },
-            "tooltip": {
-              "mode": "multi",
-              "sort": "desc"
-            }
+            "tooltip": {"mode": "multi", "sort": "desc"}
           },
           "fieldConfig": {
             "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
+              "color": {"mode": "palette-classic"},
               "custom": {
                 "drawStyle": "line",
                 "lineInterpolation": "linear",
@@ -287,32 +265,32 @@
                 "fillOpacity": 0,
                 "showPoints": "auto",
                 "spanNulls": true,
-                "thresholdsStyle": {
-                  "mode": "dashed"
-                }
+                "thresholdsStyle": {"mode": "dashed"}
               },
               "unit": "short",
               "thresholds": {
                 "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "red",
-                    "value": null
-                  },
-                  {
-                    "color": "green",
-                    "value": 90
-                  }
-                ]
+                "steps": [{"color": "red", "value": null}, {"color": "green", "value": 90}]
               }
-            }
+            },
+            "overrides": [
+              {
+                "matcher": {"id": "byName", "options": "router"},
+                "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]
+              },
+              {
+                "matcher": {"id": "byName", "options": "ingestor"},
+                "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]
+              },
+              {
+                "matcher": {"id": "byName", "options": "extractor"},
+                "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "purple"}}]
+              }
+            ]
           },
           "targets": [
             {
-              "datasource": {
-                "type": "loki",
-                "uid": "loki"
-              },
+              "datasource": {"type": "loki", "uid": "loki"},
               "expr": "sum by (service) (count_over_time({service=~\"router|ingestor|extractor\", event=~\"route.folder_done|ingest.folder_done|extract.folder_done\"} [1h]))",
               "legendFormat": "{{service}}",
               "refId": "A"
@@ -323,16 +301,8 @@
           "type": "timeseries",
           "title": "Max lag per stage (minutes)",
           "description": "Folder finish time minus the folder's own time. Healthy is ~20-35 min. crawl_result is deleted after ~8 h, so lag near 480 means folders are deleted before they are processed (data loss).",
-          "datasource": {
-            "type": "loki",
-            "uid": "loki"
-          },
-          "gridPos": {
-            "h": 9,
-            "w": 12,
-            "x": 12,
-            "y": 32
-          },
+          "datasource": {"type": "loki", "uid": "loki"},
+          "gridPos": {"h": 9, "w": 12, "x": 12, "y": 32},
           "id": 203,
           "timeFrom": "24h",
           "interval": "1h",
@@ -342,21 +312,13 @@
               "displayMode": "table",
               "placement": "right",
               "showLegend": true,
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ]
+              "calcs": ["lastNotNull", "max"]
             },
-            "tooltip": {
-              "mode": "multi",
-              "sort": "desc"
-            }
+            "tooltip": {"mode": "multi", "sort": "desc"}
           },
           "fieldConfig": {
             "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
+              "color": {"mode": "palette-classic"},
               "custom": {
                 "drawStyle": "line",
                 "lineInterpolation": "linear",
@@ -364,36 +326,36 @@
                 "fillOpacity": 0,
                 "showPoints": "auto",
                 "spanNulls": true,
-                "thresholdsStyle": {
-                  "mode": "dashed"
-                }
+                "thresholdsStyle": {"mode": "dashed"}
               },
               "unit": "m",
               "thresholds": {
                 "mode": "absolute",
                 "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  },
-                  {
-                    "color": "orange",
-                    "value": 60
-                  },
-                  {
-                    "color": "red",
-                    "value": 420
-                  }
+                  {"color": "green", "value": null},
+                  {"color": "orange", "value": 60},
+                  {"color": "red", "value": 420}
                 ]
               }
-            }
+            },
+            "overrides": [
+              {
+                "matcher": {"id": "byName", "options": "router"},
+                "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]
+              },
+              {
+                "matcher": {"id": "byName", "options": "ingestor"},
+                "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]
+              },
+              {
+                "matcher": {"id": "byName", "options": "extractor"},
+                "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "purple"}}]
+              }
+            ]
           },
           "targets": [
             {
-              "datasource": {
-                "type": "loki",
-                "uid": "loki"
-              },
+              "datasource": {"type": "loki", "uid": "loki"},
               "expr": "max by (service) (max_over_time({service=~\"router|ingestor|extractor\", event=~\"route.folder_done|ingest.folder_done|extract.folder_done\"} | json folder | label_format fdate=`{{ regexReplaceAll \".*/([0-9]{8})/([0-9]{4})$\" .folder \"${1}${2}\" }}` | label_format lag_min=`{{ div (sub (unixEpoch __timestamp__) (unixEpoch (toDate \"200601021504\" .fdate))) 60 }}` | __error__=\"\" | unwrap lag_min [1h]))",
               "legendFormat": "{{service}}",
               "refId": "A"
@@ -404,16 +366,8 @@
           "type": "timeseries",
           "title": "Router max lag per worker (minutes)",
           "description": "Lag of each router worker. One worker climbing while the rest stay flat means a slow or hot crawler_NN folder; all climbing means the router as a whole is too slow.",
-          "datasource": {
-            "type": "loki",
-            "uid": "loki"
-          },
-          "gridPos": {
-            "h": 9,
-            "w": 12,
-            "x": 0,
-            "y": 41
-          },
+          "datasource": {"type": "loki", "uid": "loki"},
+          "gridPos": {"h": 9, "w": 12, "x": 0, "y": 41},
           "id": 204,
           "timeFrom": "24h",
           "interval": "1h",
@@ -423,21 +377,13 @@
               "displayMode": "table",
               "placement": "right",
               "showLegend": true,
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ]
+              "calcs": ["lastNotNull", "max"]
             },
-            "tooltip": {
-              "mode": "multi",
-              "sort": "desc"
-            }
+            "tooltip": {"mode": "multi", "sort": "desc"}
           },
           "fieldConfig": {
             "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
+              "color": {"mode": "palette-classic"},
               "custom": {
                 "drawStyle": "line",
                 "lineInterpolation": "linear",
@@ -445,36 +391,22 @@
                 "fillOpacity": 0,
                 "showPoints": "auto",
                 "spanNulls": true,
-                "thresholdsStyle": {
-                  "mode": "dashed"
-                }
+                "thresholdsStyle": {"mode": "dashed"}
               },
               "unit": "m",
               "thresholds": {
                 "mode": "absolute",
                 "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  },
-                  {
-                    "color": "orange",
-                    "value": 60
-                  },
-                  {
-                    "color": "red",
-                    "value": 420
-                  }
+                  {"color": "green", "value": null},
+                  {"color": "orange", "value": 60},
+                  {"color": "red", "value": 420}
                 ]
               }
             }
           },
           "targets": [
             {
-              "datasource": {
-                "type": "loki",
-                "uid": "loki"
-              },
+              "datasource": {"type": "loki", "uid": "loki"},
               "expr": "max by (worker_id) (max_over_time({service=\"router\", event=\"route.folder_done\"} | json folder | label_format fdate=`{{ regexReplaceAll \".*/([0-9]{8})/([0-9]{4})$\" .folder \"${1}${2}\" }}` | label_format lag_min=`{{ div (sub (unixEpoch __timestamp__) (unixEpoch (toDate \"200601021504\" .fdate))) 60 }}` | __error__=\"\" | unwrap lag_min [1h]))",
               "legendFormat": "router_{{worker_id}}",
               "refId": "A"
@@ -485,16 +417,8 @@
           "type": "timeseries",
           "title": "Ingestor max lag per worker (minutes)",
           "description": "Lag of each ingestor worker. One worker climbing usually means a hot shard (e.g. wikipedia.org on ingestor 0, facebook.com on ingestor 12).",
-          "datasource": {
-            "type": "loki",
-            "uid": "loki"
-          },
-          "gridPos": {
-            "h": 9,
-            "w": 12,
-            "x": 12,
-            "y": 41
-          },
+          "datasource": {"type": "loki", "uid": "loki"},
+          "gridPos": {"h": 9, "w": 12, "x": 12, "y": 41},
           "id": 205,
           "timeFrom": "24h",
           "interval": "1h",
@@ -504,21 +428,13 @@
               "displayMode": "table",
               "placement": "right",
               "showLegend": true,
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ]
+              "calcs": ["lastNotNull", "max"]
             },
-            "tooltip": {
-              "mode": "multi",
-              "sort": "desc"
-            }
+            "tooltip": {"mode": "multi", "sort": "desc"}
           },
           "fieldConfig": {
             "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
+              "color": {"mode": "palette-classic"},
               "custom": {
                 "drawStyle": "line",
                 "lineInterpolation": "linear",
@@ -526,36 +442,22 @@
                 "fillOpacity": 0,
                 "showPoints": "auto",
                 "spanNulls": true,
-                "thresholdsStyle": {
-                  "mode": "dashed"
-                }
+                "thresholdsStyle": {"mode": "dashed"}
               },
               "unit": "m",
               "thresholds": {
                 "mode": "absolute",
                 "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  },
-                  {
-                    "color": "orange",
-                    "value": 60
-                  },
-                  {
-                    "color": "red",
-                    "value": 420
-                  }
+                  {"color": "green", "value": null},
+                  {"color": "orange", "value": 60},
+                  {"color": "red", "value": 420}
                 ]
               }
             }
           },
           "targets": [
             {
-              "datasource": {
-                "type": "loki",
-                "uid": "loki"
-              },
+              "datasource": {"type": "loki", "uid": "loki"},
               "expr": "max by (worker_id) (max_over_time({service=\"ingestor\", event=\"ingest.folder_done\"} | json folder | label_format fdate=`{{ regexReplaceAll \".*/([0-9]{8})/([0-9]{4})$\" .folder \"${1}${2}\" }}` | label_format lag_min=`{{ div (sub (unixEpoch __timestamp__) (unixEpoch (toDate \"200601021504\" .fdate))) 60 }}` | __error__=\"\" | unwrap lag_min [1h]))",
               "legendFormat": "ingestor_{{worker_id}}",
               "refId": "A"
@@ -566,16 +468,8 @@
           "type": "timeseries",
           "title": "Avg folder duration per stage (s)",
           "description": "folder_start -> folder_done. Above 600 s a worker cannot keep up with one folder every 10 minutes. Needs the duration_s field added in this PR.",
-          "datasource": {
-            "type": "loki",
-            "uid": "loki"
-          },
-          "gridPos": {
-            "h": 9,
-            "w": 12,
-            "x": 0,
-            "y": 50
-          },
+          "datasource": {"type": "loki", "uid": "loki"},
+          "gridPos": {"h": 9, "w": 12, "x": 0, "y": 50},
           "id": 206,
           "timeFrom": "24h",
           "interval": "1h",
@@ -585,21 +479,13 @@
               "displayMode": "table",
               "placement": "right",
               "showLegend": true,
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ]
+              "calcs": ["lastNotNull", "max"]
             },
-            "tooltip": {
-              "mode": "multi",
-              "sort": "desc"
-            }
+            "tooltip": {"mode": "multi", "sort": "desc"}
           },
           "fieldConfig": {
             "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
+              "color": {"mode": "palette-classic"},
               "custom": {
                 "drawStyle": "line",
                 "lineInterpolation": "linear",
@@ -607,36 +493,36 @@
                 "fillOpacity": 0,
                 "showPoints": "auto",
                 "spanNulls": true,
-                "thresholdsStyle": {
-                  "mode": "dashed"
-                }
+                "thresholdsStyle": {"mode": "dashed"}
               },
               "unit": "s",
               "thresholds": {
                 "mode": "absolute",
                 "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  },
-                  {
-                    "color": "orange",
-                    "value": 480
-                  },
-                  {
-                    "color": "red",
-                    "value": 600
-                  }
+                  {"color": "green", "value": null},
+                  {"color": "orange", "value": 480},
+                  {"color": "red", "value": 600}
                 ]
               }
-            }
+            },
+            "overrides": [
+              {
+                "matcher": {"id": "byName", "options": "router"},
+                "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]
+              },
+              {
+                "matcher": {"id": "byName", "options": "ingestor"},
+                "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]
+              },
+              {
+                "matcher": {"id": "byName", "options": "extractor"},
+                "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "purple"}}]
+              }
+            ]
           },
           "targets": [
             {
-              "datasource": {
-                "type": "loki",
-                "uid": "loki"
-              },
+              "datasource": {"type": "loki", "uid": "loki"},
               "expr": "avg by (service) (avg_over_time({service=~\"router|ingestor|extractor\", event=~\"route.folder_done|ingest.folder_done|extract.folder_done\"} | json duration_s | __error__=\"\" | unwrap duration_s [1h]))",
               "legendFormat": "{{service}}",
               "refId": "A"
@@ -647,16 +533,8 @@
           "type": "timeseries",
           "title": "Crawler results written per worker (per hour)",
           "description": "items_written per crawler worker. A worker far below the others is starved of URLs, or its spider is stuck. Its router worker then has nothing to do.",
-          "datasource": {
-            "type": "loki",
-            "uid": "loki"
-          },
-          "gridPos": {
-            "h": 9,
-            "w": 12,
-            "x": 12,
-            "y": 50
-          },
+          "datasource": {"type": "loki", "uid": "loki"},
+          "gridPos": {"h": 9, "w": 12, "x": 12, "y": 50},
           "id": 207,
           "timeFrom": "24h",
           "interval": "1h",
@@ -666,21 +544,13 @@
               "displayMode": "table",
               "placement": "right",
               "showLegend": true,
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ]
+              "calcs": ["lastNotNull", "max"]
             },
-            "tooltip": {
-              "mode": "multi",
-              "sort": "desc"
-            }
+            "tooltip": {"mode": "multi", "sort": "desc"}
           },
           "fieldConfig": {
             "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
+              "color": {"mode": "palette-classic"},
               "custom": {
                 "drawStyle": "line",
                 "lineInterpolation": "linear",
@@ -694,10 +564,7 @@
           },
           "targets": [
             {
-              "datasource": {
-                "type": "loki",
-                "uid": "loki"
-              },
+              "datasource": {"type": "loki", "uid": "loki"},
               "expr": "sum by (worker_id) (sum_over_time({service=\"crawler\", event=\"spider.heartbeat\"} | json items_written | __error__=\"\" | unwrap items_written [1h]))",
               "legendFormat": "crawler_{{worker_id}}",
               "refId": "A"
@@ -708,40 +575,19 @@
           "type": "timeseries",
           "title": "Errors per hour (router / ingestor / extractor)",
           "description": "ERROR log lines per service. Check the Batch errors panels above or the service logs when this spikes.",
-          "datasource": {
-            "type": "loki",
-            "uid": "loki"
-          },
-          "gridPos": {
-            "h": 7,
-            "w": 24,
-            "x": 0,
-            "y": 59
-          },
+          "datasource": {"type": "loki", "uid": "loki"},
+          "gridPos": {"h": 7, "w": 24, "x": 0, "y": 59},
           "id": 208,
           "timeFrom": "24h",
           "interval": "1h",
           "maxDataPoints": 48,
           "options": {
-            "legend": {
-              "displayMode": "table",
-              "placement": "right",
-              "showLegend": true,
-              "calcs": [
-                "sum",
-                "max"
-              ]
-            },
-            "tooltip": {
-              "mode": "multi",
-              "sort": "desc"
-            }
+            "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["sum", "max"]},
+            "tooltip": {"mode": "multi", "sort": "desc"}
           },
           "fieldConfig": {
             "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
+              "color": {"mode": "palette-classic"},
               "custom": {
                 "drawStyle": "line",
                 "lineInterpolation": "linear",
@@ -751,14 +597,25 @@
                 "spanNulls": true
               },
               "unit": "short"
-            }
+            },
+            "overrides": [
+              {
+                "matcher": {"id": "byName", "options": "router"},
+                "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]
+              },
+              {
+                "matcher": {"id": "byName", "options": "ingestor"},
+                "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]
+              },
+              {
+                "matcher": {"id": "byName", "options": "extractor"},
+                "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "purple"}}]
+              }
+            ]
           },
           "targets": [
             {
-              "datasource": {
-                "type": "loki",
-                "uid": "loki"
-              },
+              "datasource": {"type": "loki", "uid": "loki"},
               "expr": "sum by (service) (count_over_time({service=~\"router|ingestor|extractor\", level=\"ERROR\"} [1h]))",
               "legendFormat": "{{service}}",
               "refId": "A"

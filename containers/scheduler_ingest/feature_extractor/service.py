@@ -28,6 +28,9 @@ class ExtractService:
         started = time.monotonic()
         file_cnt = 0
         error = 0
+        # Crawl results seen (the folder also holds status="new" link records),
+        # so Grafana can line this stage up with crawler / router / ingestor.
+        records = 0
 
         for f in folder.iterdir():
             if not f.is_file():
@@ -43,6 +46,8 @@ class ExtractService:
                 continue
 
             for rec in recs:
+                if rec.get("status") != "new":
+                    records += 1
                 try:
                     if rec.get("status") == "ok":
                         feat = extract_basic(rec)
@@ -71,6 +76,7 @@ class ExtractService:
                 "folder": str(folder),
                 "file_cnt": file_cnt,
                 "error": error,
+                "records": records,
                 "duration_s": round(time.monotonic() - started, 1),
             },
         )
