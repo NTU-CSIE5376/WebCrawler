@@ -213,6 +213,10 @@ class IngestDB:
             return set()
         now = time.monotonic()
         cache = self._frozen_cache
+        # Expired entries are replacements, not additional cache keys.
+        # Invalidate before selecting stale ids so every requested id is refilled.
+        if len(cache) + sum(did not in cache for did in domain_ids) > FROZEN_DOMAIN_CACHE_MAX:
+            cache.clear()
         stale = [
             did for did in domain_ids
             if did not in cache or now - cache[did][1] >= FROZEN_DOMAIN_CACHE_TTL_SEC
@@ -224,8 +228,6 @@ class IngestDB:
                 (stale,),
             )
             frozen_now = {row[0] for row in cur.fetchall()}
-            if len(cache) + len(stale) > FROZEN_DOMAIN_CACHE_MAX:
-                cache.clear()
             for did in stale:
                 cache[did] = (did in frozen_now, now)
         return {did for did in domain_ids if cache[did][0]}
