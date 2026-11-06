@@ -142,7 +142,7 @@ def test_live_worker_crawls_only_requested_pages_and_never_emits_ingestor_result
                     active -= 1
             if self.path == "/robots.txt":
                 body, code, mime = b"User-agent: *\nAllow: /\n", 200, "text/plain"
-            elif self.path == "/wiki/redirect":
+            elif self.path == "/wiki/redirect?oldid=123":
                 self.send_response(302)
                 self.send_header("Location", "/wiki/html")
                 self.end_headers()
@@ -234,8 +234,8 @@ process.start()
         assert json.loads((output / "00002.json").read_text())["error"] == "NonHTML content-type"
         assert "/wiki/outlink" not in hits
         assert request_headers
-        assert all("?" not in path for path in hits)
-        assert '"event": "wikipedia.url_normalized"' in result.stdout
+        assert "/wiki/redirect?oldid=123" in hits
+        assert all(f"/wiki/regular/{i}?utm_source=test" in hits for i in range(20))
         assert all(headers["User-Agent"].startswith("WebCrawlerBot/") for headers in request_headers)
         assert all("Sec-Fetch-Site" not in headers for headers in request_headers)
         records = [json.loads(line) for file in (tmp_path / "normal_results").rglob("*.jsonl")

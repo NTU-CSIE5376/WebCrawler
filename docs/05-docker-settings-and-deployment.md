@@ -148,13 +148,10 @@ processes share the same domain budget regardless of their shard assignment.
 The whitelist refresh script excludes Wikipedia from all scopes, avoiding
 additional parallel probes and new language-host split entries.
 
-The middleware normalizes `/wiki/Title` URLs by removing query parameters and
-fragments, trimming surrounding title whitespace, and replacing title spaces
-with underscores. It converts `/w/index.php?title=Title` URLs to `/wiki/Title`.
-Revision selectors are discarded so requests retrieve current content. URLs
-without a usable title and write methods are rejected; internal robots.txt
-checks are allowed. Each rewrite emits `wikipedia.url_normalized` with
-`original_url` and `normalized_url`; canonical URLs do not emit this event.
+The Wikipedia middleware preserves the requested URL, including its path,
+query parameters, and fragment. URL normalization and selection belong
+upstream; redirects are handled by Scrapy. Requests must use GET or HEAD,
+and robots.txt checks remain enabled.
 
 Wikipedia requests use the configured bot identity and gzip, suppress browser
 navigation headers, and disable cookies. Scrapy does not execute JavaScript.

@@ -2,10 +2,8 @@
 import logging
 from datetime import timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from scrapy.exceptions import IgnoreRequest
-from scrapy.http.request import NO_CALLBACK
 
 
 logger = logging.getLogger("crawler")
@@ -67,34 +65,8 @@ class WikipediaMiddleware:
         })
 
     def process_request(self, request, policy):
-        url = urlsplit(request.url)
-        robots = url.path == "/robots.txt" and request.callback is NO_CALLBACK
         if request.method not in {"GET", "HEAD"}:
             raise IgnoreRequest("Wikipedia crawling requires GET or HEAD")
-        path = url.path
-        if path == "/w/index.php":
-            titles = parse_qs(url.query).get("title", [])
-            if len(titles) != 1 or not titles[0].strip():
-                raise IgnoreRequest("Wikipedia URL cannot be normalized to /wiki/Title without a title")
-            title = titles[0]
-            path = "/wiki/" + quote(title.strip().replace(" ", "_"), safe="/:")
-        elif not (robots or (path.startswith("/wiki/") and path != "/wiki/")):
-            raise IgnoreRequest("Wikipedia URL cannot be normalized to /wiki/Title")
-        elif not robots:
-            title = unquote(path.removeprefix("/wiki/"))
-            normalized_title = title.strip().replace(" ", "_")
-            if not normalized_title:
-                raise IgnoreRequest("Wikipedia URL cannot be normalized to /wiki/Title without a title")
-            if normalized_title != title:
-                path = "/wiki/" + quote(normalized_title, safe="/:")
-        normalized_url = url._replace(path=path, query="", fragment="").geturl()
-        if normalized_url != request.url:
-            logger.info(
-                "wikipedia.url_normalized",
-                extra={"event": "wikipedia.url_normalized", "original_url": request.url,
-                       "normalized_url": normalized_url},
-            )
-            return request.replace(url=normalized_url)
         for name, values in policy.headers.items():
             request.headers[name] = values
         request.headers["Accept-Encoding"] = "gzip"
