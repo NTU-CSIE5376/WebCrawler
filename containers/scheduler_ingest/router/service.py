@@ -41,8 +41,11 @@ MANUAL_PRIORITY_MAX = 2.0
 # domain_id never changes for a domain and domain_score moves slowly, so the
 # domain cache outlives a folder. It is dropped every DOMAIN_CACHE_TTL_SEC (to
 # pick up new domain scores) or when it grows past DOMAIN_CACHE_MAX entries.
+# Memory: ~200-250 B per entry, so 200k entries is ~40-50 MB per router and
+# ~0.8 GB worst case across 16 routers (the container has no memory limit and
+# shares the host with a YB tserver). Raise it if the hit rate is too low.
 DOMAIN_CACHE_TTL_SEC = 3600.0
-DOMAIN_CACHE_MAX = 500_000
+DOMAIN_CACHE_MAX = 200_000
 
 
 def _priority_fields(link: Dict[str, Any]) -> Dict[str, Any]:
