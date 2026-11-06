@@ -40,9 +40,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
+import stat
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -106,7 +109,7 @@ def discover_stages(raw: dict) -> list[Stage]:
             continue
         for child in sorted(parent.iterdir()):
             m = pattern.match(child.name)
-            if not m or not child.is_dir():
+            if not m or child.is_symlink() or not child.is_dir():
                 continue
             worker_id = int(m.group(1))
             stages.append(Stage(
@@ -138,11 +141,13 @@ def watermark(stage: Stage) -> tuple[str, str] | None:
 
 
 def _folders(base: Path) -> Iterator[tuple[str, str, Path]]:
+    if base.is_symlink():
+        return
     for date_dir in sorted(base.iterdir()):
-        if not (date_dir.is_dir() and DATE_RE.match(date_dir.name)):
+        if date_dir.is_symlink() or not (date_dir.is_dir() and DATE_RE.match(date_dir.name)):
             continue
         for time_dir in sorted(date_dir.iterdir()):
-            if time_dir.is_dir() and TIME_RE.match(time_dir.name):
+            if not time_dir.is_symlink() and time_dir.is_dir() and TIME_RE.match(time_dir.name):
                 yield date_dir.name, time_dir.name, time_dir
 
 
@@ -169,11 +174,49 @@ def plan(
     return out
 
 
+@contextmanager
+def _directory_fd(path: Path) -> Iterator[int]:
+    """Open a directory without following symlinks in any path component."""
+    if ".." in path.parts:
+        raise ValueError("parent path components are not allowed")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(path.anchor or ".", flags)
+    try:
+        for part in path.parts[1:] if path.is_absolute() else path.parts:
+            child_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child_fd
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _remove_folder(base: Path, folder: Path) -> None:
+    """Delete only a date/time child, anchored to no-follow directory FDs.
+
+    Discovery checks alone cannot protect against a directory being replaced
+    by a symlink after planning. FD-relative rmtree also protects its own
+    traversal against symlink replacement while deleting descendants.
+    """
+    parts = folder.relative_to(base).parts
+    if len(parts) != 2 or not DATE_RE.fullmatch(parts[0]) or not TIME_RE.fullmatch(parts[1]):
+        raise ValueError("folder must be a date/time child of its cleanup base")
+    with _directory_fd(base) as base_fd:
+        date_fd = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=base_fd)
+        try:
+            shutil.rmtree(parts[1], dir_fd=date_fd)
+        finally:
+            os.close(date_fd)
+
+
 def _remove_empty_date_dirs(base: Path) -> None:
-    for date_dir in base.iterdir():
-        if date_dir.is_dir() and DATE_RE.match(date_dir.name):
+    with _directory_fd(base) as base_fd:
+        for name in os.listdir(base_fd):
+            if not DATE_RE.fullmatch(name):
+                continue
             try:
-                date_dir.rmdir()  # only succeeds when empty
+                if stat.S_ISDIR(os.stat(name, dir_fd=base_fd, follow_symlinks=False).st_mode):
+                    os.rmdir(name, dir_fd=base_fd)  # only succeeds when empty
             except OSError:
                 pass
 
@@ -200,14 +243,18 @@ def run(
                 log(f"  UNCONSUMED {d.folder} age={d.age.total_seconds() / 3600:.1f}h")
             if apply:
                 try:
-                    shutil.rmtree(d.folder)
-                except OSError as e:
+                    _remove_folder(stage.base_dir, d.folder)
+                except (OSError, ValueError) as e:
                     totals["errors"] += 1
                     log(f"  ERROR {d.folder}: {e}")
                     continue
             totals["consumed" if d.consumed else "unconsumed"] += 1
         if apply:
-            _remove_empty_date_dirs(stage.base_dir)
+            try:
+                _remove_empty_date_dirs(stage.base_dir)
+            except (OSError, ValueError) as e:
+                totals["errors"] += 1
+                log(f"  ERROR {stage.base_dir}: {e}")
     return totals
 
 
