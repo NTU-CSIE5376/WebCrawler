@@ -25,6 +25,67 @@ def enqueue(root, name="batch", urls=None, crawler_ids=None):
     return path
 
 
+def test_live_manual_scheduling_observes_autothrottle_on_shared_language_slot(tmp_path):
+    hits = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            host = self.headers["Host"].split(":")[0]
+            hits.append((host, self.path))
+            if host.endswith(".wikipedia.org"):
+                # Actual response latency drives Scrapy's AutoThrottle signal.
+                time.sleep(0.2)
+            body = b"<html>saved</html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_port
+    wiki_urls = [f"http://{language}.wikipedia.org:{port}/wiki/{i}"
+                 for i, language in enumerate(("en", "zh", "en", "zh"))]
+    other_urls = [f"http://other.example.org:{port}/page/{i}" for i in range(2)]
+    path = enqueue(tmp_path, urls=wiki_urls + other_urls)
+    root = Path(__file__).resolve().parents[3]
+    runner = Path(__file__).parent / "helpers" / "manual_shared_slot_runner.py"
+    try:
+        result = subprocess.run([sys.executable, str(runner), str(tmp_path), str(port)],
+                                cwd=root / "containers/crawler",
+                                env={**os.environ, "PYTHONPATH": f"{root}:{root / 'containers/crawler'}"},
+                                capture_output=True, text=True, timeout=25)
+        assert result.returncode == 0, result.stdout + result.stderr
+        observed = json.loads((tmp_path / "observation.json").read_text())
+        assert observed["finish_reason"] == "finished", result.stdout + result.stderr
+        assert observed["initial_pending"] == {"wikipedia": 4, "other.example.org": 2}
+        assert observed["warmup_delay"] > 0.5  # Above startup delay and bootstrap latency/concurrency.
+        assert observed["warmup_delay"] == pytest.approx(min(observed["warmup_latency"] / 0.2, 1))
+        samples = observed["samples"]
+        assert samples
+        assert all(sample["concurrency"] == 2 for sample in samples)
+        assert all(sample["seconds_per_url"] == pytest.approx(sample["delay"]) for sample in samples)
+        assert max(sample["outstanding"] for sample in samples) == 2
+        assert any(admission == {"outstanding": 2, "pending": 2}
+                   for admission in observed["other_admissions"]), observed
+        assert {(entry["host"], entry["slot"]) for entry in observed["downloads"]} == {
+            ("en.wikipedia.org", "wikipedia"), ("zh.wikipedia.org", "wikipedia"),
+            ("other.example.org", "other.example.org")}
+        assert len(hits) == 7  # One warmup plus all six manual requests, without retries.
+        status = job_status(path.stem, json.loads(path.read_text()), tmp_path / "results" / path.stem)
+        assert status["completed_urls"] == status["succeeded_urls"] == 6
+        assert status["failed_urls"] == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def test_restart_resumes_only_unfinished_urls(tmp_path):
     path = enqueue(tmp_path, urls=["https://example.com/a", "https://example.com/b"])
     batch = next_batch(path.parent)
