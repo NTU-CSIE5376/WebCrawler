@@ -159,7 +159,8 @@ def test_existing_scrapy_retry_remains_bounded_and_preserves_manual_job(cooldown
     assert retried.meta["manual_bulk_crawl_job_id"] == "job"
     assert retried.meta["manual_bulk_crawl_index"] == 7
     assert retried.meta["retry_times"] == 1
-    assert retried.dont_filter
+    # Scrapy 2.20 uses a one-shot bypass; earlier versions set dont_filter.
+    assert retried.dont_filter or retried.meta.get("skip_dupefilter_once") is True
     dispatcher.process_request(retried)
     assert retried.meta["download_slot"] == "wikipedia"
     exhausted = Response(retried.url, status=429, request=retried)
