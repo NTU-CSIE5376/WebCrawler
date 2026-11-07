@@ -1,4 +1,4 @@
-"""Wikipedia backoff pauses the shared download slot, including queued work."""
+"""Common HTTP 429 backoff pauses a downloader slot, including queued work."""
 from datetime import datetime, timezone
 from email.utils import format_datetime
 from types import SimpleNamespace
@@ -15,6 +15,7 @@ from twisted.internet.task import Clock
 
 from containers.crawler.crawler.middlewares.site_dispatcher import SiteMiddlewareDispatcher
 from containers.crawler.crawler.middlewares.wikipedia import WikipediaMiddleware
+from containers.crawler.crawler.middlewares.retry_after import RetryAfterMiddleware
 from containers.crawler.crawler.site_policies import SitePolicies
 
 
@@ -31,13 +32,13 @@ def cooldown(monkeypatch):
     crawler.engine = SimpleNamespace(downloader=SimpleNamespace(
         slots={"wikipedia": slot}, _process_queue=Mock()))
     dispatcher = SiteMiddlewareDispatcher.from_crawler(crawler)
-    middleware = dispatcher.handlers[policies.resolve("en.wikipedia.org").middleware]
+    middleware = RetryAfterMiddleware.from_crawler(crawler)
     middleware.clock = Clock()
     return crawler, dispatcher, middleware, slot
 
 
-def received(crawler, status=429, retry_after=None, host="en.wikipedia.org"):
-    request = Request(f"https://{host}/wiki/Test", meta={"download_slot": "wikipedia"})
+def received(crawler, status=429, retry_after=None, host="en.wikipedia.org", slot_key="wikipedia"):
+    request = Request(f"https://{host}/wiki/Test", meta={"download_slot": slot_key})
     response = Response(request.url, status=status,
                         headers={} if retry_after is None else {"Retry-After": retry_after},
                         request=request)
@@ -59,7 +60,7 @@ def test_cooldown_honors_retry_after_and_resumes_once(cooldown, header, seconds,
     assert SiteMiddlewareDispatcher.from_crawler(crawler) is dispatcher
     with caplog.at_level("WARNING", logger="crawler"):
         received(crawler, retry_after=header)
-    assert crawler.stats.get_value("wikipedia/cooldowns") == 1
+    assert crawler.stats.get_value("retry_after/cooldowns") == 1
     assert slot.latercall is not None
     middleware.clock.advance(seconds - 0.01)
     crawler.engine.downloader._process_queue.assert_not_called()
@@ -67,7 +68,7 @@ def test_cooldown_honors_retry_after_and_resumes_once(cooldown, header, seconds,
     crawler.engine.downloader._process_queue.assert_called_once_with(slot)
     assert slot.latercall is None
     assert middleware.cooldown_until == {}
-    record = next(r for r in caplog.records if getattr(r, "event", None) == "wikipedia.rate_limited")
+    record = next(r for r in caplog.records if getattr(r, "event", None) == "crawler.rate_limited")
     assert record.cooldown_seconds == seconds
 
 
@@ -99,12 +100,47 @@ def test_cooldown_replaces_pacing_timer_and_shutdown_can_cancel_it(cooldown):
 
 
 @pytest.mark.parametrize("status,host", [(200, "en.wikipedia.org"), (503, "en.wikipedia.org"),
-                                          (429, "example.org")])
+                                          (200, "example.org")])
 def test_other_responses_do_not_pause(cooldown, status, host):
     crawler, _, middleware, slot = cooldown
     received(crawler, status=status, host=host)
     assert slot.latercall is None
     assert middleware.clock.getDelayedCalls() == []
+
+
+def test_unconfigured_domain_uses_common_cooldown_and_slots_resume_independently(cooldown):
+    crawler, _, middleware, wiki_slot = cooldown
+    other_slot = SimpleNamespace(latercall=None)
+    downloader = crawler.engine.downloader
+    downloader.slots["example.org"] = other_slot
+
+    received(crawler, host="example.org", slot_key="example.org", retry_after="20")
+    assert wiki_slot.latercall is None
+    assert other_slot.latercall is not None
+    received(crawler, retry_after="10")
+
+    middleware.clock.advance(10)
+    downloader._process_queue.assert_called_once_with(wiki_slot)
+    assert wiki_slot.latercall is None
+    assert other_slot.latercall is not None
+    assert middleware.cooldown_until == {"example.org": 20}
+    middleware.clock.advance(10)
+    assert downloader._process_queue.call_args_list[-1].args == (other_slot,)
+    assert downloader._process_queue.call_count == 2
+    assert middleware.cooldown_until == {}
+
+
+def test_bundled_settings_enable_common_cooldown(monkeypatch):
+    import runpy
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    monkeypatch.syspath_prepend(str(root))
+    monkeypatch.chdir(root)
+    settings = runpy.run_path(str(root / "crawler/settings.py"))
+    assert settings["DOWNLOADER_MIDDLEWARES"][
+        "crawler.middlewares.retry_after.RetryAfterMiddleware"] == 90
+    assert not hasattr(WikipediaMiddleware, "response_downloaded")
 
 
 def test_existing_scrapy_retry_remains_bounded_and_preserves_manual_job(cooldown):
@@ -191,7 +227,8 @@ class TestSpider(Spider):
         self.crawler.stats.inc_value('test/success')
 process=CrawlerProcess({'LOG_LEVEL':'ERROR','ROBOTSTXT_OBEY':False,
     'HTTPPROXY_ENABLED':False,'DNS_RESOLVER':'scrapy.resolver.CachingThreadedResolver',
-    'DOWNLOADER_MIDDLEWARES':{'crawler.middlewares.site_dispatcher.SiteMiddlewareDispatcher':80},
+    'DOWNLOADER_MIDDLEWARES':{'crawler.middlewares.site_dispatcher.SiteMiddlewareDispatcher':80,
+        'crawler.middlewares.retry_after.RetryAfterMiddleware':90},
     'SPIDER_MIDDLEWARES':{'crawler.middlewares.site_dispatcher.SiteMiddlewareDispatcher':500},
     'DOWNLOAD_SLOTS':{'wikipedia':{'concurrency':1,'delay':0}},
     'RETRY_TIMES':1,'CLOSESPIDER_TIMEOUT':20})
@@ -204,7 +241,7 @@ process.crawl(crawler)
 process.start()
 assert crawler.stats.get_value('test/success')==3, crawler.stats.get_stats()
 assert crawler.stats.get_value('retry/count')==1
-assert crawler.stats.get_value('wikipedia/cooldowns')==1
+assert crawler.stats.get_value('retry_after/cooldowns')==1
 '''
     try:
         result = subprocess.run([sys.executable, '-c', script, str(server.server_port)],

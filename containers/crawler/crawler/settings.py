@@ -45,6 +45,7 @@ DEFAULT_REQUEST_HEADERS = {
 # cover retries, redirects, robots.txt, and both normal and manual requests.
 DOWNLOADER_MIDDLEWARES = {
     "crawler.middlewares.site_dispatcher.SiteMiddlewareDispatcher": 80,
+    "crawler.middlewares.retry_after.RetryAfterMiddleware": 90,
     # Last before the downloader, first on responses/exceptions: robots fetches
     # acquire separately; retries/redirects release before reacquiring a lease.
     "crawler.middlewares.shared_concurrency.SharedConcurrencyMiddleware": 1000,

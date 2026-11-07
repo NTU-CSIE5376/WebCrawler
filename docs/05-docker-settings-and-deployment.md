@@ -163,12 +163,14 @@ Wikipedia requests use the configured bot identity and gzip, suppress browser
 navigation headers, and disable cookies. Scrapy does not execute JavaScript.
 Robots.txt checks and standard bounded retries remain enabled.
 
-On HTTP 429, the middleware pauses the affected Wikipedia download slot for at
+On HTTP 429, the common `RetryAfterMiddleware` pauses the affected download slot for at
 least 10 seconds, honoring a longer `Retry-After` value (seconds or an HTTP date).
-Queued Wikipedia requests and retries wait together; other domains continue.
+Queued requests and retries for that slot wait together; other slots continue.
 Further 429s extend the cooldown without shortening an existing wait. Requests
-already in flight can finish. Cooldowns are logged as `wikipedia.rate_limited`
-and counted in `wikipedia/cooldowns`.
+already in flight can finish.
+Cooldowns are local to the downloader slot in its crawler process, consistent
+with host routing. They are logged as `crawler.rate_limited` and counted in
+`retry_after/cooldowns`.
 
 #### YouTube
 
