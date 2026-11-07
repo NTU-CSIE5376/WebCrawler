@@ -16,7 +16,7 @@ from twisted.internet import task as twisted_task
 
 from crawler.items import PageItem
 from crawler.queue_consumer import QueueConsumer
-from crawler.youtube_extractor import extract_youtube_outlinks, normalize_youtube_url
+from crawler.middlewares.youtube import normalize_youtube_url
 from crawler.manual_bulk_crawls import ManualBulkCrawlConsumer
 from libs.obslog import configure as configure_logging
 from libs.urls import host_of
@@ -415,10 +415,6 @@ class HtmlSpider(scrapy.Spider):
                 "domain": self._extract_domain(u),
                 "anchor": (link.text or "").strip()[:200]
             })
-
-        host = host_of(response.url)
-        if host == "youtube.com" or host.endswith(".youtube.com"):
-            extract_youtube_outlinks(response, outlinks)
 
         title = (response.xpath("//title/text()").get() or "").strip()[:500] or None
         hreflang_count = len(response.xpath(

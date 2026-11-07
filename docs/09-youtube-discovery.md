@@ -94,7 +94,7 @@ extractor (`extract_youtube.py`, unchanged).
 
 Code:
 
-- `containers/crawler/crawler/youtube_extractor.py` — extraction, priority, URL normalization
+- `containers/crawler/crawler/middlewares/youtube.py` — extraction, priority, URL normalization
 - `containers/crawler/crawler/spiders/spider.py` — generic-link normalization, extractor hook
 - `containers/scheduler_ingest/router/service.py` — `_priority_fields`
 - `libs/ipc/new_link_record.py` — `url_priority` / `source` fields, `SOURCE_YOUTUBE_CHANNEL = 4`
@@ -115,7 +115,7 @@ priority = 1 + min(subscribers / 10_000_000, 1)    if subscribers >= 10_000
   ≥ 10M subscribers all cap at `2.0`.
 - A channel's uploads playlist, home tab, `/playlists` tab and the
   playlists listed on its own channel pages all share its priority.
-- Tunables (`youtube_extractor.py`): `CHANNEL_PRIORITY_MIN_SUBSCRIBERS`,
+- Tunables (`middlewares/youtube.py`): `CHANNEL_PRIORITY_MIN_SUBSCRIBERS`,
   `CHANNEL_PRIORITY_SUBSCRIBER_SCALE`, `CHANNEL_PRIORITY_MAX_BONUS`.
 - Subscriber text is parsed from English UI strings (`"4.55M subscribers"`,
   `"1,234 subscribers"`); the crawler sends `Accept-Language: en-US`.
