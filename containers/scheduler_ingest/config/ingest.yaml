@@ -26,6 +26,10 @@ ingestor:
   result_dir_template: "/data/ipc/crawl_result/ingestor_{id:02d}"
   stats_dir: "/data/ipc/stats"
   interval_minutes: 10
+  # Worker processes per ingestor that write a folder's shards in parallel
+  # (each with its own DB connection). 1 = write shards in-process, one
+  # after another. Env INGESTOR_SHARD_WORKERS overrides.
+  shard_workers: 1
 
 # Newly discovered links only (crawl results are untouched).
 #   normalize_params: stripped for real (libs/frontier/url_normalize.py).

@@ -1,6 +1,7 @@
 from __future__ import annotations
 import time
 import argparse
+import functools
 import logging
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ from libs.scoring.golden_discovery_runtime import GoldenDiscoveryRuntimeScorer
 from libs.stats.delta_writer import StatsDeltaWriter
 
 from .service import IngestService
+from .shard_pool import ShardPool, db_from_config
 from .trap_filter import DEFAULT_NORMALIZE_PARAMS, TrapFilter, TrapFilterConfig
 from .db_ops import IngestDB
 
@@ -129,27 +131,14 @@ def _load_trap_filter(raw: dict[str, Any], ingestor_id: int) -> TrapFilter | Non
     return TrapFilter(cfg)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True)
-    ap.add_argument("--ingestor-id", type=int, required=True)
-    args = ap.parse_args()
+def _shard_workers(raw: dict[str, Any]) -> int:
+    ingestor = dict(raw.get("ingestor") or {})
+    return max(1, _env_int("INGESTOR_SHARD_WORKERS", int(ingestor.get("shard_workers", 1))))
 
-    raw = load_yaml(args.config)
-    ingestor_id = args.ingestor_id
-    configure_logging(service="ingestor", worker_id=ingestor_id)
 
-    ingestor = require(raw, "ingestor")
+def build_ingest_db(raw: dict[str, Any]) -> IngestDB:
+    """One engine + inline ranker. Also called in each shard worker process."""
     pg = require(raw, "postgres")
-
-    prog = Progress(require(ingestor, "progress_template").format(id=ingestor_id))
-    interval_minutes = int(ingestor.get("interval_minutes", 30))
-    reader = FolderReader(
-        require(ingestor, "result_dir_template").format(id=ingestor_id),
-        prog,
-        interval_minutes
-    )
-
     engine = create_engine(
         str(require(pg, "dsn")),
         pool_pre_ping=True,
@@ -167,16 +156,53 @@ def main():
     )
     Session = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
-    db = IngestDB(
+    return IngestDB(
         Session,
         inline_ranker=_load_inline_ranker(raw),
         inline_score_timeout_sec=_inline_score_timeout_sec(raw),
         inline_score_batch_size=_inline_score_batch_size(raw),
     )
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--ingestor-id", type=int, required=True)
+    args = ap.parse_args()
+
+    raw = load_yaml(args.config)
+    ingestor_id = args.ingestor_id
+    configure_logging(service="ingestor", worker_id=ingestor_id)
+
+    ingestor = require(raw, "ingestor")
+
+    prog = Progress(require(ingestor, "progress_template").format(id=ingestor_id))
+    interval_minutes = int(ingestor.get("interval_minutes", 30))
+    reader = FolderReader(
+        require(ingestor, "result_dir_template").format(id=ingestor_id),
+        prog,
+        interval_minutes
+    )
+
+    # With shard workers the parent only reads folders and merges counters;
+    # each worker process builds its own engine and ranker.
+    shard_workers = _shard_workers(raw)
+    if shard_workers > 1:
+        db = None
+        shard_pool = ShardPool(
+            shard_workers, functools.partial(db_from_config, args.config), ingestor_id,
+        )
+        LOGGER.info(
+            "ingest.shard_workers",
+            extra={"event": "ingest.shard_workers", "shard_workers": shard_workers},
+        )
+    else:
+        db, shard_pool = build_ingest_db(raw), None
     stats_dir=require(ingestor, "stats_dir")
     svc = IngestService(
         ingestor_id, db, StatsDeltaWriter(stats_dir),
         trap_filter=_load_trap_filter(raw, ingestor_id),
+        shard_pool=shard_pool,
     )
 
     while True:

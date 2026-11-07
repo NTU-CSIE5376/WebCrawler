@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import time
 from pathlib import Path
 from collections import defaultdict
 
@@ -13,44 +14,96 @@ from .trap_filter import TrapFilter
 logger = logging.getLogger("ingestor")
 
 
+def accumulate_result(result, counters, domains):
+    if isinstance(result, bool):
+        if result:
+            counters["new_links"] += 1
+        return
+
+    if not result:
+        return
+
+    domains.setdefault(result.domain_id, defaultdict(int))
+
+    if result.new_link:
+        counters["new_links"] += 1
+    if result.is_ok:
+        counters["num_fetch_ok"] += 1
+        domains[result.domain_id]["num_fetch_ok"] += 1
+    else:
+        counters["num_fetch_fail"] += 1
+        domains[result.domain_id]["num_fetch_fail"] += 1
+    if result.is_upd:
+        counters["num_content_update"] += 1
+        domains[result.domain_id]["num_content_update"] += 1
+    if result.fail_reason:
+        counters.setdefault("fail_reasons", defaultdict(int))[result.fail_reason] += 1
+        domains[result.domain_id].setdefault("fail_reasons", defaultdict(int))[result.fail_reason] += 1
+
+
+def merge_counts(dst: dict, src: dict) -> None:
+    """Add nested int counters from src into dst (counters, domains, shard stats)."""
+    for key, value in src.items():
+        if isinstance(value, dict):
+            merge_counts(dst.setdefault(key, defaultdict(int)), value)
+        else:
+            dst[key] = dst.get(key, 0) + value
+
+
+def run_batches(db, recs, kind, counters, domains, shard_stats):
+    """Write recs of one kind ("links" or "results") shard by shard.
+
+    Fill each shard's batches before moving to the next shard. Slicing mixed
+    shards first repeats lookups and scoring for small groups.
+    """
+    recs_by_shard = defaultdict(list)
+    for rec in recs:
+        recs_by_shard[int(rec["shard_id"])].append(rec)
+    for shard_id, shard_recs in recs_by_shard.items():
+        started = time.monotonic()
+        errors = 0
+        for i in range(0, len(shard_recs), BATCH_SIZE):
+            batch = shard_recs[i : i + BATCH_SIZE]
+            try:
+                results = db.process_batch(batch)
+                for result in results:
+                    accumulate_result(result, counters, domains)
+            except Exception as e:
+                logger.error(
+                    "ingest.batch_error",
+                    extra={
+                        "event": "ingest.batch_error",
+                        "error": str(e),
+                        "batch_size": len(batch),
+                        "shard_id": shard_id,
+                    },
+                )
+                counters["error_count"] += len(batch)
+                counters["ingest_error"] += len(batch)
+                errors += len(batch)
+        merge_counts(shard_stats, {shard_id: {
+            kind: len(shard_recs),
+            "errors": errors,
+            "seconds": time.monotonic() - started,
+        }})
+
+
 class IngestService:
     def __init__(
         self,
         ingestor_id: int,
-        db: IngestDB,
+        db: IngestDB | None,
         stats: StatsDeltaWriter,
         trap_filter: TrapFilter | None = None,
+        shard_pool=None,
     ):
         self.ingestor_id = ingestor_id
         self.db = db
         self.stats = stats
         self.trap_filter = trap_filter
-
-    def _accumulate_result(self, result, counters, domains):
-        if isinstance(result, bool):
-            if result:
-                counters["new_links"] += 1
-            return
-
-        if not result:
-            return
-
-        domains.setdefault(result.domain_id, defaultdict(int))
-
-        if result.new_link:
-            counters["new_links"] += 1
-        if result.is_ok:
-            counters["num_fetch_ok"] += 1
-            domains[result.domain_id]["num_fetch_ok"] += 1
-        else:
-            counters["num_fetch_fail"] += 1
-            domains[result.domain_id]["num_fetch_fail"] += 1
-        if result.is_upd:
-            counters["num_content_update"] += 1
-            domains[result.domain_id]["num_content_update"] += 1
-        if result.fail_reason:
-            counters.setdefault("fail_reasons", defaultdict(int))[result.fail_reason] += 1
-            domains[result.domain_id].setdefault("fail_reasons", defaultdict(int))[result.fail_reason] += 1
+        # Optional ShardPool: writes each shard in a worker process. Without
+        # it every shard is written here, one after another.
+        self.shard_pool = shard_pool
 
     def process_folder(self, folder: Path):
         logger.info(
@@ -73,7 +126,7 @@ class IngestService:
                 all_recs.extend(read_jsonl(f))
                 file_cnt += 1
 
-        link_recs = self.db.aggregate_links(
+        link_recs = IngestDB.aggregate_links(
             [r for r in all_recs if r.get("status") == "new"]
         )
         trap_dropped = url_normalized = url_would_normalize = 0
@@ -83,35 +136,33 @@ class IngestService:
             url_would_normalize = fstats.would_normalize
             if url_normalized:
                 # Stripped variants of one page collapse into a single row.
-                link_recs = self.db.aggregate_links(link_recs)
+                link_recs = IngestDB.aggregate_links(link_recs)
         result_recs = [r for r in all_recs if r.get("status") != "new"]
 
         # Links before results: a url that appears as both discovery and crawl
         # result needs its domain_score set before the result UPSERT runs.
-        for batch_recs in (link_recs, result_recs):
-            # Fill each shard's batches before moving to the next shard. Slicing
-            # mixed shards first repeats lookups and scoring for small groups.
-            recs_by_shard = defaultdict(list)
-            for rec in batch_recs:
-                recs_by_shard[int(rec["shard_id"])].append(rec)
-            for shard_recs in recs_by_shard.values():
-                for i in range(0, len(shard_recs), BATCH_SIZE):
-                    batch = shard_recs[i : i + BATCH_SIZE]
-                    try:
-                        results = self.db.process_batch(batch)
-                        for result in results:
-                            self._accumulate_result(result, counters, domains)
-                    except Exception as e:
-                        logger.error(
-                            "ingest.batch_error",
-                            extra={
-                                "event": "ingest.batch_error",
-                                "error": str(e),
-                                "batch_size": len(batch),
-                            },
-                        )
-                        counters["error_count"] += len(batch)
-                        counters["ingest_error"] += len(batch)
+        # Both records hash to the same shard, so per-shard order is enough.
+        shard_stats = {}
+        if self.shard_pool is None:
+            for kind, batch_recs in (("links", link_recs), ("results", result_recs)):
+                run_batches(self.db, batch_recs, kind, counters, domains, shard_stats)
+        else:
+            self.shard_pool.run(link_recs, result_recs, counters, domains, shard_stats)
+
+        for shard_id in sorted(shard_stats):
+            st = shard_stats[shard_id]
+            logger.info(
+                "ingest.shard_done",
+                extra={
+                    "event": "ingest.shard_done",
+                    "folder": str(folder),
+                    "shard_id": shard_id,
+                    "links": st.get("links", 0),
+                    "results": st.get("results", 0),
+                    "errors": st.get("errors", 0),
+                    "seconds": round(st.get("seconds", 0.0), 2),
+                },
+            )
 
         domains.pop(None, None)
         self.stats.write(
