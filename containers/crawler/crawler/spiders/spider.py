@@ -43,6 +43,7 @@ class HtmlSpider(scrapy.Spider):
         self._max_pending_requests = 0
         self._domain_pending: dict[int, int] = {}
         self._heartbeat_task: twisted_task.LoopingCall | None = None
+        self._top_up_task: twisted_task.LoopingCall | None = None
 
     @classmethod
     def from_crawler(cls, crawler, *args, **kwargs):
@@ -61,11 +62,15 @@ class HtmlSpider(scrapy.Spider):
         crawler.signals.connect(spider.req_scheduled, signal=signals.request_scheduled)
         crawler.signals.connect(spider.req_start, signal=signals.request_reached_downloader)
         crawler.signals.connect(spider.req_end, signal=signals.response_received)
+        crawler.signals.connect(spider.req_dropped, signal=signals.request_dropped)
         crawler.signals.connect(spider.spider_opened, signal=signals.spider_opened)
         crawler.signals.connect(spider.spider_closed, signal=signals.spider_closed)
 
         spider.heartbeat_interval_sec = float(
             crawler.settings.getfloat("OBSLOG_HEARTBEAT_SEC", 5.0)
+        )
+        spider.top_up_interval_sec = float(
+            crawler.settings.getfloat("IPC_TOP_UP_INTERVAL_SEC", 5.0)
         )
 
         return spider
@@ -311,12 +316,18 @@ class HtmlSpider(scrapy.Spider):
         if self.heartbeat_interval_sec > 0 and self._heartbeat_task is None:
             self._heartbeat_task = twisted_task.LoopingCall(self._emit_heartbeat)
             self._heartbeat_task.start(self.heartbeat_interval_sec, now=False)
+        if self.top_up_interval_sec > 0 and self._top_up_task is None:
+            self._top_up_task = twisted_task.LoopingCall(self._periodic_top_up)
+            self._top_up_task.start(self.top_up_interval_sec, now=False)
 
     def spider_closed(self, spider=None, reason: str | None = None):
         self.manual_bulk_crawls.close()
         if self._heartbeat_task is not None and self._heartbeat_task.running:
             self._heartbeat_task.stop()
         self._heartbeat_task = None
+        if self._top_up_task is not None and self._top_up_task.running:
+            self._top_up_task.stop()
+        self._top_up_task = None
 
     def _emit_heartbeat(self):
         runtime = self._downloader_runtime()
@@ -350,6 +361,10 @@ class HtmlSpider(scrapy.Spider):
     async def start(self):
         for domain_id, url in self._reserve_urls(reason="start", force=True):
             yield self._build_request(url, domain_id)
+
+    def _periodic_top_up(self):
+        if len(self._domain_pending) < self.domain_low_watermark:
+            self._maybe_top_up(reason="periodic")
 
     def on_idle(self):
         self._maybe_top_up(reason="idle", force=True)
@@ -478,6 +493,13 @@ class HtmlSpider(scrapy.Spider):
                 "domain": host_of(request.url),
             },
         )
+    def req_dropped(self, request, spider=None):
+        # The scheduler can drop an owned request (e.g. a redirect target the
+        # dupefilter has seen); neither parse nor errback runs for it then.
+        domain_id = request.meta.get("_track_domain_id")
+        if domain_id:
+            self._finish_owned_request(reason="dropped", domain_id=domain_id)
+
     def req_start(self, request):
         t = datetime.now()
         request.meta["t_down_start"] = t

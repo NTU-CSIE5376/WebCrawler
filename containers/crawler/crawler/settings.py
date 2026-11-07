@@ -96,6 +96,10 @@ IPC_PREFETCH_TARGET_REQUESTS = CONCURRENT_REQUESTS * 8
 
 # Reload domain files when active in-flight domains drop below this threshold.
 IPC_DOMAIN_LOW_WATERMARK = 144
+# Also check the watermark on a timer: completions of owned requests and
+# spider_idle are not enough once owned work has drained while manual bulk
+# crawls keep the engine busy.
+IPC_TOP_UP_INTERVAL_SEC = 5.0
 
 DNS_TIMEOUT = 15
 DOWNLOAD_TIMEOUT = 15
