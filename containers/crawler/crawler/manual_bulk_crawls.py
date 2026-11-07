@@ -1,4 +1,6 @@
 """Feed bounded API work into the existing downloader and domain slots."""
+import logging
+import math
 from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -15,6 +17,8 @@ from libs.ipc.manual_bulk_crawl import (
     JobUnavailable, ManualBulkCrawlBatch, iter_batches, is_expired,
 )
 from libs.urls import host_of
+
+logger = logging.getLogger("crawler")
 
 
 @dataclass
@@ -33,19 +37,25 @@ class _DomainQueue:
     jitter: float = field(default_factory=random)  # Fixed [0, 1) seconds per domain.
 
 
+def _int_setting(settings, name, default, minimum):
+    value = settings[name] if name in settings else default
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{name} must be an integer of at least {minimum}")
+    return value
+
+
 class ManualBulkCrawlConsumer:
     def __init__(self, spider):
         self.spider = spider
         settings = spider.crawler.settings
         self.pending_dir = Path(settings["MANUAL_BULK_CRAWL_QUEUE_DIR"])
         self.concurrency = settings.getint("CONCURRENT_REQUESTS", 64)
-        self.max_active_jobs = (settings["MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS"]
-                                if "MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS" in settings else 64)
-        if (isinstance(self.max_active_jobs, bool) or not isinstance(self.max_active_jobs, int)
-                or self.max_active_jobs < 1):
-            raise ValueError("MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS must be a positive integer")
+        self.max_active_jobs = _int_setting(settings, "MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS", 64, 1)
+        self.host_headroom = _int_setting(settings, "MANUAL_BULK_CRAWL_HOST_HEADROOM", 1, 0)
         self.jobs: dict[str, _ActiveJob] = {}
         self.inflight: set[tuple[str, int]] = set()
+        self.saves = 0
+        self.save_seconds = 0.0
         self.domains: dict[str, _DomainQueue] = {}
         self.inflight_domains: dict[tuple[str, int], str] = {}
         self.ready = pqdict(reverse=True)
@@ -104,6 +114,10 @@ class ManualBulkCrawlConsumer:
                                   else settings.getfloat("DOWNLOAD_DELAY"))
         # Inverse QPS: delay-bound or latency/concurrency-bound, whichever is slower.
         seconds_per_url = max(delay, domain.latency / max(1, concurrency))
+        if delay > 0:
+            # A slot starts one request per delay, so beyond about latency / delay in
+            # transfer, more outstanding requests only wait in the slot and hold capacity.
+            concurrency = min(concurrency, math.ceil(domain.latency / delay - 1e-9) + self.host_headroom)
         return concurrency, seconds_per_url
 
     def _refresh_priorities(self, hosts: Iterable[str] | None = None) -> None:
@@ -120,7 +134,8 @@ class ManualBulkCrawlConsumer:
                 self.ready.pop(host, None)
                 continue
             remaining = len(domain.pending) + domain.outstanding
-            # Prefer the longest remaining service time, with fixed sub-second jitter.
+            # Prefer the longest remaining service time, with fixed sub-second jitter. A host
+            # at its cap leaves the queue, so smaller hosts get the free slots.
             self.ready[host] = remaining * seconds_per_url + domain.jitter
 
     def _discard_pending(self, job_id, job):
@@ -216,6 +231,11 @@ class ManualBulkCrawlConsumer:
 
     def fetch_failed(self, failure):
         response = getattr(failure.value, "response", None)
+        logger.warning("request.fail", extra={
+            "event": "request.fail", "url": failure.request.url, "domain": host_of(failure.request.url),
+            "fail_reason": f"HttpError {response.status}" if response is not None else failure.type.__name__,
+            "status": response.status if response is not None else None, "source": "manual",
+        })
         if response is not None:
             return self.parse(response)
         meta = failure.request.meta
@@ -236,7 +256,11 @@ class ManualBulkCrawlConsumer:
             return
         try:
             if not job.failed:
+                started = monotonic()
                 job.batch.save(index, **result)
+                # Saves run on the reactor thread; the heartbeat reports their total time.
+                self.saves += 1
+                self.save_seconds += monotonic() - started
         except JobUnavailable:
             job.failed = True
         except Exception:

@@ -14,7 +14,7 @@ from containers.crawler.crawler.fair_scheduler import FairScheduler
 def scheduler_factory(tmp_path):
     schedulers = []
 
-    def factory(disk=False, replace=None, policy="balanced"):
+    def factory(disk=False, replace=None, policy="balanced", share=None):
         if replace is not None:
             replace.close("restart")
             schedulers.remove(replace)
@@ -27,6 +27,8 @@ def scheduler_factory(tmp_path):
         })
         if policy is not None:
             settings.set("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", policy)
+        if share is not None:
+            settings.set("MANUAL_BULK_CRAWL_SHARE_PERCENT", share)
         if disk:
             settings.set("JOBDIR", str(tmp_path / "job"))
         downloader = SimpleNamespace(slots={}, get_slot_key=lambda request: urlsplit(request.url).hostname)
@@ -139,6 +141,7 @@ def test_both_disk_partitions_resume_after_restart(scheduler_factory):
 
 
 @pytest.mark.parametrize("policy,expected", [
+    ("weighted", ["normal", "manual"] * 3),
     ("balanced", ["normal", "manual"] * 3),
     ("manual_first", ["manual"] * 3 + ["normal"] * 3),
     ("normal_first", ["normal"] * 3 + ["manual"] * 3),
@@ -154,6 +157,7 @@ def test_dispatch_policy_preserves_source_preference_across_storage(scheduler_fa
 
 
 @pytest.mark.parametrize("policy,expected", [
+    ("weighted", ["normal", "manual"] * 3),
     ("balanced", ["normal", "manual"] * 3),
     ("manual_first", ["manual"] * 3 + ["normal"] * 3),
     ("normal_first", ["normal"] * 3 + ["manual"] * 3),
@@ -195,21 +199,89 @@ def test_restart_applies_current_policy_to_already_queued_requests(scheduler_fac
     assert [source(resumed.next_request()) for _ in range(2)] == expected
 
 
-def test_unspecified_policy_defaults_to_manual_first(scheduler_factory):
+def test_unspecified_policy_defaults_to_weighted_half(scheduler_factory):
     scheduler = scheduler_factory(policy=None)
-    scheduler.enqueue_request(request("normal", 0))
-    scheduler.enqueue_request(Request("https://example.com/manual/default", meta={"manual_bulk_crawl_job_id": "a" * 32}))
-    assert [source(scheduler.next_request()) for _ in range(2)] == ["manual", "normal"]
+    for i in range(3):
+        scheduler.enqueue_request(request("manual", i))
+        scheduler.enqueue_request(request("normal", i))
+    assert scheduler.scheduling_policy == "weighted"
+    assert [source(scheduler.next_request()) for _ in range(6)] == ["normal", "manual"] * 3
 
 
-@pytest.mark.parametrize("policy", [None, "balanced", "manual_first", "normal_first"])
-def test_crawler_environment_sets_dispatch_policy(monkeypatch, policy):
+@pytest.mark.parametrize("policy", [None, "weighted", "balanced", "manual_first", "normal_first"])
+@pytest.mark.parametrize("share", [None, "30"])
+def test_crawler_environment_sets_dispatch_policy(monkeypatch, policy, share):
     import runpy
 
     monkeypatch.setenv("CRAWLER_USE_AUTOTHROTTLE", "true")
-    if policy is None:
-        monkeypatch.delenv("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", raising=False)
-    else:
-        monkeypatch.setenv("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", policy)
+    for name, value in (("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", policy),
+                        ("MANUAL_BULK_CRAWL_SHARE_PERCENT", share)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
     settings = runpy.run_module("containers.crawler.crawler.settings")
-    assert settings["MANUAL_BULK_CRAWL_SCHEDULING_POLICY"] == (policy or "manual_first")
+    assert settings["MANUAL_BULK_CRAWL_SCHEDULING_POLICY"] == (policy or "weighted")
+    assert settings["MANUAL_BULK_CRAWL_SHARE_PERCENT"] == int(share or 50)
+
+
+def refilled(scheduler, dispatches):
+    """Dispatches with both sources always having work; each served request is replaced."""
+    for flow in ("normal", "manual"):
+        scheduler.enqueue_request(request(flow, 0))
+    served = []
+    for i in range(dispatches):
+        flow = source(scheduler.next_request())
+        served.append(flow)
+        scheduler.enqueue_request(request(flow, i + 1))
+    return served
+
+
+def longest_run(served, flow):
+    best = run = 0
+    for item in served:
+        run = run + 1 if item == flow else 0
+        best = max(best, run)
+    return best
+
+
+@pytest.mark.parametrize("share", [20, 25, 50, 75])
+def test_weighted_gives_manual_its_share_while_both_have_work(scheduler_factory, share):
+    scheduler = scheduler_factory(policy="weighted", share=share)
+    served = refilled(scheduler, 10_000)
+    assert abs(served.count("manual") - share * 100) <= 1
+    majority = "normal" if share < 50 else "manual"
+    stride_ratio = max(share, 100 - share) // min(share, 100 - share)
+    assert longest_run(served, majority) <= stride_ratio
+    assert longest_run(served, "manual" if majority == "normal" else "normal") == 1
+
+
+@pytest.mark.parametrize("alone", ["normal", "manual"])
+def test_weighted_alternates_once_a_lone_source_gets_company(scheduler_factory, alone):
+    scheduler = scheduler_factory(policy="weighted", share=50)
+    for i in range(5):
+        scheduler.enqueue_request(request(alone, i))
+    assert [source(scheduler.next_request()) for _ in range(5)] == [alone] * 5
+    other = "normal" if alone == "manual" else "manual"
+    for i in range(5, 10):
+        scheduler.enqueue_request(request(alone, i))
+        scheduler.enqueue_request(request(other, i))
+    assert [source(scheduler.next_request()) for _ in range(10)] == [other, alone] * 5
+
+
+@pytest.mark.parametrize("idle", ["normal", "manual"])
+def test_weighted_idle_source_does_not_bank_turns(scheduler_factory, idle):
+    scheduler = scheduler_factory(policy="weighted", share=25)
+    busy = "manual" if idle == "normal" else "normal"
+    for i in range(1000):
+        scheduler.enqueue_request(request(busy, i))
+        assert source(scheduler.next_request()) == busy
+    served = refilled(scheduler, 100)
+    assert 24 <= served.count("manual") <= 26
+    assert longest_run(served, idle) <= 3
+
+
+@pytest.mark.parametrize("share", [0, 100, -1, True, "50", 50.5])
+def test_invalid_share_is_rejected_at_startup(scheduler_factory, share):
+    with pytest.raises(ValueError, match="MANUAL_BULK_CRAWL_SHARE_PERCENT"):
+        scheduler_factory(policy="weighted", share=share)
