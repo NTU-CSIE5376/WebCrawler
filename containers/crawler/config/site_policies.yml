@@ -48,9 +48,9 @@ domains:
   espn.com:
     middleware: crawler.middlewares.espn.ESPNMiddleware
     request_limits:
-      target_concurrent_requests: 4
-      max_concurrent_requests: 4
-      max_qps: 4
+      target_concurrent_requests: 32
+      max_concurrent_requests: 16
+      max_qps: 64
 
 hosts:
   01282.com:

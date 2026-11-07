@@ -206,9 +206,18 @@ and query parameters, identifies as `WebCrawlerBot/1.0`, requests gzip, and disa
 cookies. Configured site headers can override the identity. Robots checks,
 bounded retries, and the common 429 cooldown remain enabled.
 
-ESPN uses an AutoThrottle target of four, nominal four QPS, a shared domain
-concurrency cap of four, and one `espn.com` download slot. These are initial tuning
-values, not a measured improvement or limits published by ESPN.
+The `espn.com` domain policy uses an AutoThrottle target of 32, nominal 64 QPS,
+a shared domain concurrency cap of 16, and one `espn.com` download slot. The target
+controls pacing; the hard cap remains 16 across crawler processes and subdomains.
+Global defaults remain unchanged.
+
+A fresh 10,000-URL benchmark on `www.espn.com` completed in 377.75 seconds with
+9,826 successful HTTP-200 pages (26.01 pages/sec), no HTTP 429s, and no cooldowns.
+First-half and second-half rates were 26.05 and 25.98 pages/sec. The run used one
+crawler with a two-CPU quota and 4 GiB RAM, retaining the production middleware,
+HTML parser, and JSON output pipeline. These are measured tuning values, not
+limits published by ESPN; the benchmark did not validate rates for other ESPN
+hosts. Other hosts share the domain slot, so their cooldowns also affect it.
 
 ## 5.4 Operational Configuration Coupling
 
