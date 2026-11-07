@@ -99,12 +99,15 @@ class SiteMiddlewareDispatcher:
         return result
 
     async def process_spider_output(self, response, result, spider=None):
-        url = urlparse_cached(response)
-        if url.scheme in {"http", "https"} and url.hostname is not None:
-            policy = self.policies.resolve(url.hostname)
-            handler = self.handlers.get(policy.middleware)
-            hook = getattr(handler, "process_spider_output", None)
-            if hook is not None:
-                result = hook(response, result, policy)
+        # Downloader failures (including robots and policy denials) have no
+        # response. Preserve errback output without selecting a site handler.
+        if response is not None:
+            url = urlparse_cached(response)
+            if url.scheme in {"http", "https"} and url.hostname is not None:
+                policy = self.policies.resolve(url.hostname)
+                handler = self.handlers.get(policy.middleware)
+                hook = getattr(handler, "process_spider_output", None)
+                if hook is not None:
+                    result = hook(response, result, policy)
         async for item in as_async_generator(result):
             yield item
