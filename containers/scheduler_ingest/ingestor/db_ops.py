@@ -6,15 +6,19 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+import psycopg2
 from psycopg2.extras import execute_values
+from sqlalchemy.dialects.postgresql.psycopg2 import PGDialect_psycopg2
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import sessionmaker
+from tenacity import before_sleep_log, retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from libs.db.sharding.history_partition import ensure_partitions, missing_partition_target
 from libs.ipc.new_link_record import SOURCE_NATURAL, SOURCE_YOUTUBE_CHANNEL
 from libs.scoring.golden_discovery_runtime import GoldenDiscoveryRuntimeScorer
 
-
 LOGGER = logging.getLogger("ingestor")
+_DIALECT = PGDialect_psycopg2(dbapi=psycopg2)
 EXISTING_URL_LOOKUP_BATCH_SIZE = 50000
 
 # discovery_frozen is flipped by the GC service on a slow cadence, so a short
@@ -36,6 +40,21 @@ BATCH_SIZE = 2000
 
 # Catches already-queued oversized urls that bypassed the spider-side filter.
 MAX_URL_LEN = 2500
+
+
+def _connection_error(exc: Exception, raw_connection=None) -> bool:
+    """YugabyteDB-only retry predicate for this ingestor's YSQL/psycopg2 connection."""
+    original = exc.orig if isinstance(exc, DBAPIError) else exc
+    sqlstate = getattr(original, "pgcode", None)
+    if sqlstate:
+        if sqlstate == "08007":  # Transaction resolution unknown: do not replay.
+            return False
+        return sqlstate.startswith("08") or sqlstate in {"57P01", "57P02", "57P03"}
+    if isinstance(exc, DBAPIError) and exc.connection_invalidated:
+        return True
+    if raw_connection is None and isinstance(original, psycopg2.OperationalError):
+        return True  # Connection acquisition failed; no transaction exists yet.
+    return _DIALECT.is_disconnect(original, raw_connection, None)
 
 ROBOTS_UNKNOWN = 0
 ROBOTS_ALLOWED = 1
@@ -769,13 +788,29 @@ class IngestDB:
         return self._process_batch_once(recs)
 
     def _process_batch_once(self, recs: list[dict]) -> list[IngestResult | bool | None]:
+        """Retry transaction execution, but never replay an uncertain commit."""
+        sess, results = self._execute_batch(recs)
+        try:
+            # Keep COMMIT outside Tenacity: a lost acknowledgment may mean the
+            # additive counters were already committed successfully.
+            sess.commit()
+            return results
+        finally:
+            sess.close()
+
+    @retry(
+        retry=retry_if_exception(_connection_error),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=0.2),
+        before_sleep=before_sleep_log(LOGGER, logging.WARNING),
+        reraise=True,
+    )
+    def _execute_batch(self, recs: list[dict]):
         """Group records by (kind, shard_id) and dispatch to bulk paths.
 
-        All-or-nothing: any failure rolls back and re-raises.
-        Returns IngestResult for results, bool for new links, in input order.
+        Each attempt owns a fresh session. On success, return the open session
+        and input-ordered results to _process_batch_once(), which commits and closes.
         """
-        results: list[IngestResult | bool | None] = [None] * len(recs)
-
         results_by_shard: dict[int, list[tuple[int, dict]]] = defaultdict(list)
         links_by_shard: dict[int, list[tuple[int, dict]]] = defaultdict(list)
         for i, rec in enumerate(recs):
@@ -787,15 +822,27 @@ class IngestDB:
             else:
                 results_by_shard[sid].append((i, rec))
 
-        with self.Session.begin() as sess:
-            with sess.connection().connection.cursor() as cur:
-                # Links first so that a URL that appears as both a discovered
-                # link and a crawl result in the same batch is inserted with
-                # its domain_score before the result UPSERT touches it.
+        results: list[IngestResult | bool | None] = [None] * len(recs)
+        raw_connection = None
+        sess = self.Session()
+        try:
+            sess.begin()
+            connection = sess.connection().connection
+            raw_connection = connection.driver_connection
+            with connection.cursor() as cur:
+                # Links first so discovery metadata is set before a matching
+                # crawl result updates the same URL.
                 for sid, items in links_by_shard.items():
                     for idx, ok in self._bulk_links(cur, sid, items):
                         results[idx] = ok
                 for sid, items in results_by_shard.items():
                     for idx, ir in self._bulk_results(cur, sid, items):
                         results[idx] = ir
-        return results
+            return sess, results
+        except Exception as exc:
+            if _connection_error(exc, raw_connection):
+                # Raw cursor calls bypass SQLAlchemy's disconnect handling.
+                sess.invalidate()
+            else:
+                sess.close()  # Roll back non-connection failures normally.
+            raise
