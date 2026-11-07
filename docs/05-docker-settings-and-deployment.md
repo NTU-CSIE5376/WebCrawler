@@ -198,6 +198,18 @@ video links to the page's outlinks. Manual bulk crawl results and non-HTML
 responses bypass this enrichment. The former standalone `youtube_extractor.py`
 implementation now lives in the middleware module.
 
+#### ESPN
+
+`crawler.middlewares.espn.ESPNMiddleware` skips login, members, and personalization
+paths on ESPN's public frontend before downloading. It preserves content URLs
+and query parameters, identifies as `WebCrawlerBot/1.0`, requests gzip, and disables
+cookies. Configured site headers can override the identity. Robots checks,
+bounded retries, and the common 429 cooldown remain enabled.
+
+ESPN uses an AutoThrottle target of four, nominal four QPS, a shared domain
+concurrency cap of four, and one `espn.com` download slot. These are initial tuning
+values, not a measured improvement or limits published by ESPN.
+
 ## 5.4 Operational Configuration Coupling
 
 The following must remain aligned:

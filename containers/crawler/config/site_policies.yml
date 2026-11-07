@@ -45,6 +45,13 @@ domains:
   reddit.com:
     allow: false
 
+  espn.com:
+    middleware: crawler.middlewares.espn.ESPNMiddleware
+    request_limits:
+      target_concurrent_requests: 4
+      max_concurrent_requests: 4
+      max_qps: 4
+
 hosts:
   01282.com:
     request_limits:
