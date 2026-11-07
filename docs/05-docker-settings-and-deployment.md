@@ -105,6 +105,24 @@ the domain middleware; `middleware: null` disables the custom handler while
 keeping the resolved crawl policy. `request_limits: null` resets limits to the
 global default. Headers inherit one field at a time; a null header suppresses it.
 
+`allow` is a shared policy option with the same default → domain → exact-host
+precedence. It defaults to `true`; `false` makes the common dispatcher raise
+`IgnoreRequest` before robots fetching, site handlers, or acquiring a request
+budget. It covers normal requests, manual jobs, retries, and redirect destinations
+in every crawler process. Domain denials include all subdomains unless an exact
+host explicitly sets `allow: true`. Denials remain failures in crawl and manual
+job results. Discovery and patrol workers do not use this crawler policy.
+
+```yaml
+domains:
+  instagram.com:
+    allow: false
+  facebook.com:
+    allow: false
+  reddit.com:
+    allow: false
+```
+
 The policy-aware extension reuses Scrapy's AutoThrottle calculation and applies
 the resolved site's minimum interval, calculated as `1 / max_qps`. AutoThrottle
 starts at the larger of that minimum and `AUTOTHROTTLE_START_DELAY`; it may slow

@@ -8,6 +8,7 @@ from scrapy.downloadermiddlewares.defaultheaders import DefaultHeadersMiddleware
 from scrapy.downloadermiddlewares.downloadtimeout import DownloadTimeoutMiddleware
 from scrapy.downloadermiddlewares.redirect import RedirectMiddleware
 from scrapy.downloadermiddlewares.useragent import UserAgentMiddleware
+from scrapy.exceptions import IgnoreRequest
 
 from containers.crawler.crawler.site_policies import SitePolicies
 from containers.crawler.crawler.middlewares.wikipedia import WikipediaMiddleware
@@ -15,6 +16,66 @@ from containers.crawler.crawler.middlewares.site_dispatcher import SiteMiddlewar
 
 
 WIKIPEDIA_MIDDLEWARE = f"{WikipediaMiddleware.__module__}.WikipediaMiddleware"
+
+
+def test_allow_inherits_default_domain_and_exact_host():
+    policies = SitePolicies({
+        "default": {"allow": False},
+        "domains": {"example.com": {"allow": True}},
+        "hosts": {"private.example.com": {"allow": False}, "allowed.example.org": {"allow": True}},
+    })
+    assert policies.resolve("example.org").allow is False
+    assert policies.resolve("www.example.com").allow is True
+    assert policies.resolve("private.example.com").allow is False
+    assert policies.resolve("allowed.example.org").allow is True
+    assert SitePolicies({}).resolve("example.com").allow is True
+    override = SitePolicies({"domains": {"example.com": {"allow": False}},
+                             "hosts": {"docs.example.com": {"allow": True}}})
+    assert override.resolve("docs.example.com").allow is True
+    assert override.resolve("www.example.com").allow is False
+
+
+@pytest.mark.parametrize("value", [None, "false", 0, 1, []])
+@pytest.mark.parametrize("section", ["default", "domains", "hosts"])
+def test_allow_requires_a_boolean(value, section):
+    rule = {"allow": value}
+    document = {section: rule if section == "default" else {"example.com": rule}}
+    with pytest.raises(ValueError):
+        SitePolicies(document)
+
+
+@pytest.mark.parametrize("domain", ["instagram.com", "facebook.com", "reddit.com"])
+@pytest.mark.parametrize("prefix", ["", "www.", "developers."])
+@pytest.mark.parametrize("path", ["/page?key=value", "/robots.txt"])
+@pytest.mark.parametrize("manual", [False, True])
+def test_bundled_denials_cover_subdomains_robots_and_manual_jobs(monkeypatch, domain, prefix, path, manual):
+    root = Path(__file__).resolve().parents[1]
+    monkeypatch.syspath_prepend(str(root))
+    monkeypatch.chdir(root)
+    policies = SitePolicies.load()
+    dispatcher = SiteMiddlewareDispatcher(policies)
+    meta = {"manual_bulk_crawl_job_id": "job", "manual_bulk_crawl_index": 7} if manual else {}
+    request = Request(f"https://{prefix}{domain}{path}", meta=meta)
+    assert policies.resolve(prefix + domain).allow is False
+    assert policies.resolve(prefix + domain).middleware is None
+    with pytest.raises(IgnoreRequest, match="disabled by site policy"):
+        dispatcher.process_request(request)
+    assert "download_slot" not in request.meta
+    for key, value in meta.items():
+        assert request.meta[key] == value
+    assert policies.resolve(domain + ".example.com").allow is True
+    assert dispatcher.process_request(Request("https://example.com/article")) is None
+
+
+def test_redirect_to_denied_domain_stops_before_site_handler():
+    dispatcher = SiteMiddlewareDispatcher(SitePolicies({"domains": {"example.org": {
+        "allow": False, "middleware": f"{__name__}.ExactHostMiddleware",
+    }}}))
+    initial = apply(dispatcher, Request("https://example.com/article"))
+    denied = redirect(initial, "https://www.example.org/article")
+    with pytest.raises(IgnoreRequest, match="disabled by site policy"):
+        dispatcher.process_request(denied)
+    assert "X-Handler" not in denied.headers
 
 
 class ExactHostMiddleware:
