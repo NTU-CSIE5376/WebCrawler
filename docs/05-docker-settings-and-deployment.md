@@ -52,23 +52,133 @@ Crawler-specific networking:
 - `scheduler_control`: 16 offerers + 1 accounting rolloff worker + optional Golden Discovery Ranker v1 workers
 - `scheduler_ingest`: 16 routers + 16 ingestors + 16 extractors + 1 stats aggregator
 - `crawler`: 16 spiders total:
-  - 15 baseline AutoThrottle spiders (`crawler_id=0..6,8..15`)
-  - 1 independently configurable AutoThrottle canary spider (`crawler_id=7`)
+  - 15 baseline AutoThrottle spiders (`crawler_id=0..14`)
+  - 1 independently configurable AutoThrottle canary spider (`crawler_id=15`)
 
 Total long-running app processes (excluding postgres internals):
 
 - Default: `17 + 49 + 16 = 82`
 - With Golden Discovery Ranker v1 enabled: `21 + 49 + 16 = 86`
 
-Crawler throttle mode is selected per supervisord program through environment
-variables. All production workers currently set `CRAWLER_USE_AUTOTHROTTLE=true`.
-Workers `0..6` and `8..15` share the baseline AutoThrottle values; worker `7`
-is intentionally kept in its own program so it can be tuned independently for
-future canary experiments. Fixed-QPS mode remains available by setting
-`CRAWLER_USE_AUTOTHROTTLE=false`, which reads `domain_qps.json`.
-All crawler workers default Scrapy's `SCRAPER_SLOT_MAX_ACTIVE_SIZE` to
-`50000000` bytes to avoid downloader stalls from scraper-slot backpressure; set
-`CRAWLER_SCRAPER_SLOT_MAX_ACTIVE_SIZE` to override it.
+Supervisor keeps per-process global concurrency and AutoThrottle target/start/max
+tuning. Baseline workers use global concurrency 256; the canary uses 384 and a
+150,000,000-byte scraper buffer. The default scraper buffer is 50,000,000 bytes;
+`CRAWLER_SCRAPER_SLOT_MAX_ACTIVE_SIZE` overrides it.
+
+### 5.3.1 Middleware
+
+Crawler policies are loaded from `containers/crawler/config/site_policies.yml`.
+`default.crawler_mode` is `autothrottle`, and
+`default.request_limits.max_qps` is `4` (a 0.25-second minimum interval).
+Domains and exact hostnames can override the mode with `fixed` or `autothrottle`
+and provide partial `request_limits`; each field inherits from default to domain
+to host. Domain rules match the registered domain and its subdomains; host rules
+match an exact hostname.
+
+```yaml
+default:
+  crawler_mode: autothrottle
+  request_limits:
+    max_qps: 4
+    max_concurrent_requests: 16
+domains:
+  wikipedia.org:
+    crawler_mode: autothrottle
+    middleware: crawler.middlewares.wikipedia.WikipediaMiddleware
+    request_limits:
+      download_slot: wikipedia
+      target_concurrent_requests: 8
+      max_qps: 15
+      max_concurrent_requests: 8
+  youtube.com:
+    middleware: crawler.middlewares.youtube.YouTubeMiddleware
+hosts:
+  example.com:
+    crawler_mode: fixed
+    request_limits:
+      max_qps: 1
+```
+
+`SiteMiddlewareDispatcher` selects handlers from these declarative bindings for
+request, downloaded-response, and spider-output hooks. Exact host rules inherit
+the domain middleware; `middleware: null` disables the custom handler while
+keeping the resolved crawl policy. `request_limits: null` resets limits to the
+global default. Headers inherit one field at a time; a null header suppresses it.
+
+The policy-aware extension reuses Scrapy's AutoThrottle calculation and applies
+the resolved site's minimum interval, calculated as `1 / max_qps`. AutoThrottle
+starts at the larger of that minimum and `AUTOTHROTTLE_START_DELAY`; it may slow
+down as latency rises. Fixed slots use their configured interval and opt out of
+adaptive adjustments. Concurrency is enforced by Scrapy slots per crawler
+process. Standard Scrapy delay randomization still applies, so `max_qps` controls
+nominal pacing rather than a strict rolling-window or shared multi-process QPS
+budget. `download_slot` groups requests into a shared slot within a crawler;
+rules sharing a slot must have consistent policies. Normal and manual API
+requests use the same downloader and site policies.
+
+`request_limits.target_concurrent_requests` optionally overrides the AutoThrottle
+target for a domain or exact host, inheriting through the same policy hierarchy.
+When omitted, it uses `AUTOTHROTTLE_TARGET_CONCURRENCY` (2 by default). This target
+controls adaptive pacing; `max_concurrent_requests` remains the hard cap.
+
+The YAML is the source of truth for mode, minimum interval, and slot concurrency;
+the old `domain_qps.json`, `CRAWLER_USE_AUTOTHROTTLE`, `CRAWLER_DOWNLOAD_DELAY`, and
+`CRAWLER_CONCURRENT_REQUESTS_PER_DOMAIN` settings are no longer used.
+
+#### Wikipedia
+
+Wikipedia uses AutoThrottle with `target_concurrent_requests: 8`, `max_qps: 15`
+(a minimum interval of about 0.0667 seconds), and `max_concurrent_requests: 8`. When explicitly configured
+under `domains`, `max_concurrent_requests` is enforced by the generic
+`SharedConcurrencyMiddleware` across all crawler processes and subdomains.
+This includes robots.txt, redirects, retries, and manual jobs, regardless of
+shard routing. Host overrides cannot relax a domain's shared cap; a lower host
+limit still applies locally. Default and host-only concurrency limits remain
+per process. Domain rules without an explicit concurrency setting do not
+create a shared budget.
+
+The shared limit covers crawler requests. The unchanged synchronous sitemap
+discovery and patrol workers can each add one concurrent request; with a crawler
+cap of eight, the combined maximum is ten. Use a crawler cap of seven to keep
+the combined maximum at nine for the current one-instance-per-worker deployment.
+
+The middleware uses file locks under `/data/ipc/request_budgets`, on the IPC
+bind mount shared by the crawler containers. Workers wait asynchronously for a
+lease and fail closed if the shared directory is unavailable. Responses and
+download exceptions release leases; process death releases locks automatically.
+For local runs, set `SHARED_REQUEST_BUDGET_DIR` to a writable directory shared by
+all participating processes. Do not delete lock files while crawlers run.
+Deploy by restarting all crawler processes together so no old workers bypass
+the middleware. Existing split whitelist entries can remain: all crawler
+processes share the same domain budget regardless of their shard assignment.
+The whitelist refresh script excludes Wikipedia from all scopes, avoiding
+additional parallel probes and new language-host split entries.
+
+The Wikipedia middleware preserves the requested URL, including its path,
+query parameters, and fragment. URL normalization and selection belong
+upstream; redirects are handled by Scrapy. Requests must use GET or HEAD,
+and robots.txt checks remain enabled.
+
+Wikipedia requests use the configured bot identity and gzip, suppress browser
+navigation headers, and disable cookies. Scrapy does not execute JavaScript.
+Robots.txt checks and standard bounded retries remain enabled.
+
+On HTTP 429, the common `RetryAfterMiddleware` pauses the affected download slot for at
+least 10 seconds, honoring a longer `Retry-After` value (seconds or an HTTP date).
+Queued requests and retries for that slot wait together; other slots continue.
+Further 429s extend the cooldown without shortening an existing wait. Requests
+already in flight can finish.
+Cooldowns are local to the downloader slot in its crawler process, consistent
+with host routing. They are logged as `crawler.rate_limited` and counted in
+`retry_after/cooldowns`.
+
+#### YouTube
+
+The YouTube middleware runs the existing video outlink extractor on normal
+HTML `PageItem` output. It preserves the extractor's parsing behavior and adds
+video links to the page's outlinks. Manual bulk crawl results and non-HTML
+responses bypass this enrichment. The former standalone `youtube_extractor.py`
+implementation now lives in the middleware module.
 
 ## 5.4 Operational Configuration Coupling
 

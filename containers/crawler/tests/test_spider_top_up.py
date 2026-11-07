@@ -14,7 +14,8 @@ from crawler.spiders.spider import HtmlSpider  # noqa: E402
 
 
 @pytest.fixture
-def spider(tmp_path):
+def spider(tmp_path, monkeypatch):
+    monkeypatch.chdir(Path(__file__).resolve().parents[1])
     queue_dir = tmp_path / "url_queue" / "crawler_00"
     queue_dir.mkdir(parents=True)
     crawler = get_crawler(HtmlSpider, {
