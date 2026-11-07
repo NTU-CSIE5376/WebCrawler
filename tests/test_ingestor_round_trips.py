@@ -205,7 +205,7 @@ class FolderBatchingRoundTripTest(unittest.TestCase):
         session = MagicMock()
         session.connection.return_value.connection.cursor.return_value.__enter__.return_value = cur
         session_factory = MagicMock()
-        session_factory.begin.return_value.__enter__.return_value = session
+        session_factory.return_value = session
         ranker = _Ranker()
         db = IngestDB(Session=session_factory, inline_ranker=ranker)
         batch_size = ingest_db_ops.BATCH_SIZE
@@ -224,7 +224,8 @@ class FolderBatchingRoundTripTest(unittest.TestCase):
         self.assertEqual(len(ranker.calls), 16)
         self.assertTrue(all(len(urls) == batch_size for urls in ranker.calls))
         self.assertEqual(len(captured), 32)  # One current + history insert per shard.
-        self.assertEqual(session_factory.begin.call_count, 16)
+        self.assertEqual(session_factory.call_count, 16)
+        self.assertEqual(session.commit.call_count, 16)
         scored_urls = [url for urls in ranker.calls for url in urls]
         self.assertCountEqual(scored_urls, [rec["url"] for rec in recs])
         self.assertEqual(stats["counters"]["new_links"], len(recs))
