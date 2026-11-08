@@ -31,6 +31,7 @@ TOP_PROJECT_SUFFIX = b".wikipedia"
 # Special: namespace (e.g. Special:Search sits near the top every day).
 NON_ARTICLE_TITLES = {"-"}
 NON_ARTICLE_PREFIXES = ("Special:",)
+DEFAULT_USER_AGENT = "WebCrawlerBot/1.0 (+https://github.com/NTU-CSIE5376/WebCrawler)"
 BASE_URL = "https://dumps.wikimedia.org/other/pageview_complete"
 MAX_URL_LEN = 2500
 DEFAULT_INJECT_BATCH_SIZE = 1000
@@ -136,13 +137,15 @@ def fetch_listing(
     *,
     retries: int = DEFAULT_DOWNLOAD_RETRIES,
     backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS,
+    user_agent: str = DEFAULT_USER_AGENT,
 ) -> str:
     if retries <= 0:
         raise ValueError("retries must be positive")
 
+    req = urllib.request.Request(url, headers={"User-Agent": user_agent})
     for attempt in range(1, retries + 1):
         try:
-            with urllib.request.urlopen(url, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 return resp.read().decode()
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
             if attempt >= retries or not is_retryable_error(exc):
@@ -283,8 +286,8 @@ def response_content_range(resp) -> ContentRange | None:
     )
 
 
-def download_request(url: str, resume_from: int) -> urllib.request.Request:
-    headers = {}
+def download_request(url: str, resume_from: int, user_agent: str = DEFAULT_USER_AGENT) -> urllib.request.Request:
+    headers = {"User-Agent": user_agent}
     if resume_from > 0:
         headers["Range"] = f"bytes={resume_from}-"
     return urllib.request.Request(url, headers=headers)
