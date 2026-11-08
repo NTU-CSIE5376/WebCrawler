@@ -26,6 +26,10 @@ uv run scripts/migrate_add_source.py [--dry-run]
 
 ```bash
 uv run scripts/golden_inject.py [--dry-run]
+docker compose exec scheduler_ingest python scripts/golden_inject.py
+
+# host crontab: weekly, Monday 01:00 UTC (09:00 CST on UTC+8 hosts)
+0 9 * * 1 cd /opt/WebCrawler && docker compose exec -T -e PYTHONPATH=/app scheduler_ingest python scripts/golden_inject.py >> /home/r14922138/logs/golden_inject.log 2>&1
 ```
 
 ## 6.3 `migrate_add_discovered_from.py`
@@ -342,6 +346,7 @@ uv run scripts/oneoff_drop_trap_frontier.py --execute --include-history
 uv run scripts/wiki_pageview_inject.py [--dry-run] [--skip-inject] [--top-k 100000] [--agent user]
 docker compose exec scheduler_ingest python scripts/wiki_pageview_inject.py
 
-# host crontab: weekly, Monday 04:30 UTC
-30 4 * * 1 cd /path/to/WebCrawler && docker compose exec -T scheduler_ingest python scripts/wiki_pageview_inject.py >> /var/log/wiki_pageview_inject.log 2>&1
+# host crontab: weekly, Monday 04:30 UTC (12:30 CST on UTC+8 hosts)
+# Note: runs after Monday 01:00 UTC golden_inject and after Wikimedia's 02:30 UTC dump release.
+30 12 * * 1 cd /opt/WebCrawler && docker compose exec -T -e PYTHONPATH=/app scheduler_ingest python scripts/wiki_pageview_inject.py --data-dir /data/ipc/wiki_pageviews >> /home/r14922138/logs/wiki_pageview_inject.log 2>&1
 ```
