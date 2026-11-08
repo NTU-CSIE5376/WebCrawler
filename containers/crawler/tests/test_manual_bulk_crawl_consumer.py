@@ -1,5 +1,6 @@
 """Keep download capacity busy across jobs while preserving per-job ownership."""
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -468,9 +469,16 @@ def test_language_hosts_share_configured_slot_backlog_and_dispatch_cap(queue, fa
     from twisted.internet.error import TimeoutError
 
     enqueue, factory, _ = queue
-    enqueue("english", urls=[f"https://en.wikipedia.org/wiki/{i}" for i in range(3)])
-    enqueue("chinese", urls=[f"https://zh.wikipedia.org/wiki/{i}" for i in range(3)])
-    enqueue("other", urls=["https://other.example/0"])
+    manifests = [
+        enqueue("english", urls=[f"https://en.wikipedia.org/wiki/{i}" for i in range(3)]),
+        enqueue("chinese", urls=[f"https://zh.wikipedia.org/wiki/{i}" for i in range(3)]),
+        enqueue("other", urls=["https://other.example/0"]),
+    ]
+    # This scenario assumes English was submitted first. Give manifests distinct
+    # timestamps: a filesystem mtime tie otherwise puts "chinese" first by name.
+    submitted_at = manifests[0].stat().st_mtime
+    for offset, manifest in enumerate(manifests):
+        os.utime(manifest, (submitted_at + offset, submitted_at + offset))
     registry = SitePolicies({"domains": {"wikipedia.org": {"request_limits": {
         "download_slot": "wikipedia", "max_concurrent_requests": 2}}}})
     consumer, requests = factory(concurrency=8, site_policies=registry,
