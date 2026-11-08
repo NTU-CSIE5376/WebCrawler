@@ -121,7 +121,26 @@ domains:
     allow: false
   reddit.com:
     allow: false
+  x.com:
+    allow: false
+  imdb.com:
+    allow: false
+  sofascore.com:
+    allow: false
 ```
+
+The bundled exclusions reflect the following published policies, checked on
+November 8, 2026. They apply to the registered domain and its subdomains through
+the shared dispatcher, including normal requests, manual jobs, and redirects.
+
+| Domain | Reason for `allow: false` | Supporting source |
+| --- | --- | --- |
+| `instagram.com` | Meta requires prior permission for automated collection from its products. This crawler has no configured authorization. | [Instagram terms](https://help.instagram.com/581066165581870), [Meta's explanation of its scraping policy](https://about.fb.com/news/2021/04/how-we-combat-scraping/) |
+| `facebook.com` | The robots notice requires express written permission for automated collection; the wildcard group also excludes our crawler. | [Facebook robots.txt](https://www.facebook.com/robots.txt) |
+| `reddit.com` | The user agreement distinguishes conditional robots-compliant crawling from scraping, which requires prior written consent. This deployment conservatively excludes content collection without a separate authorization. | [User Agreement, section 7](https://redditinc.com/policies/user-agreement), [robots.txt](https://www.reddit.com/robots.txt) |
+| `x.com` | The wildcard group disallows all paths for our crawler. Named search-bot exceptions do not apply. | [X robots.txt](https://x.com/robots.txt) |
+| `imdb.com` | The wildcard group disallows all paths; the notice also requires written permission for automated scraping. | [IMDb robots.txt](https://www.imdb.com/robots.txt) |
+| `sofascore.com` | The terms restrict scraping without explicit consent, except as permitted by law. This deployment excludes the domain on that basis; its robots file is not a blanket ban. | [Terms, section 2.9](https://www.sofascore.com/sk/terms-and-conditions), [robots.txt](https://www.sofascore.com/robots.txt) |
 
 The policy-aware extension reuses Scrapy's AutoThrottle calculation and applies
 the resolved site's minimum interval, calculated as `1 / max_qps`. AutoThrottle
@@ -198,6 +217,13 @@ video links to the page's outlinks. Manual bulk crawl results and non-HTML
 responses bypass this enrichment. The former standalone `youtube_extractor.py`
 implementation now lives in the middleware module.
 
+#### X
+
+X uses `allow: false` because the wildcard rules in
+[X's robots.txt](https://x.com/robots.txt) disallow all paths for our crawler.
+The shared dispatcher rejects all X requests before network access, covering
+posts, profiles, and sharing/composer links without a custom middleware.
+
 #### ESPN
 
 `crawler.middlewares.espn.ESPNMiddleware` skips login, members, and personalization
@@ -218,6 +244,49 @@ crawler with a two-CPU quota and 4 GiB RAM, retaining the production middleware,
 HTML parser, and JSON output pipeline. These are measured tuning values, not
 limits published by ESPN; the benchmark did not validate rates for other ESPN
 hosts. Other hosts share the domain slot, so their cooldowns also affect it.
+
+#### Yahoo
+
+`crawler.middlewares.yahoo.YahooMiddleware` identifies requests as
+`WebCrawlerBot/1.0`, suppresses browser navigation headers, and disables cookies.
+It preserves requested URLs and lets Scrapy negotiate supported compression.
+Robots checks, bounded retries, and the shared 429 cooldown remain enabled.
+
+The `yahoo.com` policy enforces a shared concurrency budget of 16 across crawler
+processes and subdomains. All Yahoo hosts inherit an AutoThrottle target of eight
+and nominal 16 QPS, using the `yahoo.com` downloader slot and sharing its
+AutoThrottle delay and 429 cooldown.
+
+A fresh 10,000-URL main-site validation using the current domain policy
+(target eight, shared cap 16, nominal 16 QPS) completed in 1,109.36 seconds with
+9,964 rendered articles (8.98 articles/sec; 9.10 HTTP QPS), no HTTP 429s, no
+cooldowns, and no spider errors. First-half and second-half article rates were
+9.06 and 8.91/sec. Final failures were 27 HTTP 404s, one HTTP 403, and three
+redirect-limit failures; five additional HTML pages fell outside the main-site
+article criterion. All 10,000 inputs completed.
+
+The earlier 3,000-URL run with cap eight recorded 9.30 articles/sec; a separate
+10,000-URL run at nominal 24 QPS recorded 8.07 articles/sec after 29 recovered
+429s. The current validation used previously unrequested, robots-permitted
+`www.yahoo.com` article URLs with normal retries, cooldowns, parsing, and output
+writes enabled. It validates one crawler's main-site throughput; mixed-host and
+multi-process throughput were not measured. Yahoo provided no cache-hit
+classification, so these results do not establish a cache hit/miss rate.
+
+#### Sofascore
+
+The `sofascore.com` domain uses `allow: false` because its
+[terms, section 2.9](https://www.sofascore.com/sk/terms-and-conditions) prohibit
+scraping without explicit consent, except as permitted by law. The shared
+dispatcher blocks the domain and all subdomains, including app-install links,
+for ordinary and manual requests before downloading.
+
+On November 8, 2026, the benchmark host received HTTP 403 JSON from Varnish for
+`www.sofascore.com/robots.txt`; earlier player-page probes received the same
+rejection. No throughput settings were selected from these failures. The
+published [robots rules](https://www.sofascore.com/robots.txt) contain path-specific
+exclusions rather than a wildcard ban on all paths. The domain exclusion reflects
+the terms restriction rather than a blanket robots rule.
 
 ## 5.4 Operational Configuration Coupling
 

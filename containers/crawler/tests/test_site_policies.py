@@ -44,7 +44,7 @@ def test_allow_requires_a_boolean(value, section):
         SitePolicies(document)
 
 
-@pytest.mark.parametrize("domain", ["instagram.com", "facebook.com", "reddit.com"])
+@pytest.mark.parametrize("domain", ["instagram.com", "facebook.com", "reddit.com", "x.com", "imdb.com", "sofascore.com"])
 @pytest.mark.parametrize("prefix", ["", "www.", "developers."])
 @pytest.mark.parametrize("path", ["/page?key=value", "/robots.txt"])
 @pytest.mark.parametrize("manual", [False, True])
@@ -65,6 +65,32 @@ def test_bundled_denials_cover_subdomains_robots_and_manual_jobs(monkeypatch, do
         assert request.meta[key] == value
     assert policies.resolve(domain + ".example.com").allow is True
     assert dispatcher.process_request(Request("https://example.com/article")) is None
+
+
+@pytest.mark.parametrize("manual", [False, True])
+def test_bundled_sofascore_denial_covers_app_links_and_redirects(monkeypatch, manual):
+    root = Path(__file__).resolve().parents[1]
+    monkeypatch.syspath_prepend(str(root))
+    monkeypatch.chdir(root)
+    policies = SitePolicies.load()
+    dispatcher = SiteMiddlewareDispatcher(policies)
+    meta = {"manual_bulk_crawl_job_id": "job", "manual_bulk_crawl_index": 7} if manual else {}
+    for path in ("/robots.txt", "/nixz/header?deep_link_value=https%3A%2F%2Fwww.sofascore.com%2Fteam%2F153474"):
+        request = Request("https://app.sofascore.com" + path, meta=meta)
+        with pytest.raises(IgnoreRequest, match="disabled by site policy"):
+            dispatcher.process_request(request)
+        assert "download_slot" not in request.meta
+        for key, value in meta.items():
+            assert request.meta[key] == value
+    # Publisher redirects into either the main site or app host are rejected.
+    initial = Request("https://example.com/football")
+    dispatcher.process_request(initial)
+    for host in ("sofascore.com", "www.sofascore.com", "app.sofascore.com", "landing.sofascore.com"):
+        assert policies.resolve(host).allow is False
+        redirected = redirect(initial, f"https://{host}/")
+        with pytest.raises(IgnoreRequest, match="disabled by site policy"):
+            dispatcher.process_request(redirected)
+    assert policies.resolve("app.sofascore.com.example.com").allow is True
 
 
 def test_redirect_to_denied_domain_stops_before_site_handler():

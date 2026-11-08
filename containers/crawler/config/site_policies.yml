@@ -36,6 +36,12 @@ domains:
   youtube.com:
     middleware: crawler.middlewares.youtube.YouTubeMiddleware
 
+  x.com:
+    allow: false
+
+  imdb.com:
+    allow: false
+
   instagram.com:
     allow: false
 
@@ -45,12 +51,22 @@ domains:
   reddit.com:
     allow: false
 
+  sofascore.com:
+    allow: false
+
   espn.com:
     middleware: crawler.middlewares.espn.ESPNMiddleware
     request_limits:
       target_concurrent_requests: 32
       max_concurrent_requests: 16
       max_qps: 64
+
+  yahoo.com:
+    middleware: crawler.middlewares.yahoo.YahooMiddleware
+    request_limits:
+      target_concurrent_requests: 8
+      max_concurrent_requests: 16
+      max_qps: 16
 
 hosts:
   01282.com:
