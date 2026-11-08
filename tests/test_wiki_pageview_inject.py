@@ -297,6 +297,25 @@ class ScorerManualPriorityTest(unittest.TestCase):
     def test_steering_path_skips_manual_priority(self):
         self.assertIn("(url_score IS NULL OR url_score <= 1.0)", self._picked_sql(True))
 
+    def test_fetch_listing_sends_user_agent(self):
+        from unittest.mock import patch, MagicMock
+        from scripts.wiki_pageview_inject import fetch_listing, DEFAULT_USER_AGENT
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = b"<html>listing</html>"
+            mock_resp.__enter__.return_value = mock_resp
+            mock_urlopen.return_value = mock_resp
+            fetch_listing("https://dumps.wikimedia.org/test")
+            self.assertEqual(mock_urlopen.call_count, 1)
+            req = mock_urlopen.call_args[0][0]
+            self.assertEqual(req.headers.get("User-agent"), DEFAULT_USER_AGENT)
+
+    def test_download_request_includes_user_agent(self):
+        from scripts.wiki_pageview_inject import download_request, DEFAULT_USER_AGENT
+        req = download_request("https://dumps.wikimedia.org/dump.bz2", 100)
+        self.assertEqual(req.headers.get("User-agent"), DEFAULT_USER_AGENT)
+        self.assertEqual(req.headers.get("Range"), "bytes=100-")
+
 
 if __name__ == "__main__":
     unittest.main()
