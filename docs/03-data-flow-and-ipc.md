@@ -94,9 +94,26 @@ Notes:
   "parent_page_score": 0.5,
   "inlink_count_approx": 1,
   "inlink_count_external": 0,
-  "anchor_text": "click here"
+  "anchor_text": "click here",
+  "url_priority": null,
+  "source": 0
 }
 ```
+
+`url_priority` / `source` are set only for crawler outlinks that carry a
+`priority` field. Today only `containers/crawler/crawler/middlewares/youtube.py`
+sets it, as `priority = 1 + min(subscribers / 10M, 1)` for channels whose page
+shows a subscriber count of at least 10K; each such channel gets its uploads
+playlist (`/playlist?list=UU…`), home (`/channel/UC…`) and `/channel/UC…/playlists`
+URLs, and playlists (`PL…` / `OLAK5uy_…`) listed on that channel's own pages
+inherit the same priority. Other channels and playlists are emitted without a
+priority and ranked by the model like any outlink. The router accepts values in `(1.0, 2.0]` and tags them
+`source = 4` (`SOURCE_YOUTUBE_CHANNEL`). The ingestor skips the inline ranker
+for these rows and writes `url_score = url_priority`, `url_score_updated_at =
+now()`, `source = 4`; on conflict it only raises the score of `source` 0/4 rows,
+never lowering a score or touching golden (1), pageview (2) or patrol (3) rows.
+Because `url_score > 1`, the background ranker never rescores them. Design
+and rationale: [09-youtube-discovery.md](./09-youtube-discovery.md).
 
 The single canonical builder for this record lives at
 `libs/ipc/new_link_record.py:build_new_link_record(...)`. Both the
@@ -344,7 +361,8 @@ Responsibilities:
   concurrently without file locks.
 - Configure `MANUAL_BULK_CRAWL_SCHEDULING_POLICY` and
   `MANUAL_BULK_CRAWL_SHARE_PERCENT` on the crawler (both passed through
-  Compose); restart crawlers after changing them. The default is `weighted`
+  Compose). Apply changes with a queue-preserving rollout; memory-backed crawlers
+  must drain or persist pending work before a restart. The default is `weighted`
   with a share of 50. This crawler-wide setting applies to all jobs, including
   already queued requests; jobs and requests carry no dispatch policy.
   Each crawler has two scheduler queues: normal and manual.
@@ -368,8 +386,11 @@ Responsibilities:
   by `MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS` (default 64), overridable with
   `CRAWLER_MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS`.
 - Admit manual jobs in submission order up to the active-job limit, then group
-  their unfinished URLs by Scrapy downloader slot (normally hostname). Within a
-  slot, preserve submission order and original URL indexes. Across slots, prefer
+  their unfinished URLs by Scrapy downloader slot (normally hostname). In a
+  configured shared slot, such as `wikipedia`, language hosts share pending and
+  outstanding counts and the same dispatch cap. Slot names resolve through site
+  policies, including exact host overrides. Within a slot, preserve submission
+  order and original URL indexes. Across slots, prefer
   the longest estimated remaining service time: remaining URLs divided by
   estimated QPS. QPS is estimated as `1 / max(delay, latency / concurrency)`,
   using live downloader slot settings when available, otherwise crawler settings
@@ -377,22 +398,24 @@ Responsibilities:
   exponentially smoothed `download_latency` from responses (20% new sample).
   A slot's prefetch cap is its concurrency, but with a delay it is at most
   `ceil(latency / delay)` plus `MANUAL_BULK_CRAWL_HOST_HEADROOM` (default 1):
-  the slot starts one request per delay, so further requests would only wait
-  in the slot and count against `CONCURRENT_REQUESTS`. The cap has no fixed
-  value: AutoThrottle keeps a slot's delay at least `latency / TARGET_CONCURRENCY`,
-  so the cap follows the target (target 2.0 gives 3 with headroom 1, target 4.0
-  gives 5). The manual consumer sets no per-host rate of its own; the slot delay
+  this estimates the work needed to sustain the slot's dispatch rate and limits
+  additional requests waiting against `CONCURRENT_REQUESTS`. `download_latency`
+  measures time to response headers, so this estimate can under-admit slow or
+  streamed response bodies; it is not a measurement of complete transfer time.
+  With matching latency/delay estimates the cap follows the adaptive target
+  (target 2.0 gives 3 with headroom 1, target 4.0 gives 5). The manual consumer
+  sets no per-host rate of its own; the slot delay
   is the only per-host pacing, the same as for normal requests.
   Among slots below their prefetch cap, select the largest estimated remaining
-  service time, plus a fixed random jitter of less than one second per domain.
+  service time plus a fixed random jitter of less than one second per slot.
   A slot at its cap leaves the queue, so the free capacity goes to smaller
-  slots: a large host cannot hold back a small one, in its own job or another.
+  slots in this job or another.
   An indexed priority queue (`pqdict`) keeps one entry per eligible slot and
   updates its priority in place.
   Each slot's manual outstanding URLs (queued, downloading or retrying), across
-  all jobs, are held to this prefetch cap. Redirects and retries keep the
-  original request's `download_slot`, so they stay on, and are charged to, the
-  original slot until the URL's final result. Refill immediately on
+  all jobs, are held to this prefetch cap. Site middleware resolves redirects
+  against the destination policy; consumer completion releases the original
+  admission slot through `inflight_domains`. Refill immediately on
   completion, and refresh live slot settings on each poll. These are prefetch
   decisions; the shared downloader still enforces actual politeness for both
   normal and manual work. Jobs outside the active window wait for admission.

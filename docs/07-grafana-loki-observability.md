@@ -212,6 +212,17 @@ Events emitted by the offerer:
 | `offer.refill` | One per scan cycle. Includes `picked_urls`, `new_domains`. |
 | `offer.error` | DB / disk error path. |
 
+`offer.refill.elapsed_sec` measures the full scan/refill work, excluding the
+configured sleep. `offer.peek_shard` reports `shard_id`, `elapsed_sec`, and
+`candidates_returned` for each production candidate query. `offer.peek` is emitted
+after claims and includes `peek_elapsed_sec` and `claim_publish_elapsed_sec` to
+separate candidate-selection time from claiming/publishing time. Domain files
+are published as each claim commits; polling between cycles remains 60 s.
+
+If crawler QPS rises in bursts then decays, compare refill events with
+`spider.heartbeat.active_domains`, `pending`, `transferring`, and
+`scraper_active_size_ratio`.
+
 Events emitted by ingestor / router (`ingest.*`, `route.*`) are similar
 in shape — see the call sites in `containers/scheduler_ingest/` for the
 exact fields.

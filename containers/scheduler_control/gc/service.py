@@ -60,22 +60,20 @@ class FrontierGCService:
         sample (estimated pending over half the cap, leaving noise headroom),
         plus every currently frozen domain so drained ones can be unfrozen."""
         tcur = self._tcur(shard_id)
+        # YSQL does not support TABLESAMPLE, so this is an exact count instead
+        # of a sample-based estimate (sample_percent is unused here as a
+        # result; it still applies to scripts/oneoff_drop_trap_frontier.py).
         sql = text(f"""
-            WITH s AS (
-                SELECT domain_id, count(*) AS c
-                FROM {tcur} TABLESAMPLE SYSTEM (:pct)
-                WHERE should_crawl = TRUE
-                GROUP BY domain_id
-            )
-            SELECT domain_id FROM s
-            WHERE c::float / (:pct / 100.0) > (:cap / 2.0)
+            SELECT domain_id, count(*) AS c
+            FROM {tcur}
+            WHERE should_crawl = TRUE
+            GROUP BY domain_id
+            HAVING count(*) > (:cap / 2.0)
         """)
         with self.Session() as sess:
             sampled = {
                 r[0]
-                for r in sess.execute(
-                    sql, {"pct": self.cfg.sample_percent, "cap": self.cfg.frontier_cap}
-                ).fetchall()
+                for r in sess.execute(sql, {"cap": self.cfg.frontier_cap}).fetchall()
             }
             frozen = {
                 r[0]
@@ -136,15 +134,18 @@ class FrontierGCService:
     def _evict(self, shard_id: int, where: str, params: dict) -> int:
         """Delete one trickle batch matching `where`, return rows removed."""
         tcur = self._tcur(shard_id)
+        # url is the real PK of this table; ctid is not available on all
+        # PG-wire-compatible targets (e.g. YSQL), so the batch is identified
+        # by url instead of the system column.
         sql = text(f"""
             WITH picked AS (
-                SELECT ctid FROM {tcur}
+                SELECT url FROM {tcur}
                 WHERE {where}
                 ORDER BY first_seen
                 LIMIT :batch
                 FOR UPDATE SKIP LOCKED
             )
-            DELETE FROM {tcur} WHERE ctid IN (SELECT ctid FROM picked)
+            DELETE FROM {tcur} WHERE url IN (SELECT url FROM picked)
         """)
         params = {**params, "batch": self.cfg.batch_size}
         with self.Session() as sess:
@@ -187,8 +188,17 @@ class FrontierGCService:
     def run_once(self) -> None:
         totals = {"froze": 0, "unfroze": 0, "frozen_evicted": 0, "stale_evicted": 0}
         for shard_id in range(self.cfg.total_shards):
-            f = self._refresh_freeze(shard_id)
-            e = self._evict_shard(shard_id)
+            # Isolate per shard: a single failing shard must not abort the
+            # whole daily pass and leave every other shard unprocessed.
+            try:
+                f = self._refresh_freeze(shard_id)
+                e = self._evict_shard(shard_id)
+            except Exception as ex:
+                logger.error(
+                    "gc.shard_error",
+                    extra={"event": "gc.shard_error", "shard_id": shard_id, "error": str(ex)},
+                )
+                continue
             for k, v in {**f, **e}.items():
                 totals[k] += v
         logger.info("gc.run_once", extra={"event": "gc.run_once", **totals})

@@ -290,6 +290,7 @@ class OffererService:
             slots_to_fill * self.cfg.peek_multiplier,
             self.cfg.peek_hard_cap,
         )
+        peek_started = time.monotonic()
         try:
             candidates = self.selector.peek_global_candidates(
                 limit=peek_limit,
@@ -323,6 +324,8 @@ class OffererService:
                 "shard_picked_urls": {},
             }
 
+        peek_elapsed_sec = time.monotonic() - peek_started
+        claim_started = time.monotonic()
         new_domains: dict[int, list[str]] = {}
         domain_counter: dict[int, int] = defaultdict(int)
         shard_domain_counter: dict[int, int] = defaultdict(int)
@@ -361,6 +364,9 @@ class OffererService:
                 skipped_empty += 1
                 continue
             new_domains[cand.domain_id] = urls
+            # Each claim is committed by the selector. Publish it immediately
+            # so the crawler can consume it while later domains are claimed.
+            self._write_domain_file(queue_dir, cand.domain_id, urls)
             if cand.shard_id not in shard_url_counter:
                 visited_shards.append(cand.shard_id)
             domain_counter[cand.domain_id] += len(urls)
@@ -378,6 +384,8 @@ class OffererService:
                 "skipped_empty": skipped_empty,
                 "slots_requested": slots_requested,
                 "slots_filled": len(new_domains),
+                "peek_elapsed_sec": round(peek_elapsed_sec, 3),
+                "claim_publish_elapsed_sec": round(time.monotonic() - claim_started, 3),
             },
         )
 
@@ -408,11 +416,7 @@ class OffererService:
             slots_requested=slots_requested,
         )
 
-        written = 0
-        for domain_id, urls in new_domains.items():
-            self._write_domain_file(queue_dir, domain_id, urls)
-            written += 1
-
+        written = len(new_domains)
         self.stats.write(
             source="offerer",
             counters={
@@ -451,11 +455,13 @@ class OffererService:
     def run_forever(self) -> None:
         while True:
             try:
+                started = time.monotonic()
                 res = self._refill_once_if_needed()
                 logger.info(
                     "offer.refill",
                     extra={
                         "event": "offer.refill",
+                        "elapsed_sec": round(time.monotonic() - started, 3),
                         "action": res.get("action"),
                         "queue_dir": res.get("queue_dir"),
                         "current_domains": res.get("current_domains"),

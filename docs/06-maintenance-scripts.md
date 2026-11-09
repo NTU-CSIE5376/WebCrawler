@@ -18,14 +18,39 @@ uv run scripts/migrate_add_source.py [--dry-run]
 
 - Recurring job (intended weekly).
 - Force-injects golden set URLs older than 4 weeks from metricdb into crawlerdb.
-- Shard resolution: goes through `libs.db.sharding.key.compute_shard` (single source of truth), which honors `domain_overrides` in `ingest.yaml` and `split_etld1` in `shard_split.yaml`; overrides for split eTLD+1s are stripped automatically.
+- Shard resolution: uses `ShardRouter.route()` on the full URL, matching the normal router's domain key **and** shard. It honors `domain_overrides` in `ingest.yaml` and the live `shard_split_subdomain` table, and supports IP hostnames. Do not reduce a split hostname to its parent domain before routing.
 - Writes to `domain_state`, `url_state_current_{shard}`, `url_state_history_{shard}`.
 - Existing rows are flipped to `source = 1` so golden set membership is identifiable. New rows are also mirrored into history (matches `db_ops.process_link`).
+- Google's `srsltid` is stripped before injecting (`libs.urls.strip_srsltid`); a URL with and without `srsltid` counts as the same page. If crawlerdb only holds the `srsltid` form, that row is marked golden instead of inserting the stripped URL, so the page is not stored or fetched twice.
 - Does not write to metricdb.
+- New URLs are explicitly pending (`should_crawl = TRUE`); existing URLs keep their crawl state. This is not a force-recrawl command for previously scheduled/fetched URLs.
+- Writes at most `--commit-interval` valid inputs per transaction (default 1,000), with bulk SQL grouped by shard. A default 0.5-second pause between batches limits the added write load.
+- Transient connection, serialization, deadlock and timeout errors reopen the connection and retry the whole uncommitted batch (at most eight retries by default). Permanent schema/data errors fail visibly. A failed attempt's domain IDs are never retained in the cache.
+- `/data/ipc/maintenance/golden_inject/` is the default persistent state directory. Cron and manual runs **must use the same directory**: `run.lock` prevents overlap; `checkpoint.json` advances only after a successful database commit. An interrupted matching input/routing plan resumes; changing the plan restarts a safe idempotent scan. A completed run starts fresh on the next invocation so deleted rows can be restored.
+- A lost commit acknowledgement may cause a safe replay to be reported as “marked” instead of “new”. Verify persisted rows independently; do not treat those classification counters as an exact historical insertion count.
+- `latest-run.json` records completion, counters and skipped metric URL IDs/reasons. Relative links such as `/goto?...` have no target hostname and are reported as skipped, not invented into an absolute URL. The four-week eligibility rule is unchanged.
+- `--dry-run` uses read-only database connections and writes no checkpoint. It validates the plan/routing; its count is not an estimate of how many rows will be newly inserted.
 
 ```bash
-uv run scripts/golden_inject.py [--dry-run]
+python scripts/golden_inject.py --dry-run
+docker compose exec -T -e PYTHONPATH=/app scheduler_ingest \
+  python scripts/golden_inject.py --commit-interval 1000
+
+# host crontab: weekly, Monday 01:00 UTC (09:00 CST on UTC+8 hosts)
+0 9 * * 1 cd /opt/WebCrawler && docker compose exec -T -e PYTHONPATH=/app scheduler_ingest python scripts/golden_inject.py >> /home/r14922138/logs/golden_inject.log 2>&1
 ```
+
+The existing weekly cron needs no new service or container restart. Keep `/data/ipc`
+mounted persistently, and inspect the completion log plus `latest-run.json` after a
+run. If the retry budget is exhausted, rerun the same command to continue from its
+last checkpoint. Do not remove `run.lock` while a process holds it, and do not reset
+or edit a checkpoint while a run is active. Checkpoints contain fingerprints and
+counts, not database passwords or full URL lists. Skipped inputs need a source-data
+fix; retrying an unchanged invalid relative URL will not resolve its destination.
+
+The dedicated `golden_inject` CI job runs both unit tests and real PostgreSQL
+transaction/recovery tests; the three container test jobs alone do not cover these
+root-level tests.
 
 ## 6.3 `migrate_add_discovered_from.py`
 
@@ -162,7 +187,7 @@ Shared constants:
 
 - `NUM_SHARDS = 256`
 - `CRAWLERDB`, `METRICDB`: psycopg2 connection kwargs
-- `SOURCE_NATURAL = 0`, `SOURCE_GOLDEN = 1`, `SOURCE_PAGEVIEW = 2`: values for `url_state_current.source`
+- `SOURCE_NATURAL = 0`, `SOURCE_GOLDEN = 1`, `SOURCE_PAGEVIEW = 2`, `SOURCE_GOLDEN_PARENT_PATROL = 3`, `SOURCE_YOUTUBE_CHANNEL = 4`: values for `url_state_current.source` (`4` is written by the ingestor, mirrored in `libs/ipc/new_link_record.py`; see [09-youtube-discovery.md](./09-youtube-discovery.md))
 
 The `DISCOVERY_SOURCE_*` constants for the "new outlink candidate" IPC
 record live in `libs/ipc/new_link_record.py` (`DISCOVERY_SOURCE_UNKNOWN = 0`,
@@ -327,14 +352,35 @@ uv run scripts/oneoff_drop_trap_frontier.py --execute --include-history
 
 ## 6.17 `wiki_pageview_inject.py`
 
-- Recurring job (intended weekly).
-- Downloads the latest available Wikimedia `pageview_complete` automated dump, extracts the top pageview URLs, and injects them into crawlerdb with pageview-derived `url_score`.
-- Stores dump and extracted artifacts under `/data/wiki_pageviews/` by default instead of the process working directory. `docker-compose.yml` mounts the same host path into `scheduler_ingest` for compose-run maintenance jobs.
-- Downloads to `*.part`, resumes incomplete dumps with HTTP `Range` requests, validates the compressed bzip2 dump, then atomically renames it into place. Transient Wikimedia/network failures keep resumable partial files and retry with exponential backoff.
-- Writes extracted top files through `*.part` and atomically renames them after validating the extracted rows.
-- Applies retention cleanup to old `pageviews-*-automated.bz2`, `top*_pageviews_*.txt`, and stale `*.part` artifacts. Default retention is 45 days; use `--retention-days` or `--no-cleanup` to adjust.
+- Recurring job, **weekly**. Each run uses one day of traffic: Wikimedia publishes the previous day's `pageview_complete` dump around 02:30 UTC, and the script picks the newest available one.
+- Ranks by the `user` agent dump (human traffic) by default; `--agent automated` (bot traffic) is kept only for comparison. Views are summed across access methods per article, only `*.wikipedia` projects are kept, and non-article titles (`-`, `Special:*`) are dropped.
+- Injects the top `--top-k` articles (default 1,000,000; zh articles expand to 7 URL variants) as scheduler priority: `url_score = 1 + views / max_views` plus `url_score_updated_at = NOW()`, which places them above ranker scores and below golden URLs.
+- Each run the whole top-K list is compared against crawlerdb in the same upsert: new URLs are inserted (`should_crawl` defaults to TRUE); URLs never fetched successfully (`last_fetch_ok IS NULL`) are put back on the schedule (`should_crawl = TRUE`) unless they were scheduled within the last day or have 3+ consecutive failures; already-crawled URLs and golden rows are not modified.
+- Writes the injected URLs to `priority_{date}_{agent}.txt`. On the next run, URLs from the newest earlier list that are no longer in the top K are handed back to the ranker (`url_score`/`url_score_updated_at` reset to NULL) in the same transaction. If no earlier list exists the script warns and skips this step.
+- Why K = 1M: in a batch 18/19 backtest (645 golden Wikipedia URLs pending in crawlerdb), ordering wikipedia.org's ~14K URLs/day by pageview crawls more pending golden URLs than the ranker at every budget from 1 to 60 days (36% vs 9% after 7 days, 66% vs 41% after 60 days). Cutting the list at a smaller K and handing the rest to the ranker never helped: after 60 days K=100K reaches 54% and K=300K 59%, against 66% for pageview order alone. The backtest uses one static list; with the weekly refresh, newly trending articles enter at high scores and are crawled first, so K mainly bounds how much of the wiki budget pageview can take from the ranker.
+- Stores dump, top, and priority files under `/data/wiki_pageviews/` by default. Downloads to `*.part`, resumes incomplete dumps with HTTP `Range` requests, validates the compressed bzip2 dump, then atomically renames it into place. Transient Wikimedia/network failures keep resumable partial files and retry with exponential backoff.
+- Deletes earlier dumps as soon as this run's top list is extracted (a `user` dump is ~730 MB).
+- Applies retention cleanup to old dumps, `top*_pageviews_*` files, priority lists, and stale `*.part` artifacts. Default retention is 45 days, which keeps the previous run's priority list for the demotion step; use `--retention-days` or `--no-cleanup` to adjust (keep it above the run interval, or demotion is skipped).
 
 ```bash
-uv run scripts/wiki_pageview_inject.py [--dry-run] [--skip-inject]
-docker compose exec scheduler_ingest python scripts/wiki_pageview_inject.py --retention-days 30
+uv run scripts/wiki_pageview_inject.py [--dry-run] [--skip-inject] [--top-k 100000] [--agent user]
+docker compose exec scheduler_ingest python scripts/wiki_pageview_inject.py
+
+# host crontab: weekly, Monday 04:30 UTC (12:30 CST on UTC+8 hosts)
+# Note: runs after Monday 01:00 UTC golden_inject and after Wikimedia's 02:30 UTC dump release.
+30 12 * * 1 cd /opt/WebCrawler && docker compose exec -T -e PYTHONPATH=/app scheduler_ingest python scripts/wiki_pageview_inject.py --data-dir /data/ipc/wiki_pageviews >> /home/r14922138/logs/wiki_pageview_inject.log 2>&1
+```
+
+## 6.18 `trap_filter_golden_check.py`
+
+- Reads the ingest trap filter's audit logs (`/data/ipc/trap_filter/ingestor_*/YYYY-MM-DD.jsonl.gz`, one JSON object per dropped / normalized / would-be-normalized discovery link: `ts`, `action` (`drop`, `normalize`, `would_normalize`), `url`, `normalized_url`, `would_normalize_url`, `rules`, `domain_id`, `shard_id`, `discovered_from`) and checks them against the golden set (metricdb `metric_url`, read-only, or `--golden-file`).
+- Golden URLs are also matched by their normalized form: metricdb stores them as copied from search results (often with `srsltid`), while the crawler discovers the clean URL. `golden_inject.py` strips `srsltid` on its side (#103), so both converge on the same row. Rule definitions and validation: [10-frontier-trap-rules.md](10-frontier-trap-rules.md).
+- Reports per rule: drop events, distinct golden URLs dropped, and the false-kill rate (`golden dropped / golden total`). Golden URLs that were only normalized are listed separately: the stripped URL is still inserted, so they are not kills. Golden URLs that shadow normalization would rewrite (`WOULD_NORMALIZE`) show what widening `normalize_params` would touch.
+- Streams the logs; only the golden set is held in memory. `--out DIR` writes `summary.csv` and `golden_hits.csv` (each golden hit with its rules, parent URL and first timestamp).
+- Baseline before rollout: running the filter over the 138,459 metricdb golden URLs drops 4 (0.0029%), normalizes 1,290 (`srsltid`) and shadow-logs 38 (`utm_*`, `_gl`, `;jsessionid=`, …).
+- Log volume: inflow is logged before the DB existence check, so a trap URL rediscovered in many folders is logged each time. Delete old log files by hand once the review is done.
+
+```bash
+docker compose exec scheduler_ingest python scripts/trap_filter_golden_check.py --since 2026-11-01 --out /data/ipc/trap_filter/report
+python scripts/trap_filter_golden_check.py --log-dir ./trap_filter --golden-file golden_urls.csv
 ```

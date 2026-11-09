@@ -7,16 +7,24 @@ from libs.ipc.jsonio import read_json, read_jsonl
 from libs.stats.delta_writer import StatsDeltaWriter
 
 from .db_ops import IngestDB, IngestResult, BATCH_SIZE
+from .trap_filter import TrapFilter
 
 
 logger = logging.getLogger("ingestor")
 
 
 class IngestService:
-    def __init__(self, ingestor_id: int, db: IngestDB, stats: StatsDeltaWriter):
+    def __init__(
+        self,
+        ingestor_id: int,
+        db: IngestDB,
+        stats: StatsDeltaWriter,
+        trap_filter: TrapFilter | None = None,
+    ):
         self.ingestor_id = ingestor_id
         self.db = db
         self.stats = stats
+        self.trap_filter = trap_filter
 
     def _accumulate_result(self, result, counters, domains):
         if isinstance(result, bool):
@@ -68,28 +76,42 @@ class IngestService:
         link_recs = self.db.aggregate_links(
             [r for r in all_recs if r.get("status") == "new"]
         )
+        trap_dropped = url_normalized = url_would_normalize = 0
+        if self.trap_filter is not None:
+            link_recs, fstats = self.trap_filter.apply(link_recs)
+            trap_dropped, url_normalized = fstats.dropped, fstats.normalized
+            url_would_normalize = fstats.would_normalize
+            if url_normalized:
+                # Stripped variants of one page collapse into a single row.
+                link_recs = self.db.aggregate_links(link_recs)
         result_recs = [r for r in all_recs if r.get("status") != "new"]
 
         # Links before results: a url that appears as both discovery and crawl
         # result needs its domain_score set before the result UPSERT runs.
         for batch_recs in (link_recs, result_recs):
-            for i in range(0, len(batch_recs), BATCH_SIZE):
-                batch = batch_recs[i : i + BATCH_SIZE]
-                try:
-                    results = self.db.process_batch(batch)
-                    for result in results:
-                        self._accumulate_result(result, counters, domains)
-                except Exception as e:
-                    logger.error(
-                        "ingest.batch_error",
-                        extra={
-                            "event": "ingest.batch_error",
-                            "error": str(e),
-                            "batch_size": len(batch),
-                        },
-                    )
-                    counters["error_count"] += len(batch)
-                    counters["ingest_error"] += len(batch)
+            # Fill each shard's batches before moving to the next shard. Slicing
+            # mixed shards first repeats lookups and scoring for small groups.
+            recs_by_shard = defaultdict(list)
+            for rec in batch_recs:
+                recs_by_shard[int(rec["shard_id"])].append(rec)
+            for shard_recs in recs_by_shard.values():
+                for i in range(0, len(shard_recs), BATCH_SIZE):
+                    batch = shard_recs[i : i + BATCH_SIZE]
+                    try:
+                        results = self.db.process_batch(batch)
+                        for result in results:
+                            self._accumulate_result(result, counters, domains)
+                    except Exception as e:
+                        logger.error(
+                            "ingest.batch_error",
+                            extra={
+                                "event": "ingest.batch_error",
+                                "error": str(e),
+                                "batch_size": len(batch),
+                            },
+                        )
+                        counters["error_count"] += len(batch)
+                        counters["ingest_error"] += len(batch)
 
         domains.pop(None, None)
         self.stats.write(
@@ -107,6 +129,9 @@ class IngestService:
                 "num_fetch_fail": counters.get("num_fetch_fail", 0),
                 "num_content_update": counters.get("num_content_update", 0),
                 "new_links": counters.get("new_links", 0),
+                "trap_dropped": trap_dropped,
+                "url_normalized": url_normalized,
+                "url_would_normalize": url_would_normalize,
             },
         )
 

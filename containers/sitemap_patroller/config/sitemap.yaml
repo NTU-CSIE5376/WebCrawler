@@ -3,7 +3,7 @@
 
 postgres:
   # psycopg2 DSN. Sitemap workers use psycopg2 directly, no SQLAlchemy.
-  dsn: "postgresql://crawler:crawler@172.16.191.1:5432/crawlerdb"
+  dsn: "postgresql://yugabyte:yugabyte@172.16.191.3:5433/crawlerdb"
 
 # Path to scheduler_ingest's config — patrol needs `router.num_shards`,
 # `router.shards_per_ingestor`, `router.ingestor_dir_template`,

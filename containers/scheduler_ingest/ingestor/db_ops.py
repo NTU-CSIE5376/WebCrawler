@@ -6,14 +6,25 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+import psycopg2
 from psycopg2.extras import execute_values
+from sqlalchemy.dialects.postgresql.psycopg2 import PGDialect_psycopg2
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import sessionmaker
+from tenacity import before_sleep_log, retry, retry_if_exception, stop_after_attempt, wait_exponential
 
+from libs.db.sharding.history_partition import ensure_partitions, missing_partition_target
+from libs.ipc.new_link_record import SOURCE_NATURAL, SOURCE_YOUTUBE_CHANNEL
 from libs.scoring.golden_discovery_runtime import GoldenDiscoveryRuntimeScorer
 
-
 LOGGER = logging.getLogger("ingestor")
+_DIALECT = PGDialect_psycopg2(dbapi=psycopg2)
 EXISTING_URL_LOOKUP_BATCH_SIZE = 50000
+
+# discovery_frozen is flipped by the GC service on a slow cadence, so a short
+# per-process cache saves one domain_state round trip per shard per batch.
+FROZEN_DOMAIN_CACHE_TTL_SEC = 300.0
+FROZEN_DOMAIN_CACHE_MAX = 200_000
 
 
 @dataclass
@@ -29,6 +40,21 @@ BATCH_SIZE = 2000
 
 # Catches already-queued oversized urls that bypassed the spider-side filter.
 MAX_URL_LEN = 2500
+
+
+def _connection_error(exc: Exception, raw_connection=None) -> bool:
+    """YugabyteDB-only retry predicate for this ingestor's YSQL/psycopg2 connection."""
+    original = exc.orig if isinstance(exc, DBAPIError) else exc
+    sqlstate = getattr(original, "pgcode", None)
+    if sqlstate:
+        if sqlstate == "08007":  # Transaction resolution unknown: do not replay.
+            return False
+        return sqlstate.startswith("08") or sqlstate in {"57P01", "57P02", "57P03"}
+    if isinstance(exc, DBAPIError) and exc.connection_invalidated:
+        return True
+    if raw_connection is None and isinstance(original, psycopg2.OperationalError):
+        return True  # Connection acquisition failed; no transaction exists yet.
+    return _DIALECT.is_disconnect(original, raw_connection, None)
 
 ROBOTS_UNKNOWN = 0
 ROBOTS_ALLOWED = 1
@@ -138,6 +164,16 @@ def _prefer_higher_parent(dst: dict, src: dict) -> None:
         dst["discovery_source_type"] = src.get("discovery_source_type")
 
 
+def _prefer_higher_priority(dst: dict, src: dict) -> None:
+    """Keep the highest crawler-assigned url_priority (and its source) seen
+    for a url; records without one never clear it."""
+    new_p = src.get("url_priority")
+    cur_p = dst.get("url_priority")
+    if new_p is not None and (cur_p is None or new_p > cur_p):
+        dst["url_priority"] = new_p
+        dst["source"] = src.get("source", SOURCE_NATURAL)
+
+
 class IngestDB:
     def __init__(
         self,
@@ -150,6 +186,8 @@ class IngestDB:
         self.inline_ranker = inline_ranker
         self.inline_score_timeout_sec = inline_score_timeout_sec
         self.inline_score_batch_size = max(1, inline_score_batch_size)
+        # domain_id -> (is_frozen, monotonic time it was read)
+        self._frozen_cache: dict[int, tuple[bool, float]] = {}
 
     def _tcur(self, shard_id: int) -> str:
         return f"url_state_current_{shard_id:03d}"
@@ -175,17 +213,44 @@ class IngestDB:
             existing.update(row[0] for row in cur.fetchall())
         return existing
 
+    def _url_hashes(self, cur, table: str, urls: list[str]) -> dict[str, str | None]:
+        """content_hash of every url already in `table` (None-valued when the
+        row exists without a hash). Keys double as the existence set."""
+        if not urls:
+            return {}
+
+        found: dict[str, str | None] = {}
+        for chunk in self._chunks(urls, EXISTING_URL_LOOKUP_BATCH_SIZE):
+            cur.execute(f"SELECT url, content_hash FROM {table} WHERE url = ANY(%s)", (chunk,))
+            found.update(cur.fetchall())
+        return found
+
     def _frozen_domains(self, cur, domain_ids: set[int]) -> set[int]:
         """Domains whose frontier the GC service has frozen: stop inserting
-        their newly discovered links so the backlog cannot keep growing."""
+        their newly discovered links so the backlog cannot keep growing.
+        Answers are cached for FROZEN_DOMAIN_CACHE_TTL_SEC."""
         if not domain_ids:
             return set()
-        cur.execute(
-            "SELECT domain_id FROM domain_state "
-            "WHERE domain_id = ANY(%s) AND discovery_frozen = TRUE",
-            (list(domain_ids),),
-        )
-        return {row[0] for row in cur.fetchall()}
+        now = time.monotonic()
+        cache = self._frozen_cache
+        # Expired entries are replacements, not additional cache keys.
+        # Invalidate before selecting stale ids so every requested id is refilled.
+        if len(cache) + sum(did not in cache for did in domain_ids) > FROZEN_DOMAIN_CACHE_MAX:
+            cache.clear()
+        stale = [
+            did for did in domain_ids
+            if did not in cache or now - cache[did][1] >= FROZEN_DOMAIN_CACHE_TTL_SEC
+        ]
+        if stale:
+            cur.execute(
+                "SELECT domain_id FROM domain_state "
+                "WHERE domain_id = ANY(%s) AND discovery_frozen = TRUE",
+                (stale,),
+            )
+            frozen_now = {row[0] for row in cur.fetchall()}
+            for did in stale:
+                cache[did] = (did in frozen_now, now)
+        return {did for did in domain_ids if cache[did][0]}
 
     def _score_new_links(self, urls: list[str]) -> tuple[dict[str, float], datetime | None]:
         if not urls:
@@ -326,12 +391,12 @@ class IngestDB:
             if is_ok and content_hash is not None:
                 check_urls.append(url)
 
+        # One lookup serves both the content-hash comparison and the
+        # "newly inserted vs. pre-existing" check (xmax is not available on
+        # all PG-wire-compatible targets, e.g. YSQL).
+        old_hashes = self._url_hashes(cur, tcur, [d["url"] for d in decoded])
+        existing_before = old_hashes.keys()
         if check_urls:
-            cur.execute(
-                f"SELECT url, content_hash FROM {tcur} WHERE url = ANY(%s)",
-                (check_urls,),
-            )
-            old_hashes = dict(cur.fetchall())
             for d in decoded:
                 if d["is_ok"] and d["content_hash"] is not None:
                     if old_hashes.get(d["url"]) != d["content_hash"]:
@@ -396,14 +461,14 @@ class IngestDB:
             WHEN EXCLUDED.robots_bits = {ROBOTS_UNKNOWN} THEN {tcur}.robots_bits
             ELSE EXCLUDED.robots_bits
           END
-        RETURNING {", ".join(_HIST_COLS)}, (xmax = 0) AS inserted
+        RETURNING {", ".join(_HIST_COLS)}
         """
         returned = execute_values(
             cur, upsert_sql, upsert_rows, page_size=len(upsert_rows), fetch=True,
         )
 
         if returned:
-            history_rows = [row[:-1] for row in returned]  # drop trailing 'inserted' flag
+            history_rows = [row for row in returned]
             execute_values(
                 cur,
                 f"INSERT INTO {this} ({', '.join(_HIST_COLS)}) VALUES %s",
@@ -471,8 +536,7 @@ class IngestDB:
                 (list(ok_domain_ids),),
             )
 
-        # xmax = 0 in RETURNING means the row was inserted, not updated.
-        inserted_flags = {row[0]: row[-1] for row in returned}
+        inserted_flags = {d["url"]: d["url"] not in existing_before for d in decoded}
         return [
             (d["idx"], IngestResult(
                 new_link=bool(inserted_flags.get(d["url"], False)),
@@ -512,6 +576,7 @@ class IngestDB:
                 by_url[url]["inlink_count_approx"] += inc_approx
                 by_url[url]["inlink_count_external"] += inc_external
                 _prefer_higher_parent(by_url[url], rec)
+                _prefer_higher_priority(by_url[url], rec)
                 dup_results.append((idx, False))
             else:
                 first_idx_by_url[url] = idx
@@ -540,34 +605,52 @@ class IngestDB:
         if not unique_items:
             return dup_results + frozen_results
 
+        # xmax is not available on all PG-wire-compatible targets (e.g. YSQL),
+        # so "newly inserted vs. pre-existing" is determined from a pre-upsert
+        # existence check rather than RETURNING ... (xmax = 0). The same
+        # lookup also tells the inline ranker which urls are new.
+        existing_before = self._existing_urls(cur, tcur, [rec["url"] for _, rec in unique_items])
+
         score_by_url: dict[str, float] = {}
         score_updated_at = None
         if self.inline_ranker is not None:
-            unique_urls = [rec["url"] for _, rec in unique_items]
+            # Crawler-assigned priorities bypass the model.
+            unique_urls = [
+                rec["url"] for _, rec in unique_items if rec.get("url_priority") is None
+            ]
             if self.inline_score_timeout_sec > 0:
-                existing_urls = self._existing_urls(cur, tcur, unique_urls)
-                score_urls = [url for url in unique_urls if url not in existing_urls]
+                score_urls = [url for url in unique_urls if url not in existing_before]
             else:
                 score_urls = unique_urls
             score_by_url, score_updated_at = self._score_new_links(score_urls)
 
+        priority_at = datetime.now(timezone.utc)
         link_rows = []
         for _, rec in unique_items:
             url = rec["url"]
-            scored = url in score_by_url
+            priority = rec.get("url_priority")
+            if priority is not None:
+                url_score, url_score_at = float(priority), priority_at
+                source = int(rec.get("source", SOURCE_YOUTUBE_CHANNEL))
+            else:
+                scored = url in score_by_url
+                url_score = float(score_by_url.get(url, 0.0))
+                url_score_at = score_updated_at if scored else None
+                source = SOURCE_NATURAL
             link_rows.append(
                 (
                     url,
                     int(rec["domain_id"]),
                     float(rec.get("domain_score", 0.0)),
-                    float(score_by_url.get(url, 0.0)),
-                    score_updated_at if scored else None,
+                    url_score,
+                    url_score_at,
                     rec.get("discovered_from"),
                     int(rec.get("discovery_source_type", 0)),
                     rec.get("parent_page_score"),
                     int(rec.get("inlink_count_approx", 0)),
                     int(rec.get("inlink_count_external", 0)),
                     (rec.get("anchor_text") or None),
+                    source,
                 )
             )
         # New parent wins only when it has a strictly higher score; a NULL
@@ -577,13 +660,23 @@ class IngestDB:
             f"({tcur}.parent_page_score IS NULL OR "
             f"EXCLUDED.parent_page_score > {tcur}.parent_page_score)"
         )
+        # A crawler-assigned priority may raise an existing natural or YouTube
+        # channel row (e.g. once the channel's subscriber count is known) but
+        # never touches inject-managed rows (golden / pageview / patrol) and
+        # never lowers a score. Natural records carry source 0, so they never
+        # match and leave url_score to the ranker as before.
+        prio = (
+            f"EXCLUDED.source = {SOURCE_YOUTUBE_CHANNEL} AND "
+            f"{tcur}.source IN ({SOURCE_NATURAL}, {SOURCE_YOUTUBE_CHANNEL}) AND "
+            f"EXCLUDED.url_score > COALESCE({tcur}.url_score, 0)"
+        )
         inserted_rows = execute_values(
             cur,
             f"""
             INSERT INTO {tcur}
               (url, domain_id, domain_score, url_score, url_score_updated_at, discovered_from,
                discovery_source_type, parent_page_score,
-               inlink_count_approx, inlink_count_external, anchor_text)
+               inlink_count_approx, inlink_count_external, anchor_text, source)
             VALUES %s
             ON CONFLICT (url) DO UPDATE SET
               inlink_count_approx = {tcur}.inlink_count_approx + EXCLUDED.inlink_count_approx,
@@ -597,14 +690,20 @@ class IngestDB:
               discovery_source_type = CASE WHEN {pref}
                 THEN EXCLUDED.discovery_source_type ELSE {tcur}.discovery_source_type END,
               parent_page_score = CASE WHEN {pref}
-                THEN EXCLUDED.parent_page_score ELSE {tcur}.parent_page_score END
-            RETURNING url, (xmax = 0) AS inserted
+                THEN EXCLUDED.parent_page_score ELSE {tcur}.parent_page_score END,
+              url_score = CASE WHEN {prio}
+                THEN EXCLUDED.url_score ELSE {tcur}.url_score END,
+              url_score_updated_at = CASE WHEN {prio}
+                THEN EXCLUDED.url_score_updated_at ELSE {tcur}.url_score_updated_at END,
+              source = CASE WHEN {prio}
+                THEN EXCLUDED.source ELSE {tcur}.source END
+            RETURNING url
             """,
             link_rows,
             page_size=len(link_rows),
             fetch=True,
         )
-        inserted_set = {row[0] for row in inserted_rows if row[1]}
+        inserted_set = {row[0] for row in inserted_rows} - existing_before
 
         history_rows = [r for r in link_rows if r[0] in inserted_set]
         if history_rows:
@@ -614,7 +713,7 @@ class IngestDB:
                 INSERT INTO {this}
                   (url, domain_id, domain_score, url_score, url_score_updated_at, discovered_from,
                    discovery_source_type, parent_page_score,
-                   inlink_count_approx, inlink_count_external, anchor_text)
+                   inlink_count_approx, inlink_count_external, anchor_text, source)
                 VALUES %s
                 """,
                 history_rows,
@@ -649,16 +748,69 @@ class IngestDB:
                 if not existing.get("anchor_text") and rec.get("anchor_text"):
                     existing["anchor_text"] = rec["anchor_text"]
                 _prefer_higher_parent(existing, rec)
+                _prefer_higher_priority(existing, rec)
         return list(by_url.values())
 
     def process_batch(self, recs: list[dict]) -> list[IngestResult | bool | None]:
+        """Ingest one batch; if it fails only because a ``*_history`` month
+        partition is missing, create that month's partition for every shard in
+        the batch and retry once, so ingestion does not wait on the accounting
+        pass to provision it."""
+        try:
+            return self._process_batch_once(recs)
+        except Exception as e:
+            target = missing_partition_target(str(e))
+            if target is None:
+                raise
+        parent, month = target
+        table = parent[: -len("_000")]
+        shard_ids = {int(rec["shard_id"]) for rec in recs} | {int(parent[-3:])}
+        try:
+            created = ensure_partitions(
+                self.Session, [f"{table}_{sid:03d}" for sid in shard_ids], [month]
+            )
+            LOGGER.warning(
+                "ingest.history_partition_provisioned",
+                extra={
+                    "event": "ingest.history_partition_provisioned",
+                    "table": table,
+                    "month": f"{month:%Y-%m}",
+                    "created": len(created),
+                },
+            )
+        except Exception as e:
+            # Most likely another ingestor created the same partition first;
+            # the retry below tells whether the partition is there now.
+            LOGGER.warning(
+                "ingest.history_partition_provision_error",
+                extra={"event": "ingest.history_partition_provision_error", "error": str(e)},
+            )
+        return self._process_batch_once(recs)
+
+    def _process_batch_once(self, recs: list[dict]) -> list[IngestResult | bool | None]:
+        """Retry transaction execution, but never replay an uncertain commit."""
+        sess, results = self._execute_batch(recs)
+        try:
+            # Keep COMMIT outside Tenacity: a lost acknowledgment may mean the
+            # additive counters were already committed successfully.
+            sess.commit()
+            return results
+        finally:
+            sess.close()
+
+    @retry(
+        retry=retry_if_exception(_connection_error),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=0.2),
+        before_sleep=before_sleep_log(LOGGER, logging.WARNING),
+        reraise=True,
+    )
+    def _execute_batch(self, recs: list[dict]):
         """Group records by (kind, shard_id) and dispatch to bulk paths.
 
-        All-or-nothing: any failure rolls back and re-raises.
-        Returns IngestResult for results, bool for new links, in input order.
+        Each attempt owns a fresh session. On success, return the open session
+        and input-ordered results to _process_batch_once(), which commits and closes.
         """
-        results: list[IngestResult | bool | None] = [None] * len(recs)
-
         results_by_shard: dict[int, list[tuple[int, dict]]] = defaultdict(list)
         links_by_shard: dict[int, list[tuple[int, dict]]] = defaultdict(list)
         for i, rec in enumerate(recs):
@@ -670,15 +822,27 @@ class IngestDB:
             else:
                 results_by_shard[sid].append((i, rec))
 
-        with self.Session.begin() as sess:
-            with sess.connection().connection.cursor() as cur:
-                # Links first so that a URL that appears as both a discovered
-                # link and a crawl result in the same batch is inserted with
-                # its domain_score before the result UPSERT touches it.
+        results: list[IngestResult | bool | None] = [None] * len(recs)
+        raw_connection = None
+        sess = self.Session()
+        try:
+            sess.begin()
+            connection = sess.connection().connection
+            raw_connection = connection.driver_connection
+            with connection.cursor() as cur:
+                # Links first so discovery metadata is set before a matching
+                # crawl result updates the same URL.
                 for sid, items in links_by_shard.items():
                     for idx, ok in self._bulk_links(cur, sid, items):
                         results[idx] = ok
                 for sid, items in results_by_shard.items():
                     for idx, ir in self._bulk_results(cur, sid, items):
                         results[idx] = ir
-        return results
+            return sess, results
+        except Exception as exc:
+            if _connection_error(exc, raw_connection):
+                # Raw cursor calls bypass SQLAlchemy's disconnect handling.
+                sess.invalidate()
+            else:
+                sess.close()  # Roll back non-connection failures normally.
+            raise

@@ -1,9 +1,33 @@
 """Shared URL hostname extraction, validation and canonicalization."""
 from ipaddress import ip_address
-from urllib.parse import urlsplit
+from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
 
 MAX_URL_LEN = 2500
+
+
+def strip_srsltid(url: str) -> str:
+    """Return `url` without Google's `srsltid` tracking parameter.
+
+    Google appends `srsltid` to organic search result links for Merchant
+    Center conversion attribution; the server does not use it to render the
+    page, and every search yields a new value. All other query pieces keep
+    their original encoding and order. Returns `url` unchanged if absent.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    if "srsltid" not in parts.query.lower():
+        return url
+    kept = [
+        piece for piece in parts.query.split("&")
+        if unquote_plus(piece.partition("=")[0]).lower() != "srsltid"
+    ]
+    query = "&".join(kept)
+    if query == parts.query:
+        return url
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
 
 
 def host_of(url: str | None) -> str:
@@ -13,6 +37,26 @@ def host_of(url: str | None) -> str:
     Empty input returns an empty string; malformed URLs may raise ValueError.
     """
     return (urlsplit(url).hostname or "").lower() if url else ""
+
+
+def normalize_hostname(hostname: str) -> str:
+    """Return an IDNA DNS name or canonical IP address, or raise ValueError.
+
+    Accepts bare hostnames, including local names and IPs used in site policies.
+    This does not enforce the public HTTP(S) URL rules in validate_url.
+    """
+    import idna
+
+    if not isinstance(hostname, str):
+        raise ValueError("Hostname must be a string")
+    try:
+        return str(ip_address(hostname))
+    except ValueError:
+        pass
+    try:
+        return idna.encode(hostname, uts46=True, std3_rules=True).decode("ascii").removesuffix(".")
+    except idna.IDNAError as error:
+        raise ValueError(f"Invalid hostname: {hostname!r}") from error
 
 
 def validate_url(url: object, *, max_length: int = MAX_URL_LEN) -> str:

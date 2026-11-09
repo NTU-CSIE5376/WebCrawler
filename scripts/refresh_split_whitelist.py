@@ -168,6 +168,9 @@ def main() -> None:
             else:
                 parents = sorted(overrides.keys())
 
+            parents = [parent for parent in parents
+                       if parent != "wikipedia.org" and not parent.endswith(".wikipedia.org")]
+
             print(f"scope: {len(parents)} parent(s): {', '.join(parents)}")
             print(f"min_fetch_ok: {args.min_fetch_ok:,}\n")
 
