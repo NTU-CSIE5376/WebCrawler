@@ -30,6 +30,7 @@ from libs.urls import strip_srsltid
 
 INJECT_AFTER_WEEKS = 4
 MAX_URL_LEN = 2500
+DEFAULT_COMMIT_INTERVAL = 1000
 # Sentinel url_score that lifts golden URLs above every other source in the
 # offerer's per-domain LATERAL pick (ORDER BY url_score DESC). Must stay above
 # the pageview injection ceiling of 2.0 (1 + pageview/max_pageview, see
@@ -170,6 +171,12 @@ def main():
         action="store_true",
         help="Print what would be done without writing",
     )
+    parser.add_argument(
+        "--commit-interval",
+        type=int,
+        default=DEFAULT_COMMIT_INTERVAL,
+        help=f"Number of URLs between database commits (default: {DEFAULT_COMMIT_INTERVAL})",
+    )
     args = parser.parse_args()
 
     metric_conn = psycopg2.connect(**METRICDB)
@@ -245,6 +252,19 @@ def main():
             else:
                 marked += 1
 
+            if (
+                not args.dry_run
+                and args.commit_interval > 0
+                and (injected + marked + marked_variant) % args.commit_interval == 0
+            ):
+                crawler_conn.commit()
+                log.info(
+                    "Committed progress: %d URLs processed (%d newly injected, %d marked)",
+                    injected + marked + marked_variant,
+                    injected,
+                    marked + marked_variant,
+                )
+
         if not args.dry_run:
             crawler_conn.commit()
 
@@ -259,11 +279,18 @@ def main():
         )
 
     except Exception:
-        crawler_conn.rollback()
+        if not args.dry_run:
+            try:
+                crawler_conn.rollback()
+            except Exception as rollback_err:
+                log.warning("Rollback failed (connection likely already closed): %s", rollback_err)
         raise
     finally:
         metric_conn.close()
-        crawler_conn.close()
+        try:
+            crawler_conn.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
