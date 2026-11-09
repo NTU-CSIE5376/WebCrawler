@@ -11,7 +11,8 @@
 default:
   crawler_mode: autothrottle
   request_limits:
-    max_qps: 4
+    max_qps: 8
+    target_concurrent_requests: 4
     max_concurrent_requests: 16
 
 domains:

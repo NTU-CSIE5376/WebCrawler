@@ -245,12 +245,15 @@ def test_bundled_config_uses_autothrottle_with_wikipedia_minimum(monkeypatch):
     settings = runpy.run_path(str(root / "crawler/settings.py"))
     policies = SitePolicies.load()
     assert settings["CRAWLER_THROTTLE_MODE"] == "autothrottle"
-    assert settings["DOWNLOAD_DELAY"] == 0.25
+    assert settings["DOWNLOAD_DELAY"] == 0.125
     assert policies.resolve("en.wikipedia.org").crawler_mode == "autothrottle"
     assert policies.resolve("en.wikipedia.org").request_limits.max_qps == 15
     assert policies.resolve("en.wikipedia.org").request_limits.target_concurrent_requests == 8
     assert policies.resolve("zh.wikipedia.org").request_limits.target_concurrent_requests == 8
-    assert policies.resolve("example.com").request_limits.target_concurrent_requests is None
+    assert policies.resolve("example.com").request_limits.max_qps == 8
+    assert policies.resolve("example.com").request_limits.target_concurrent_requests == 4
+    assert policies.resolve("www.youtube.com").request_limits.target_concurrent_requests == 4
+    assert policies.resolve("www.youtube.com").request_limits.max_qps == 3
     assert policies.shared_budgets("en.wikipedia.org") == (("domain:wikipedia.org", 8),)
     assert policies.shared_budgets("zh.wikipedia.org") == (("domain:wikipedia.org", 8),)
     assert "crawler.middlewares.shared_concurrency.SharedConcurrencyMiddleware" in settings["DOWNLOADER_MIDDLEWARES"]

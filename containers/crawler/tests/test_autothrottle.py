@@ -80,6 +80,21 @@ def test_domain_target_preserves_error_backoff(throttle, policies):
     assert throttle.target_concurrency == 2
 
 
+def test_yaml_default_target_overrides_global_and_null_restores_fallback(throttle, policies):
+    document = policies.config.model_dump(exclude_unset=True)
+    document["default"]["request_limits"]["target_concurrent_requests"] = 8
+    document["domains"]["wikipedia.org"]["request_limits"]["target_concurrent_requests"] = 4
+    document["hosts"]["slow.wikipedia.org"]["request_limits"]["target_concurrent_requests"] = None
+    throttle.policies = SitePolicies(document)
+
+    for hostname, expected in (("unmatched.org", 0.4), ("en.wikipedia.org", 0.8),
+                               ("slow.wikipedia.org", 1.6), ("unmatched.org", 0.4)):
+        slot = SimpleNamespace(delay=0.01)
+        throttle._adjust_delay(slot, 3.2, Response(f"https://{hostname}/page"))
+        assert slot.delay == pytest.approx(expected)
+        assert throttle.target_concurrency == 2
+
+
 def test_slow_and_error_responses_preserve_scrapy_backoff(throttle):
     slot = SimpleNamespace(delay=0.05)
     throttle._adjust_delay(slot, 2, Response("https://en.wikipedia.org/wiki/Test", status=429))
