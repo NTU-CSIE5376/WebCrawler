@@ -18,19 +18,39 @@ uv run scripts/migrate_add_source.py [--dry-run]
 
 - Recurring job (intended weekly).
 - Force-injects golden set URLs older than 4 weeks from metricdb into crawlerdb.
-- Shard resolution: goes through `libs.db.sharding.key.compute_shard` (single source of truth), which honors `domain_overrides` in `ingest.yaml` and `split_etld1` in `shard_split.yaml`; overrides for split eTLD+1s are stripped automatically.
+- Shard resolution: uses `ShardRouter.route()` on the full URL, matching the normal router's domain key **and** shard. It honors `domain_overrides` in `ingest.yaml` and the live `shard_split_subdomain` table, and supports IP hostnames. Do not reduce a split hostname to its parent domain before routing.
 - Writes to `domain_state`, `url_state_current_{shard}`, `url_state_history_{shard}`.
 - Existing rows are flipped to `source = 1` so golden set membership is identifiable. New rows are also mirrored into history (matches `db_ops.process_link`).
 - Google's `srsltid` is stripped before injecting (`libs.urls.strip_srsltid`); a URL with and without `srsltid` counts as the same page. If crawlerdb only holds the `srsltid` form, that row is marked golden instead of inserting the stripped URL, so the page is not stored or fetched twice.
 - Does not write to metricdb.
+- New URLs are explicitly pending (`should_crawl = TRUE`); existing URLs keep their crawl state. This is not a force-recrawl command for previously scheduled/fetched URLs.
+- Writes at most `--commit-interval` valid inputs per transaction (default 1,000), with bulk SQL grouped by shard. A default 0.5-second pause between batches limits the added write load.
+- Transient connection, serialization, deadlock and timeout errors reopen the connection and retry the whole uncommitted batch (at most eight retries by default). Permanent schema/data errors fail visibly. A failed attempt's domain IDs are never retained in the cache.
+- `/data/ipc/maintenance/golden_inject/` is the default persistent state directory. Cron and manual runs **must use the same directory**: `run.lock` prevents overlap; `checkpoint.json` advances only after a successful database commit. An interrupted matching input/routing plan resumes; changing the plan restarts a safe idempotent scan. A completed run starts fresh on the next invocation so deleted rows can be restored.
+- A lost commit acknowledgement may cause a safe replay to be reported as “marked” instead of “new”. Verify persisted rows independently; do not treat those classification counters as an exact historical insertion count.
+- `latest-run.json` records completion, counters and skipped metric URL IDs/reasons. Relative links such as `/goto?...` have no target hostname and are reported as skipped, not invented into an absolute URL. The four-week eligibility rule is unchanged.
+- `--dry-run` uses read-only database connections and writes no checkpoint. It validates the plan/routing; its count is not an estimate of how many rows will be newly inserted.
 
 ```bash
-uv run scripts/golden_inject.py [--dry-run]
-docker compose exec scheduler_ingest python scripts/golden_inject.py
+python scripts/golden_inject.py --dry-run
+docker compose exec -T -e PYTHONPATH=/app scheduler_ingest \
+  python scripts/golden_inject.py --commit-interval 1000
 
 # host crontab: weekly, Monday 01:00 UTC (09:00 CST on UTC+8 hosts)
 0 9 * * 1 cd /opt/WebCrawler && docker compose exec -T -e PYTHONPATH=/app scheduler_ingest python scripts/golden_inject.py >> /home/r14922138/logs/golden_inject.log 2>&1
 ```
+
+The existing weekly cron needs no new service or container restart. Keep `/data/ipc`
+mounted persistently, and inspect the completion log plus `latest-run.json` after a
+run. If the retry budget is exhausted, rerun the same command to continue from its
+last checkpoint. Do not remove `run.lock` while a process holds it, and do not reset
+or edit a checkpoint while a run is active. Checkpoints contain fingerprints and
+counts, not database passwords or full URL lists. Skipped inputs need a source-data
+fix; retrying an unchanged invalid relative URL will not resolve its destination.
+
+The dedicated `golden_inject` CI job runs both unit tests and real PostgreSQL
+transaction/recovery tests; the three container test jobs alone do not cover these
+root-level tests.
 
 ## 6.3 `migrate_add_discovered_from.py`
 
