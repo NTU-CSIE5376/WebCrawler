@@ -7,6 +7,7 @@ from unittest.mock import patch
 from containers.scheduler_control.offerer.selection.golden_discovery_ranker_v1_strategy import (
     GoldenDiscoveryRankerV1Strategy,
 )
+from containers.scheduler_control.offerer.selection.read_only_strategy import ReadOnlyStrategy
 from containers.scheduler_control.scorer import service as scorer_service
 from containers.scheduler_control.scorer.service import (
     GoldenDiscoveryRankerConfig,
@@ -241,6 +242,20 @@ class GoldenDiscoveryPeekGlobalCandidatesTest(unittest.TestCase):
         # slow on YSQL) — only the benign crawl_paused_until OR remains.
         self.assertNotIn("d.shard_id = 3", sql_2)
         self.assertNotIn("d.shard_id = 4", sql_2)
+
+    def test_exists_stays_correlated_to_avoid_full_url_index_aggregation(self):
+        for strategy_class in (GoldenDiscoveryRankerV1Strategy, ReadOnlyStrategy):
+            with self.subTest(strategy=strategy_class.__name__):
+                session = _FakeOffererSession(rows=[])
+                strategy = strategy_class(Session=_FakeOffererSessionFactory(session))
+                strategy.peek_global_candidates(
+                    limit=594, exclude_domain_ids=set(), shard_start=146, shard_end=146,
+                )
+                sql, params = session.calls[0]
+                self.assertRegex(sql, r"AND EXISTS\s*\(\s*SELECT 1 FROM url_state_current_146 u\s*"
+                                 r"WHERE u.domain_id = d.domain_id AND u.should_crawl = TRUE\s*"
+                                 r"OFFSET 0\s*\)")
+                self.assertEqual(params["limit"], 594)
 
     def test_peek_returns_empty_when_limit_is_zero(self):
         session = _FakeOffererSession()

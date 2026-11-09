@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from typing import Optional
 
@@ -289,6 +290,39 @@ class OffererRefillGlobalTest(unittest.TestCase):
             svc._refill_once_if_needed()
 
         self.assertEqual(len(selector.claim_calls), 1)
+
+    def test_publishes_each_claim_before_starting_the_next(self):
+        selector = _StubGlobalStrategy(
+            candidates=[
+                CandidateDomain(domain_id=11, shard_id=0, domain_score=0.9),
+                CandidateDomain(domain_id=22, shard_id=1, domain_score=0.8),
+                # Consuming a file during refill must not allow a second claim.
+                CandidateDomain(domain_id=11, shard_id=0, domain_score=0.9),
+            ],
+            per_domain_urls={11: ["https://a.example/1"], 22: ["https://b.example/1"]},
+        )
+        original_claim = selector.claim_domain_urls
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = _make_service(tmp, selector)
+            first_file = Path(tmp) / "queue_00/domain_000011.json"
+
+            def claim(**kwargs):
+                if kwargs["domain_id"] == 22:
+                    # Simulate the crawler reading/deleting a batch while the
+                    # offerer is still working on later domains.
+                    self.assertEqual(json.loads(first_file.read_text())["urls"],
+                                     ["https://a.example/1"])
+                    first_file.unlink()
+                return original_claim(**kwargs)
+
+            with patch.object(selector, "claim_domain_urls", side_effect=claim):
+                result = svc._refill_once_if_needed()
+
+            self.assertFalse(first_file.exists())
+            self.assertTrue((first_file.parent / "domain_000022.json").exists())
+            self.assertEqual(result["new_domains"], 2)
+            self.assertEqual(result["picked_urls"], 2)
+            self.assertEqual(len(selector.claim_calls), 2)
 
 
 if __name__ == "__main__":

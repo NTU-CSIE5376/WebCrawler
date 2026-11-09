@@ -212,6 +212,48 @@ Events emitted by the offerer:
 | `offer.refill` | One per scan cycle. Includes `picked_urls`, `new_domains`. |
 | `offer.error` | DB / disk error path. |
 
+`offer.refill.elapsed_sec` measures the full scan/refill work, excluding the
+configured sleep. `offer.peek_shard` reports `shard_id`, `elapsed_sec`, and
+`candidates_returned` for each production candidate query. `offer.peek` is emitted
+after claims and includes `peek_elapsed_sec` and `claim_publish_elapsed_sec` to
+separate candidate-selection time from claiming/publishing time. Domain files
+are published as each claim commits; polling between cycles remains 60 s.
+
+If crawler QPS rises in bursts then decays, compare refill events with
+`spider.heartbeat.active_domains`, `pending`, `transferring`, and
+`scraper_active_size_ratio`. On 2026-11-09, worker 9 fell to one domain and six
+pending requests just before its 03:17:20 UTC refill, then returned to 144
+domains and roughly 26 QPS within a minute. Refills for workers 7–15 were
+approximately 15–19 minutes apart. A read-only database inspection found YSQL
+planning the candidate EXISTS as a whole-index aggregation (estimated 21M URL
+rows on shard 146), despite the domain index being present. The `OFFSET 0`
+inside EXISTS preserves a correlated, short-circuiting domain probe and the
+same selection semantics.
+
+A paired read-only replay of worker 9's recorded query parameters across all
+16 assigned shards (144–159) measured the following aggregate selection times:
+
+| Original query | With `OFFSET 0` | Speedup | Time reduction |
+|---|---|---|---|
+| 948.625 s | 27.772 s | 34.16× | 97.07% |
+
+Each query used `LIMIT 594` and excluded the same two recorded domain IDs;
+both variants returned the same 594 candidates in the same order on every
+shard. Original-first and corrected-first ordering alternated by shard to
+reduce cache-order bias. Each original/corrected pair shared a
+`REPEATABLE READ READ ONLY` snapshot. Shards 144–150 shared an initial snapshot;
+after a client connection stall on shard 151, its incomplete pair was discarded
+and rerun, and resumed pairs used a fresh snapshot per shard. The aggregate
+therefore combines two measurement windows under live database load, with
+one completed pair per shard. The successful shard 151 rerun measured
+24.731 s versus 1.790 s.
+
+The replay made no URL claims or crawl-state writes. These measurements cover
+candidate selection only; full refill time and crawler HTTP throughput were
+not measured. The crawler rate changes were not deployed during the replay.
+See the [raw per-shard results and recorded SQL](experiments/2026-11-09-worker9-offerer-replay.json)
+for timings, ordered-result hashes, and snapshot metadata.
+
 Events emitted by ingestor / router (`ingest.*`, `route.*`) are similar
 in shape — see the call sites in `containers/scheduler_ingest/` for the
 exact fields.
