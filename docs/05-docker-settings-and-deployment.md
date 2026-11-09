@@ -69,7 +69,8 @@ tuning. Baseline workers use global concurrency 256; the canary uses 384 and a
 
 Crawler policies are loaded from `containers/crawler/config/site_policies.yml`.
 `default.crawler_mode` is `autothrottle`, and
-`default.request_limits.max_qps` is `4` (a 0.25-second minimum interval).
+`default.request_limits.max_qps` is `8` (a 0.125-second minimum interval), with
+`target_concurrent_requests: 4` for AutoThrottle pacing.
 Domains and exact hostnames can override the mode with `fixed` or `autothrottle`
 and provide partial `request_limits`; each field inherits from default to domain
 to host. Domain rules match the registered domain and its subdomains; host rules
@@ -79,7 +80,8 @@ match an exact hostname.
 default:
   crawler_mode: autothrottle
   request_limits:
-    max_qps: 4
+    max_qps: 8
+    target_concurrent_requests: 4
     max_concurrent_requests: 16
 domains:
   wikipedia.org:
@@ -118,7 +120,8 @@ requests use the same downloader and site policies.
 
 `request_limits.target_concurrent_requests` optionally overrides the AutoThrottle
 target for a domain or exact host, inheriting through the same policy hierarchy.
-When omitted, it uses `AUTOTHROTTLE_TARGET_CONCURRENCY` (2 by default). This target
+When omitted at a domain or host, it inherits the YAML default (`4`). An explicit
+null uses `AUTOTHROTTLE_TARGET_CONCURRENCY` (also `4` by default). This target
 controls adaptive pacing; `max_concurrent_requests` remains the hard cap.
 
 The YAML is the source of truth for mode, minimum interval, and slot concurrency;
