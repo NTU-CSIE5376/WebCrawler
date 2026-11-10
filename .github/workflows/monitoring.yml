@@ -86,7 +86,8 @@ jobs:
           warning = child['routes'][0]
           assert warning['group_by'] == ['project','severity']
           assert warning['group_wait'] == warning['group_interval'] == '1h'
-          assert warning['repeat_interval'] == '24h'
+          # Grafana normalizes a full-day duration to "1d" on readback.
+          assert warning['repeat_interval'] in ('24h', '1d')
           print('Grafana 11 accepted scoped grouping and quiet warning timing; no sender tested.')
           PY
       - name: Grafana smoke logs and cleanup
