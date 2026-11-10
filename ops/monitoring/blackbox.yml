@@ -6,7 +6,7 @@ modules:
       preferred_ip_protocol: ip4
       follow_redirects: false
       valid_status_codes: [200]
-      body_size_limit: 65536
+      body_size_limit: 64KiB
   tcp_connect:
     prober: tcp
     timeout: 5s

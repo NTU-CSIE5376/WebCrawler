@@ -55,6 +55,26 @@ jobs:
           assert {g['interval'] for g in groups} == {'60s','300s','600s'}
           print(f'Grafana 11 loaded {len(loaded)} paused rules; no Discord contact point provisioned.')
           PY
+      - name: Blackbox configuration and real local HTTP probe
+        run: |
+          docker run --rm --network none -v "$PWD/ops/monitoring/blackbox.yml:/etc/blackbox/config.yml:ro" prom/blackbox-exporter:v0.26.0 --config.file=/etc/blackbox/config.yml --config.check
+          docker run -d --name monitoring-probe-check --network host -v "$PWD/ops/monitoring/blackbox.yml:/etc/blackbox/config.yml:ro" prom/blackbox-exporter:v0.26.0 --config.file=/etc/blackbox/config.yml --web.listen-address=127.0.0.1:19198
+          for attempt in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:19198/metrics >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsSG http://127.0.0.1:19198/probe --data-urlencode target=http://127.0.0.1:19198/metrics --data-urlencode module=http_ready > /tmp/crawler-monitoring-checks/probe.txt
+          python - <<'PY'
+          from pathlib import Path
+          lines = Path('/tmp/crawler-monitoring-checks/probe.txt').read_text().splitlines()
+          assert 'probe_success 1' in lines
+          print('Blackbox 0.26 accepted the config and completed a local HTTP probe.')
+          PY
+      - name: Blackbox smoke cleanup
+        if: always()
+        run: |
+          docker logs monitoring-probe-check || true
+          docker rm -f monitoring-probe-check || true
       - name: Validate quiet child routing on isolated Grafana only
         run: |
           python - <<'PY'

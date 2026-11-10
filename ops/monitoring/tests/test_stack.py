@@ -39,6 +39,11 @@ def test_prometheus_targets_and_grafana_datasource_agree():
     assert datasource["jsonData"]["timeInterval"] == "60s"
 
 
+def test_probe_body_limit_has_required_byte_unit():
+    config = yaml.safe_load((ROOT / "blackbox.yml").read_text())
+    assert config["modules"]["http_ready"]["http"]["body_size_limit"] == "64KiB"
+
+
 def test_stack_cannot_restart_business_services_or_mount_docker_socket():
     stack = yaml.safe_load((ROOT / "compose.yml").read_text())
     assert stack["name"] == "crawler-monitoring"
