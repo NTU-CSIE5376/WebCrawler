@@ -1,0 +1,6 @@
+[
+  {"targets": ["172.16.191.1:9108"], "labels": {"host": "host1"}},
+  {"targets": ["172.16.191.2:9108"], "labels": {"host": "host2"}},
+  {"targets": ["172.16.191.3:9108"], "labels": {"host": "host3"}},
+  {"targets": ["172.16.191.4:9108"], "labels": {"host": "host4"}}
+]

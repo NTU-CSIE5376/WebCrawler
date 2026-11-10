@@ -1,0 +1,31 @@
+global:
+  scrape_interval: 30s
+  scrape_timeout: 10s
+  evaluation_interval: 30s
+
+# Alert evaluation and notification belong to existing Grafana 11, not a second
+# Alertmanager. These target files are explicit production allowlists.
+scrape_configs:
+  - job_name: crawler-prometheus
+    static_configs:
+      - targets: [localhost:9090]
+  - job_name: crawler-pipeline
+    static_configs:
+      - targets: [crawler-pipeline:9812]
+        labels: {host: host2}
+  - job_name: crawler-node
+    file_sd_configs:
+      - files: [/etc/prometheus/targets/nodes.json]
+  - job_name: crawler-probe
+    metrics_path: /probe
+    file_sd_configs:
+      - files: [/etc/prometheus/targets/probes.json]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [module]
+        target_label: __param_module
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: crawler-blackbox:9115
