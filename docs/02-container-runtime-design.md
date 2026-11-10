@@ -78,8 +78,8 @@ Runtime behavior of `golden_discovery_ranker_v1`:
 
 Runs `supervisord` with:
 
-- 15 baseline AutoThrottle spiders (`crawler_id=0..6,8..15`)
-- 1 independently configurable AutoThrottle canary spider (`crawler_id=7`)
+- 15 baseline AutoThrottle spiders (`crawler_id=0..14`)
+- 1 independently configurable AutoThrottle canary spider (`crawler_id=15`)
 - each spider reads/writes its own IPC queue/result path by `crawler_id`
 
 Crawler worker behavior:
@@ -87,10 +87,11 @@ Crawler worker behavior:
 1. Pop earliest queue batch JSON from `/data/ipc/url_queue/crawler_{id:02d}`.
 2. Delete queue file immediately after read.
 3. Crawl URLs with Scrapy AutoThrottle (robots obeyed, retries enabled).
-   - Baseline workers and the `crawler_id=7` canary currently use the same AutoThrottle values.
-   - `crawler_id=7` remains a separate supervisord program so future canary parameters can be adjusted independently.
-   - Fixed-QPS mode remains available through crawler settings when `CRAWLER_USE_AUTOTHROTTLE=false`.
-   - Scrapy scraper-slot backpressure defaults to `SCRAPER_SLOT_MAX_ACTIVE_SIZE=50000000` for every crawler worker.
+   - Baseline workers and the `crawler_id=15` canary currently use the same AutoThrottle values.
+   - `crawler_id=15` remains a separate supervisord program so future canary parameters can be adjusted independently.
+   - Domains and hosts can select fixed pacing with `crawler_mode: fixed` in `config/site_policies.yml`.
+   - Scrapy scraper-slot backpressure defaults to `SCRAPER_SLOT_MAX_ACTIVE_SIZE=50000000`; the canary uses `150000000`.
+   - Domain/host policies and site middleware behavior are documented in [Middleware](05-docker-settings-and-deployment.md#531-middleware).
 4. For each response:
    - if HTML/XHTML: save full content + extracted outlinks.
    - on `youtube.com` pages, outlinks also include videos, channels and playlists parsed from the embedded `ytInitialData` JSON, with an optional `priority` for high-subscriber channels (see [09-youtube-discovery.md](./09-youtube-discovery.md)).
@@ -127,6 +128,7 @@ Input: router output folders `ingestor_{id}`.
 Responsibilities:
 
 - `status="new"` records: insert new URL candidates into `url_state_current_{shard}` and history.
+  - Trap filter (`trap_filter` in `ingest.yaml`, `ingestor/trap_filter.py`), applied before any DB work: strip the approved params in `normalize_params` (default only `srsltid`, the same policy as `golden_inject.py`), merge links that collapse to the same URL, log what stripping every other tracking / session param would change without applying it (`would_normalize`), then drop links hitting a high-confidence trap rule (`libs/frontier/trap_rules.HIGH_CONFIDENCE`: path repeat, too many path segments, nested redirect, faceted navigation, calendar plugin). Every affected link is appended to `/data/ipc/trap_filter/ingestor_{id}/YYYY-MM-DD.jsonl.gz`; `scripts/trap_filter_golden_check.py` measures golden false kills from these logs. Crawl results are never filtered. Rule definitions: [10-frontier-trap-rules.md](10-frontier-trap-rules.md).
   - Links whose domain has `domain_state.discovery_frozen=TRUE` are skipped (frontier budget; see `frontier_gc` in 2.2), so frozen domains stop accumulating new frontier rows.
   - If `GOLDEN_DISCOVERY_RANKER_V1_INGEST_INLINE_ENABLED=true`, check which URLs are truly new, score those with the mounted ranker artifact before writing them to DB, and fall back to unscored insert when the inline scoring time budget is exhausted.
   - If inline scoring is disabled, new URLs keep `url_score_updated_at=NULL` and the background ranker can score them later.

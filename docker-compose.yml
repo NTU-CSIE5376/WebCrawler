@@ -101,7 +101,7 @@ services:
       context: .
       dockerfile: containers/scheduler_ingest/Dockerfile
     container_name: scheduler_ingest
-    cpus: 8
+    cpus: 32
     init: true
     restart: unless-stopped
     volumes:
@@ -119,6 +119,7 @@ services:
     init: true
     environment:
       - MANUAL_BULK_CRAWL_SCHEDULING_POLICY
+      - MANUAL_BULK_CRAWL_SHARE_PERCENT
     dns:
       - 8.8.8.8
       - 1.1.1.1

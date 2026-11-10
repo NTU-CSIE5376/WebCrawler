@@ -5,16 +5,20 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from scrapy import Spider
+from scrapy.core.downloader import Downloader
 from scrapy.http import HtmlResponse
 from scrapy.settings import Settings
+from scrapy.utils.test import get_crawler
 
 from containers.crawler.crawler.manual_bulk_crawls import ManualBulkCrawlConsumer
+from containers.crawler.crawler.site_policies import SitePolicies
 from libs.ipc import manual_bulk_crawl as storage
 from libs.ipc.manual_bulk_crawl import next_batch, prepare_job, job_status
 
 
 @pytest.fixture
-def queue(tmp_path):
+def queue(tmp_path, monkeypatch):
     pending = tmp_path / "pending"
     pending.mkdir()
 
@@ -28,7 +32,8 @@ def queue(tmp_path):
         prepare_job(path, json.loads(path.read_text()))
         return path
 
-    def consumer(concurrency=2, *, domain_concurrency=None, slot_settings=None, **limits):
+    def consumer(concurrency=2, *, domain_concurrency=None, slot_settings=None, site_policies=None, **limits):
+        monkeypatch.setattr(SitePolicies, "load", classmethod(lambda cls: site_policies or SitePolicies({})))
         requests = []
         spider = SimpleNamespace(crawler_id=0, logger=Mock(), crawler=SimpleNamespace(
             settings=Settings({"CONCURRENT_REQUESTS": concurrency,
@@ -109,6 +114,53 @@ def test_large_job_keeps_a_bounded_backlog_and_refills_on_completion(queue):
         assert status["completed_urls"] == 6
         assert len({(request.meta["manual_bulk_crawl_job_id"], request.meta["manual_bulk_crawl_index"])
                     for request in requests}) == 6
+    finally:
+        consumer.close()
+
+
+def test_empty_queue_is_not_rescanned_by_each_outstanding_response(queue, monkeypatch):
+    from containers.crawler.crawler import manual_bulk_crawls as feeder
+
+    enqueue, factory, _ = queue
+    enqueue("a", 4)
+    # Unrelated jobs remain in the shared queue when this crawler is done.
+    other = enqueue("other-worker", 4)
+    payload = json.loads(other.read_text())
+    payload["crawler_ids"] = [1] * 4
+    other.write_text(json.dumps(payload))
+    monkeypatch.setattr(feeder, "monotonic", lambda: 100.0)
+    scan = Mock(wraps=feeder.iter_batches)
+    monkeypatch.setattr(feeder, "iter_batches", scan)
+    consumer, requests = factory(concurrency=8)
+    try:
+        consumer.poll()
+        assert scan.call_count == 1
+        for request in requests[:-1]:
+            complete(consumer, request)
+        assert scan.call_count == 1
+        complete(consumer, requests[-1])
+        # Finishing a job frees capacity and permits one new scan.
+        assert scan.call_count == 2
+        assert not consumer.inflight
+        consumer.poll()
+        assert scan.call_count == 3
+    finally:
+        consumer.close()
+
+
+def test_next_poll_discovers_new_jobs_while_an_old_response_is_outstanding(queue):
+    enqueue, factory, _ = queue
+    enqueue("a", 2)
+    consumer, requests = factory(concurrency=8)
+    try:
+        consumer.poll()
+        enqueue("b", 1)
+        complete(consumer, requests[0])
+        assert len(requests) == 2
+        consumer.poll()
+        assert len(requests) == 3
+        assert requests[-1].meta["manual_bulk_crawl_job_id"] == "b"
+        assert len(consumer.inflight) == 2
     finally:
         consumer.close()
 
@@ -274,6 +326,168 @@ def test_invalid_prefetch_configuration_fails_at_startup(queue, name, value):
         factory(**{name: value})
 
 
+@pytest.mark.parametrize("value", [-1, True, 1.5, None])
+def test_invalid_host_headroom_fails_at_startup(queue, value):
+    _, factory, _ = queue
+    with pytest.raises(ValueError, match="MANUAL_BULK_CRAWL_HOST_HEADROOM"):
+        factory(host_headroom=value)
+
+
+def slots(consumer, **hosts):
+    """Live downloader slots: host -> (concurrency, delay)."""
+    consumer.spider.crawler.engine.downloader = SimpleNamespace(slots={
+        host: SimpleNamespace(concurrency=concurrency, delay=delay)
+        for host, (concurrency, delay) in hosts.items()})
+
+
+@pytest.mark.parametrize("headroom", [0, 1, 2])
+# (2.0, 0.5, 4) is AutoThrottle at TARGET_CONCURRENCY 4: the cap follows the target.
+@pytest.mark.parametrize("latency,delay,in_transfer",
+                         [(2.5, 1.0, 3), (3.5, 1.75, 2), (1.0, 4.0, 1), (2.0, 0.5, 4)])
+def test_host_cap_follows_the_slot_delay(queue, headroom, latency, delay, in_transfer):
+    enqueue, factory, _ = queue
+    enqueue("a", urls=[f"https://slow.example/{i}" for i in range(30)])
+    consumer, requests = factory(concurrency=32, host_headroom=headroom)
+    slots(consumer, **{"slow.example": (16, delay)})
+    try:
+        consumer.poll()
+        consumer.domains["slow.example"].latency = latency
+        consumer.poll()
+        assert len(requests) == in_transfer + headroom
+    finally:
+        consumer.close()
+
+
+def test_manual_and_normal_requests_share_the_hostname_slot(queue, monkeypatch):
+    # One slot per hostname means one AutoThrottle delay, so manual work cannot add a second rate.
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    from crawler.spiders.spider import HtmlSpider
+
+    enqueue, factory, _ = queue
+    enqueue("a", urls=["https://www.espn.com/nba/1"])
+    consumer, requests = factory()
+    crawler = get_crawler(Spider, {"AUTOTHROTTLE_ENABLED": True, "DOWNLOAD_DELAY": 0.25,
+                                   "CONCURRENT_REQUESTS_PER_DOMAIN": 16})
+    crawler.spider = Spider(name="slot-test")
+    downloader = Downloader(crawler)
+    spider = SimpleNamespace(_domain_pending={}, parse=None, errback=None)
+    normal = HtmlSpider._build_request(spider, "https://www.espn.com/nba/2", 7)
+    try:
+        consumer.poll()
+        manual_key, manual_slot = downloader._get_slot(requests[0])
+        normal_key, normal_slot = downloader._get_slot(normal)
+        assert manual_key == normal_key == "www.espn.com"
+        assert manual_slot is normal_slot
+    finally:
+        consumer.close()
+        downloader.close()
+
+
+def test_host_cap_never_exceeds_slot_concurrency_and_zero_delay_is_uncapped(queue):
+    enqueue, factory, _ = queue
+    enqueue("a", urls=[f"https://narrow.example/{i}" for i in range(30)])
+    enqueue("b", urls=[f"https://open.example/{i}" for i in range(30)])
+    consumer, _ = factory(concurrency=32)
+    slots(consumer, **{"narrow.example": (2, 0.1), "open.example": (12, 0)})
+    try:
+        consumer.poll()
+        consumer.domains["narrow.example"].latency = 5.0
+        consumer.domains["open.example"].latency = 5.0
+        consumer.poll()
+        assert consumer.domains["narrow.example"].outstanding == 2
+        assert consumer.domains["open.example"].outstanding == 12
+    finally:
+        consumer.close()
+
+
+def test_longer_delay_shrinks_the_host_cap_without_cancelling_requests(queue):
+    enqueue, factory, _ = queue
+    enqueue("a", urls=[f"https://slow.example/{i}" for i in range(30)])
+    consumer, requests = factory(concurrency=32, host_headroom=0)
+    slots(consumer, **{"slow.example": (16, 1.0)})
+    try:
+        consumer.poll()
+        consumer.domains["slow.example"].latency = 2.5
+        consumer.poll()
+        assert len(requests) == 3
+        consumer.spider.crawler.engine.downloader.slots["slow.example"].delay = 5.0
+        consumer.poll()
+        complete(consumer, requests[0])
+        complete(consumer, requests[1])
+        assert len(requests) == 3, "Two outstanding still exceed the new cap of one"
+        complete(consumer, requests[2])
+        assert len(requests) == 4
+    finally:
+        consumer.close()
+
+
+def test_a_failure_without_response_leaves_the_latency_estimate(queue):
+    from twisted.internet.error import TimeoutError
+    from twisted.python.failure import Failure
+
+    enqueue, factory, _ = queue
+    enqueue("a", urls=[f"https://dead.example/{i}" for i in range(4)])
+    consumer, requests = factory(concurrency=4)
+    try:
+        consumer.poll()
+        error = TimeoutError()
+        error.request = requests[0]
+        failure = Failure(error)
+        failure.request = requests[0]
+        consumer.fetch_failed(failure)
+        assert consumer.domains["dead.example"].latency == 1.0
+    finally:
+        consumer.close()
+
+
+def test_full_capacity_spreads_over_many_hosts_at_their_caps(queue):
+    enqueue, factory, _ = queue
+    hosts = [f"h{i:03d}.example" for i in range(100)]
+    for i, host in enumerate(hosts):
+        enqueue(f"j{i:03d}", urls=[f"https://{host}/{n}" for n in range(10)])
+    consumer, requests = factory(concurrency=256, max_active_jobs=100,
+                                 slot_settings={host: {"delay": 0.5, "concurrency": 16} for host in hosts})
+    try:
+        consumer.poll()
+        assert len(requests) == 256
+        outstanding = [consumer.domains[host].outstanding for host in hosts if host in consumer.domains]
+        assert max(outstanding) == 3, "latency 1.0 / delay 0.5 + 1 headroom"
+        assert sum(count > 0 for count in outstanding) >= 86
+    finally:
+        consumer.close()
+
+
+def test_longest_remaining_host_goes_first_across_jobs(queue):
+    enqueue, factory, _ = queue
+    enqueue("old", urls=[f"https://small.example/{i}" for i in range(2)])
+    consumer, requests = factory(concurrency=1)
+    try:
+        consumer.poll()
+        assert requests[0].url.startswith("https://small.example/")
+        enqueue("new", urls=[f"https://big.example/{i}" for i in range(200)])
+        consumer.poll()
+        complete(consumer, requests[0])
+        # 200 URLs left outrank 1, however long the older job has waited.
+        assert requests[1].url.startswith("https://big.example/")
+    finally:
+        consumer.close()
+
+
+def test_a_host_at_its_cap_leaves_free_slots_to_smaller_hosts(queue):
+    enqueue, factory, _ = queue
+    enqueue("old", urls=[f"https://small.example/{i}" for i in range(2)])
+    enqueue("new", urls=[f"https://big.example/{i}" for i in range(200)])
+    consumer, requests = factory(concurrency=4, slot_settings={
+        "big.example": {"delay": 0.5, "concurrency": 16}})
+    try:
+        consumer.poll()
+        hosts = [request.url.split("/")[2] for request in requests]
+        # big.example goes first but stops at its cap of 3 (latency 1.0 / delay 0.5 + 1).
+        assert hosts == ["big.example"] * 3 + ["small.example"]
+    finally:
+        consumer.close()
+
+
 def test_job_message_selects_its_output_directory_without_api_configuration(queue, monkeypatch):
     enqueue, factory, root = queue
     monkeypatch.setenv("API_CONFIG_PATH", str(root / "missing-api-config.yml"))
@@ -389,6 +603,25 @@ def test_later_jobs_supply_other_domains_without_draining_wiki_job(queue):
         consumer.close()
 
 
+def test_a_redirected_url_releases_its_original_host_once(queue):
+    # RedirectMiddleware keeps download_slot, so the hop stays on the original slot.
+    enqueue, factory, _ = queue
+    enqueue("a", urls=[f"https://origin.example/{i}" for i in range(2)])
+    consumer, requests = factory(concurrency=1)
+    try:
+        consumer.poll()
+        final = requests[0].replace(url="https://elsewhere.example/landing")
+        final.meta["redirect_times"] = 2
+        complete(consumer, final)
+        assert len(requests) == 2
+        assert consumer.domains["origin.example"].outstanding == 1
+        assert "elsewhere.example" not in consumer.domains
+        complete(consumer, final)
+        assert consumer.domains["origin.example"].outstanding == 1
+    finally:
+        consumer.close()
+
+
 def test_domain_cap_is_shared_across_jobs_and_failure_releases_it(queue):
     from twisted.python.failure import Failure
     from twisted.internet.error import TimeoutError
@@ -409,6 +642,131 @@ def test_domain_cap_is_shared_across_jobs_and_failure_releases_it(queue):
         assert consumer.domains["example.com"].outstanding == 2
         for request in requests:
             assert "download_slot" not in request.meta, "Do not pin redirect requests to original slots"
+    finally:
+        consumer.close()
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_language_hosts_share_configured_slot_backlog_and_dispatch_cap(queue, failure):
+    from twisted.python.failure import Failure
+    from twisted.internet.error import TimeoutError
+
+    enqueue, factory, _ = queue
+    enqueue("english", urls=[f"https://en.wikipedia.org/wiki/{i}" for i in range(3)])
+    enqueue("chinese", urls=[f"https://zh.wikipedia.org/wiki/{i}" for i in range(3)])
+    enqueue("other", urls=["https://other.example/0"])
+    registry = SitePolicies({"domains": {"wikipedia.org": {"request_limits": {
+        "download_slot": "wikipedia", "max_concurrent_requests": 2}}}})
+    consumer, requests = factory(concurrency=8, site_policies=registry,
+                                 slot_settings={"wikipedia": {"concurrency": 2, "delay": 10}})
+    try:
+        consumer._load_jobs()
+        assert set(consumer.domains) == {"wikipedia", "other.example"}
+        shared = consumer.domains["wikipedia"]
+        shared.jitter = 0
+        consumer._refresh_priorities()
+        assert len(shared.pending) == 6
+        assert consumer.ready["wikipedia"] == 60
+
+        consumer.refill()
+        assert len(requests) == 3  # Two Wikipedia URLs plus the unrelated host.
+        assert shared.outstanding == 2
+        assert len(shared.pending) == 4
+        assert "wikipedia" not in consumer.ready
+        assert all("download_slot" not in request.meta for request in requests)
+        # Once language hosts share a slot, completions can admit the next
+        # language/job while retaining the original job and result index.
+        for request in list(requests[:2]):
+            complete(consumer, request)
+        assert requests[-1].url == "https://zh.wikipedia.org/wiki/0"
+        assert requests[-1].meta["manual_bulk_crawl_job_id"] == "chinese"
+        assert requests[-1].meta["manual_bulk_crawl_index"] == 0
+
+        request = requests[-1]
+        before = len(requests)
+        if failure:
+            error = Failure(TimeoutError())
+            error.request = request
+            consumer.fetch_failed(error)
+        else:
+            request.meta["download_latency"] = 5
+            # Release the original admission slot even after a cross-host redirect.
+            consumer.parse(HtmlResponse("https://external.example/redirected", request=request,
+                                        body=b"<html>saved</html>",
+                                        headers={"Content-Type": "text/html"}))
+            assert shared.latency == pytest.approx(1.8)
+        assert len(requests) == before + 1
+        assert shared.outstanding == 2
+        assert set(consumer.inflight_domains.values()) == {"wikipedia", "other.example"}
+    finally:
+        consumer.close()
+
+
+def test_shared_slot_uses_live_autothrottle_delay_for_service_time(queue):
+    enqueue, factory, _ = queue
+    enqueue("wiki", urls=["https://en.wikipedia.org/wiki/0", "https://zh.wikipedia.org/wiki/1"])
+    enqueue("other", urls=[f"https://other.example/{i}" for i in range(5)])
+    registry = SitePolicies({"domains": {"wikipedia.org": {"request_limits": {
+        "download_slot": "wikipedia", "max_concurrent_requests": 2}}}})
+    consumer, requests = factory(concurrency=1, site_policies=registry,
+                                 slot_settings={"wikipedia": {"concurrency": 8, "delay": 0}})
+    live = SimpleNamespace(concurrency=2, delay=10)
+    consumer.spider.crawler.engine.downloader = SimpleNamespace(slots={"wikipedia": live})
+    try:
+        consumer._load_jobs()
+        consumer.domains["wikipedia"].jitter = 0
+        consumer._refresh_priorities()
+        assert consumer.ready["wikipedia"] == 20
+        consumer.refill()
+        assert requests[0].url == "https://en.wikipedia.org/wiki/0"
+        live.delay = 0
+        complete(consumer, requests[0])
+        assert requests[1].url.startswith("https://other.example/"), "Live delay changes must reprioritize work"
+    finally:
+        consumer.close()
+
+
+def test_shared_slot_live_concurrency_caps_all_language_hosts(queue):
+    enqueue, factory, _ = queue
+    enqueue("wiki", urls=[f"https://{language}.wikipedia.org/wiki/{i}"
+                          for i, language in enumerate(("en", "zh", "fr", "de"))])
+    registry = SitePolicies({"domains": {"wikipedia.org": {"request_limits": {
+        "download_slot": "wikipedia", "max_concurrent_requests": 8}}}})
+    consumer, requests = factory(concurrency=8, site_policies=registry,
+                                 slot_settings={"wikipedia": {"concurrency": 8, "delay": 0}})
+    live = SimpleNamespace(concurrency=1, delay=0)
+    consumer.spider.crawler.engine.downloader = SimpleNamespace(slots={"wikipedia": live})
+    try:
+        consumer.poll()
+        assert len(requests) == 1
+        assert consumer.domains["wikipedia"].outstanding == 1
+        live.concurrency = 2
+        consumer.poll()
+        assert len(requests) == 2
+        assert consumer.domains["wikipedia"].outstanding == 2
+        live.concurrency = 1
+        complete(consumer, requests[0])
+        assert len(requests) == 2, "Do not refill while the remaining request fills the reduced cap"
+        complete(consumer, requests[1])
+        assert len(requests) == 3
+        assert requests[-1].url == "https://fr.wikipedia.org/wiki/2"
+    finally:
+        consumer.close()
+
+
+def test_slot_grouping_respects_exact_host_overrides(queue):
+    enqueue, factory, _ = queue
+    enqueue("wiki", urls=[f"https://{language}.wikipedia.org/wiki/0" for language in ("en", "zh", "fr")])
+    registry = SitePolicies({
+        "domains": {"wikipedia.org": {"request_limits": {"download_slot": "wikipedia"}}},
+        "hosts": {"fr.wikipedia.org": {"request_limits": {"download_slot": "french"}}},
+    })
+    consumer, _ = factory(site_policies=registry)
+    try:
+        consumer._load_jobs()
+        assert set(consumer.domains) == {"wikipedia", "french"}
+        assert list(consumer.domains["wikipedia"].pending) == [("wiki", 0), ("wiki", 1)]
+        assert list(consumer.domains["french"].pending) == [("wiki", 2)]
     finally:
         consumer.close()
 

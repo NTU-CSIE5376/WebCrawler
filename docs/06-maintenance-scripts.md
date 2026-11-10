@@ -18,15 +18,39 @@ uv run scripts/migrate_add_source.py [--dry-run]
 
 - Recurring job (intended weekly).
 - Force-injects golden set URLs older than 4 weeks from metricdb into crawlerdb.
-- Shard resolution: goes through `libs.db.sharding.key.compute_shard` (single source of truth), which honors `domain_overrides` in `ingest.yaml` and `split_etld1` in `shard_split.yaml`; overrides for split eTLD+1s are stripped automatically.
+- Shard resolution: uses `ShardRouter.route()` on the full URL, matching the normal router's domain key **and** shard. It honors `domain_overrides` in `ingest.yaml` and the live `shard_split_subdomain` table, and supports IP hostnames. Do not reduce a split hostname to its parent domain before routing.
 - Writes to `domain_state`, `url_state_current_{shard}`, `url_state_history_{shard}`.
 - Existing rows are flipped to `source = 1` so golden set membership is identifiable. New rows are also mirrored into history (matches `db_ops.process_link`).
 - Google's `srsltid` is stripped before injecting (`libs.urls.strip_srsltid`); a URL with and without `srsltid` counts as the same page. If crawlerdb only holds the `srsltid` form, that row is marked golden instead of inserting the stripped URL, so the page is not stored or fetched twice.
 - Does not write to metricdb.
+- New URLs are explicitly pending (`should_crawl = TRUE`); existing URLs keep their crawl state. This is not a force-recrawl command for previously scheduled/fetched URLs.
+- Writes at most `--commit-interval` valid inputs per transaction (default 1,000), with bulk SQL grouped by shard. A default 0.5-second pause between batches limits the added write load.
+- Transient connection, serialization, deadlock and timeout errors reopen the connection and retry the whole uncommitted batch (at most eight retries by default). Permanent schema/data errors fail visibly. A failed attempt's domain IDs are never retained in the cache.
+- `/data/ipc/maintenance/golden_inject/` is the default persistent state directory. Cron and manual runs **must use the same directory**: `run.lock` prevents overlap; `checkpoint.json` advances only after a successful database commit. An interrupted matching input/routing plan resumes; changing the plan restarts a safe idempotent scan. A completed run starts fresh on the next invocation so deleted rows can be restored.
+- A lost commit acknowledgement may cause a safe replay to be reported as “marked” instead of “new”. Verify persisted rows independently; do not treat those classification counters as an exact historical insertion count.
+- `latest-run.json` records completion, counters and skipped metric URL IDs/reasons. Relative links such as `/goto?...` have no target hostname and are reported as skipped, not invented into an absolute URL. The four-week eligibility rule is unchanged.
+- `--dry-run` uses read-only database connections and writes no checkpoint. It validates the plan/routing; its count is not an estimate of how many rows will be newly inserted.
 
 ```bash
-uv run scripts/golden_inject.py [--dry-run]
+python scripts/golden_inject.py --dry-run
+docker compose exec -T -e PYTHONPATH=/app scheduler_ingest \
+  python scripts/golden_inject.py --commit-interval 1000
+
+# host crontab: weekly, Monday 01:00 UTC (09:00 CST on UTC+8 hosts)
+0 9 * * 1 cd /opt/WebCrawler && docker compose exec -T -e PYTHONPATH=/app scheduler_ingest python scripts/golden_inject.py >> /home/r14922138/logs/golden_inject.log 2>&1
 ```
+
+The existing weekly cron needs no new service or container restart. Keep `/data/ipc`
+mounted persistently, and inspect the completion log plus `latest-run.json` after a
+run. If the retry budget is exhausted, rerun the same command to continue from its
+last checkpoint. Do not remove `run.lock` while a process holds it, and do not reset
+or edit a checkpoint while a run is active. Checkpoints contain fingerprints and
+counts, not database passwords or full URL lists. Skipped inputs need a source-data
+fix; retrying an unchanged invalid relative URL will not resolve its destination.
+
+The dedicated `golden_inject` CI job runs both unit tests and real PostgreSQL
+transaction/recovery tests; the three container test jobs alone do not cover these
+root-level tests.
 
 ## 6.3 `migrate_add_discovered_from.py`
 
@@ -342,6 +366,21 @@ uv run scripts/oneoff_drop_trap_frontier.py --execute --include-history
 uv run scripts/wiki_pageview_inject.py [--dry-run] [--skip-inject] [--top-k 100000] [--agent user]
 docker compose exec scheduler_ingest python scripts/wiki_pageview_inject.py
 
-# host crontab: weekly, Monday 04:30 UTC
-30 4 * * 1 cd /path/to/WebCrawler && docker compose exec -T scheduler_ingest python scripts/wiki_pageview_inject.py >> /var/log/wiki_pageview_inject.log 2>&1
+# host crontab: weekly, Monday 04:30 UTC (12:30 CST on UTC+8 hosts)
+# Note: runs after Monday 01:00 UTC golden_inject and after Wikimedia's 02:30 UTC dump release.
+30 12 * * 1 cd /opt/WebCrawler && docker compose exec -T -e PYTHONPATH=/app scheduler_ingest python scripts/wiki_pageview_inject.py --data-dir /data/ipc/wiki_pageviews >> /home/r14922138/logs/wiki_pageview_inject.log 2>&1
+```
+
+## 6.18 `trap_filter_golden_check.py`
+
+- Reads the ingest trap filter's audit logs (`/data/ipc/trap_filter/ingestor_*/YYYY-MM-DD.jsonl.gz`, one JSON object per dropped / normalized / would-be-normalized discovery link: `ts`, `action` (`drop`, `normalize`, `would_normalize`), `url`, `normalized_url`, `would_normalize_url`, `rules`, `domain_id`, `shard_id`, `discovered_from`) and checks them against the golden set (metricdb `metric_url`, read-only, or `--golden-file`).
+- Golden URLs are also matched by their normalized form: metricdb stores them as copied from search results (often with `srsltid`), while the crawler discovers the clean URL. `golden_inject.py` strips `srsltid` on its side (#103), so both converge on the same row. Rule definitions and validation: [10-frontier-trap-rules.md](10-frontier-trap-rules.md).
+- Reports per rule: drop events, distinct golden URLs dropped, and the false-kill rate (`golden dropped / golden total`). Golden URLs that were only normalized are listed separately: the stripped URL is still inserted, so they are not kills. Golden URLs that shadow normalization would rewrite (`WOULD_NORMALIZE`) show what widening `normalize_params` would touch.
+- Streams the logs; only the golden set is held in memory. `--out DIR` writes `summary.csv` and `golden_hits.csv` (each golden hit with its rules, parent URL and first timestamp).
+- Baseline before rollout: running the filter over the 138,459 metricdb golden URLs drops 4 (0.0029%), normalizes 1,290 (`srsltid`) and shadow-logs 38 (`utm_*`, `_gl`, `;jsessionid=`, …).
+- Log volume: inflow is logged before the DB existence check, so a trap URL rediscovered in many folders is logged each time. Delete old log files by hand once the review is done.
+
+```bash
+docker compose exec scheduler_ingest python scripts/trap_filter_golden_check.py --since 2026-11-01 --out /data/ipc/trap_filter/report
+python scripts/trap_filter_golden_check.py --log-dir ./trap_filter --golden-file golden_urls.csv
 ```

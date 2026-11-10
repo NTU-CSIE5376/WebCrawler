@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 import unittest
 from collections import defaultdict
 from pathlib import Path
@@ -31,6 +32,9 @@ class _FakeResolver:
 
     def ensure_and_get(self, domain, shard_id):
         return self.ids[domain], False
+
+    def batch_ensure_and_get(self, domains, *, batch_size=1000):
+        return {d: (self.ids[d], 0.0) for d in domains}
 
 
 class _FakeSess:
@@ -63,6 +67,9 @@ def _router(tmp: str) -> RouterService:
     svc.sharder = ShardRouter(num_shards=256, shards_per_ingestor=16, domain_overrides={})
     svc.Session = _FakeSess
     svc.stats = SimpleNamespace(write=lambda **kw: None)
+    svc._domain_cache = {}
+    svc._domain_cache_born = time.monotonic()
+    svc._made_dirs = set()
     return svc
 
 

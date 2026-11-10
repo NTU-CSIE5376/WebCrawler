@@ -16,8 +16,8 @@ from twisted.internet import task as twisted_task
 
 from crawler.items import PageItem
 from crawler.queue_consumer import QueueConsumer
+from crawler.middlewares.youtube import normalize_youtube_url
 from crawler.redirect_dedup import DuplicateRedirectTarget, RecentFetches
-from crawler.youtube_extractor import extract_youtube_outlinks, normalize_youtube_url
 from crawler.manual_bulk_crawls import ManualBulkCrawlConsumer
 from libs.obslog import configure as configure_logging
 from libs.urls import host_of
@@ -29,6 +29,10 @@ ACCEPTED_CONTENT_TYPES = ["text/html", "application/xhtml+xml"]
 # Cap below the PG btree row entry max (~2700 bytes).
 MAX_URL_LEN = 2500
 MAX_HEADER_VALUE_LEN = 500
+
+
+def _source(request) -> str:
+    return "manual" if "manual_bulk_crawl_job_id" in request.meta else "normal"
 
 class HtmlSpider(scrapy.Spider):
     name = "html_spider"
@@ -44,6 +48,7 @@ class HtmlSpider(scrapy.Spider):
         self._max_pending_requests = 0
         self._domain_pending: dict[int, int] = {}
         self._heartbeat_task: twisted_task.LoopingCall | None = None
+        self._top_up_task: twisted_task.LoopingCall | None = None
 
     @classmethod
     def from_crawler(cls, crawler, *args, **kwargs):
@@ -71,11 +76,15 @@ class HtmlSpider(scrapy.Spider):
         crawler.signals.connect(spider.req_scheduled, signal=signals.request_scheduled)
         crawler.signals.connect(spider.req_start, signal=signals.request_reached_downloader)
         crawler.signals.connect(spider.req_end, signal=signals.response_received)
+        crawler.signals.connect(spider.req_dropped, signal=signals.request_dropped)
         crawler.signals.connect(spider.spider_opened, signal=signals.spider_opened)
         crawler.signals.connect(spider.spider_closed, signal=signals.spider_closed)
 
         spider.heartbeat_interval_sec = float(
             crawler.settings.getfloat("OBSLOG_HEARTBEAT_SEC", 5.0)
+        )
+        spider.top_up_interval_sec = float(
+            crawler.settings.getfloat("IPC_TOP_UP_INTERVAL_SEC", 5.0)
         )
 
         return spider
@@ -321,18 +330,30 @@ class HtmlSpider(scrapy.Spider):
         if self.heartbeat_interval_sec > 0 and self._heartbeat_task is None:
             self._heartbeat_task = twisted_task.LoopingCall(self._emit_heartbeat)
             self._heartbeat_task.start(self.heartbeat_interval_sec, now=False)
+        if self.top_up_interval_sec > 0 and self._top_up_task is None:
+            self._top_up_task = twisted_task.LoopingCall(self._periodic_top_up)
+            self._top_up_task.start(self.top_up_interval_sec, now=False)
 
     def spider_closed(self, spider=None, reason: str | None = None):
         self.manual_bulk_crawls.close()
         if self._heartbeat_task is not None and self._heartbeat_task.running:
             self._heartbeat_task.stop()
         self._heartbeat_task = None
+        if self._top_up_task is not None and self._top_up_task.running:
+            self._top_up_task.stop()
+        self._top_up_task = None
 
     def _emit_heartbeat(self):
         runtime = self._downloader_runtime()
         scraper_runtime = self._scraper_runtime()
         scheduler_runtime = self._scheduler_runtime()
         domains_at_limit = self._count_domains_at_limit()
+        downloader = getattr(getattr(self.crawler, "engine", None), "downloader", None)
+        manual_active = sum(
+            "manual_bulk_crawl_job_id" in r.meta for r in getattr(downloader, "active", ()) or ()
+        )
+        stats = self.crawler.stats
+        consumer = self.manual_bulk_crawls
 
         logger.info(
             "spider.heartbeat",
@@ -354,12 +375,24 @@ class HtmlSpider(scrapy.Spider):
                 "engine_slot_inprogress": scheduler_runtime["engine_slot_inprogress"],
                 "scheduler_size": scheduler_runtime["scheduler_size"],
                 "domains_at_limit": domains_at_limit,
+                # Per-source counters; dequeued and save totals are cumulative.
+                "manual_active": manual_active,
+                "normal_active": len(getattr(downloader, "active", ()) or ()) - manual_active,
+                "manual_outstanding": len(consumer.inflight),
+                "dequeued_normal": stats.get_value("scheduler/dequeued/normal", 0),
+                "dequeued_manual": stats.get_value("scheduler/dequeued/manual", 0),
+                "manual_saves": consumer.saves,
+                "manual_save_ms": round(consumer.save_seconds * 1000),
             },
         )
 
     async def start(self):
         for domain_id, url in self._reserve_urls(reason="start", force=True):
             yield self._build_request(url, domain_id)
+
+    def _periodic_top_up(self):
+        if len(self._domain_pending) < self.domain_low_watermark:
+            self._maybe_top_up(reason="periodic")
 
     def on_idle(self):
         self._maybe_top_up(reason="idle", force=True)
@@ -411,10 +444,6 @@ class HtmlSpider(scrapy.Spider):
                 "domain": self._extract_domain(u),
                 "anchor": (link.text or "").strip()[:200]
             })
-
-        host = host_of(response.url)
-        if host == "youtube.com" or host.endswith(".youtube.com"):
-            extract_youtube_outlinks(response, outlinks)
 
         title = (response.xpath("//title/text()").get() or "").strip()[:500] or None
         hreflang_count = len(response.xpath(
@@ -500,6 +529,7 @@ class HtmlSpider(scrapy.Spider):
                 "domain": host_of(url),
                 "fail_reason": item["fail_reason"],
                 "status": status,
+                "source": "normal",
             },
         )
         self._finish_owned_request(reason="errback", domain_id=track_domain_id)
@@ -514,6 +544,13 @@ class HtmlSpider(scrapy.Spider):
                 "domain": host_of(request.url),
             },
         )
+    def req_dropped(self, request, spider=None):
+        # The scheduler can drop an owned request (e.g. a redirect target the
+        # dupefilter has seen); neither parse nor errback runs for it then.
+        domain_id = request.meta.get("_track_domain_id")
+        if domain_id:
+            self._finish_owned_request(reason="dropped", domain_id=domain_id)
+
     def req_start(self, request):
         t = datetime.now()
         request.meta["t_down_start"] = t
@@ -523,6 +560,7 @@ class HtmlSpider(scrapy.Spider):
                 "event": "request.start",
                 "url": request.url,
                 "domain": host_of(request.url),
+                "source": _source(request),
             },
         )
     def req_end(self, response, request):
@@ -540,6 +578,7 @@ class HtmlSpider(scrapy.Spider):
                 "event": "request.end",
                 "url": request.url,
                 "domain": host_of(request.url),
+                "source": _source(request),
                 "status": response.status,
                 "latency_ms": downloader_total_ms,
                 "download_latency_ms": download_latency_ms,

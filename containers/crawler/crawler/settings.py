@@ -1,5 +1,6 @@
-import json
 import os
+
+from crawler.site_policies import SitePolicies
 
 BOT_NAME = "crawler"
 LOG_LEVEL = os.getenv("CRAWLER_LOG_LEVEL", "WARNING")
@@ -11,8 +12,10 @@ ROBOTSTXT_OBEY = True
 
 DUPEFILTER_CLASS = "scrapy.dupefilters.BaseDupeFilter" # Disable dupefilter
 
-# One dispatch policy for all jobs on this crawler; balanced alternates sources.
-MANUAL_BULK_CRAWL_SCHEDULING_POLICY = os.getenv("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", "manual_first")
+# One dispatch policy for all jobs on this crawler; weighted gives manual work
+# MANUAL_BULK_CRAWL_SHARE_PERCENT of the dispatches while both sources have work.
+MANUAL_BULK_CRAWL_SCHEDULING_POLICY = os.getenv("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", "weighted")
+MANUAL_BULK_CRAWL_SHARE_PERCENT = int(os.getenv("MANUAL_BULK_CRAWL_SHARE_PERCENT", "50"))
 # FIFO keeps newly fed
 # requests from overtaking older ones at the same priority, including startup.
 SCHEDULER = "crawler.fair_scheduler.FairScheduler"
@@ -40,6 +43,20 @@ DEFAULT_REQUEST_HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
+# Apply site identity before RobotsTxtMiddleware (100). Header overrides also
+# cover retries, redirects, robots.txt, and both normal and manual requests.
+DOWNLOADER_MIDDLEWARES = {
+    # First: drops a redirect hop to a recently fetched target before any
+    # site policy or concurrency lease is taken.
+    "crawler.redirect_dedup.RedirectTargetDedupMiddleware": 50,
+    "crawler.middlewares.site_dispatcher.SiteMiddlewareDispatcher": 80,
+    "crawler.middlewares.retry_after.RetryAfterMiddleware": 90,
+    # Last before the downloader, first on responses/exceptions: robots fetches
+    # acquire separately; retries/redirects release before reacquiring a lease.
+    "crawler.middlewares.shared_concurrency.SharedConcurrencyMiddleware": 1000,
+}
+SPIDER_MIDDLEWARES = {"crawler.middlewares.site_dispatcher.SiteMiddlewareDispatcher": 500}
+
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
@@ -52,43 +69,20 @@ CONCURRENT_REQUESTS = int(os.getenv("CRAWLER_CONCURRENT_REQUESTS", "256"))
 SCRAPER_SLOT_MAX_ACTIVE_SIZE = int(
     os.getenv("CRAWLER_SCRAPER_SLOT_MAX_ACTIVE_SIZE", "100000000")
 )
-USE_AUTOTHROTTLE = _env_bool("CRAWLER_USE_AUTOTHROTTLE", False)
+_SITE_POLICIES = SitePolicies.load()
+_DEFAULT_POLICY = _SITE_POLICIES.config.default
+CRAWLER_THROTTLE_MODE = _DEFAULT_POLICY.crawler_mode
+CONCURRENT_REQUESTS_PER_DOMAIN = _DEFAULT_POLICY.request_limits.max_concurrent_requests
+DOWNLOAD_DELAY = _DEFAULT_POLICY.request_limits.min_request_delay_sec
 
-if USE_AUTOTHROTTLE:
-    CRAWLER_THROTTLE_MODE = "autothrottle"
-    CONCURRENT_REQUESTS_PER_DOMAIN = int(
-        os.getenv("CRAWLER_CONCURRENT_REQUESTS_PER_DOMAIN", "16")
-    )
-    DOWNLOAD_DELAY = float(os.getenv("CRAWLER_DOWNLOAD_DELAY", "0.25"))
-
-    AUTOTHROTTLE_ENABLED = True
-    AUTOTHROTTLE_START_DELAY = float(
-        os.getenv("CRAWLER_AUTOTHROTTLE_START_DELAY", "0.5")
-    )
-    AUTOTHROTTLE_MAX_DELAY = float(
-        os.getenv("CRAWLER_AUTOTHROTTLE_MAX_DELAY", "10.0")
-    )
-    AUTOTHROTTLE_TARGET_CONCURRENCY = float(
-        os.getenv("CRAWLER_AUTOTHROTTLE_TARGET_CONCURRENCY", "2.0")
-    )
-    AUTOTHROTTLE_DEBUG = _env_bool("CRAWLER_AUTOTHROTTLE_DEBUG", False)
-else:
-    CRAWLER_THROTTLE_MODE = "fixed"
-    with open("domain_qps.json") as f:
-        _DOMAIN_QPS = json.load(f)
-    _DEFAULT_QPS = _DOMAIN_QPS.pop("_default", {})
-
-    CONCURRENT_REQUESTS_PER_DOMAIN = int(
-        os.getenv(
-            "CRAWLER_CONCURRENT_REQUESTS_PER_DOMAIN",
-            str(_DEFAULT_QPS.get("concurrency", 4)),
-        )
-    )
-    DOWNLOAD_DELAY = float(
-        os.getenv("CRAWLER_DOWNLOAD_DELAY", str(_DEFAULT_QPS.get("delay", 1.0)))
-    )
-    DOWNLOAD_SLOTS = _DOMAIN_QPS
-    AUTOTHROTTLE_ENABLED = False
+# Keep the extension available when a domain selects AutoThrottle even if the
+# global mode is fixed. Fixed requests opt out through request metadata.
+AUTOTHROTTLE_ENABLED = True
+AUTOTHROTTLE_START_DELAY = float(os.getenv("CRAWLER_AUTOTHROTTLE_START_DELAY", "0.5"))
+AUTOTHROTTLE_MAX_DELAY = float(os.getenv("CRAWLER_AUTOTHROTTLE_MAX_DELAY", "10.0"))
+AUTOTHROTTLE_TARGET_CONCURRENCY = float(os.getenv("CRAWLER_AUTOTHROTTLE_TARGET_CONCURRENCY", "4.0"))
+AUTOTHROTTLE_DEBUG = _env_bool("CRAWLER_AUTOTHROTTLE_DEBUG", False)
+DOWNLOAD_SLOTS = _SITE_POLICIES.download_slots(start_delay=AUTOTHROTTLE_START_DELAY)
 
 # Keep a local request backlog so one slow domain does not block the next IPC batch.
 IPC_PREFETCH_LOW_WATERMARK_REQUESTS = CONCURRENT_REQUESTS * 2
@@ -96,6 +90,10 @@ IPC_PREFETCH_TARGET_REQUESTS = CONCURRENT_REQUESTS * 8
 
 # Reload domain files when active in-flight domains drop below this threshold.
 IPC_DOMAIN_LOW_WATERMARK = 144
+# Also check the watermark on a timer: completions of owned requests and
+# spider_idle are not enough once owned work has drained while manual bulk
+# crawls keep the engine busy.
+IPC_TOP_UP_INTERVAL_SEC = 5.0
 
 DNS_TIMEOUT = 15
 DOWNLOAD_TIMEOUT = 15
@@ -112,13 +110,12 @@ COOKIES_ENABLED = False
 
 # Memory & stats logging
 EXTENSIONS = {
+    "scrapy.extensions.throttle.AutoThrottle": None,
+    "crawler.autothrottle.SiteAutoThrottle": 500,
     "scrapy.extensions.logstats.LogStats": 500,
     "scrapy.extensions.memusage.MemoryUsage": 500,
 }
 
-DOWNLOADER_MIDDLEWARES = {
-    "crawler.redirect_dedup.RedirectTargetDedupMiddleware": 50,
-}
 # Skip re-fetching a redirect target fetched successfully within the TTL; the
 # queued URL is still reported (ok, no content). See crawler/redirect_dedup.py.
 REDIRECT_DEDUP_ENABLED = _env_bool("CRAWLER_REDIRECT_DEDUP_ENABLED", True)
@@ -137,4 +134,6 @@ MANUAL_BULK_CRAWL_QUEUE_DIR = os.getenv(
     "CRAWLER_MANUAL_BULK_CRAWL_QUEUE_DIR", "/data/manual_bulk_crawls/pending",
 )
 MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS = int(os.getenv("CRAWLER_MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS", "64"))
+# Outstanding manual requests per host: latency / delay rounded up, plus this headroom.
+MANUAL_BULK_CRAWL_HOST_HEADROOM = int(os.getenv("CRAWLER_MANUAL_BULK_CRAWL_HOST_HEADROOM", "1"))
 INTERVAL_MINUTES = 10

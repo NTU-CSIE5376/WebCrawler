@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import logging
+import time
 
 from sqlalchemy import text
 from sqlalchemy.orm import sessionmaker
 
 from .base import CandidateDomain, SelectionStrategy
+
+logger = logging.getLogger("offerer")
 
 
 class GoldenDiscoveryRankerV1Strategy(SelectionStrategy):
@@ -162,13 +166,26 @@ class GoldenDiscoveryRankerV1Strategy(SelectionStrategy):
                   AND EXISTS (
                     SELECT 1 FROM url_state_current_{sid:03d} u
                     WHERE u.domain_id = d.domain_id AND u.should_crawl = TRUE
+                    OFFSET 0
                   )
                 ORDER BY d.domain_score DESC NULLS LAST, d.domain_id
                 LIMIT :limit
                 """)
                 params = dict(base_params)
                 params["shard_id"] = sid
-                rows.extend(sess.execute(sql, params).fetchall())
+                # Keep EXISTS correlated. Without this optimization fence, YSQL
+                # can aggregate the entire crawlable URL index (21M rows on
+                # shard 146) before sorting domains and applying the LIMIT.
+                # OFFSET 0 preserves results and allows ordered domain-index
+                # traversal with a short-circuiting URL probe per domain.
+                started = time.monotonic()
+                shard_rows = sess.execute(sql, params).fetchall()
+                rows.extend(shard_rows)
+                logger.info("offer.peek_shard", extra={
+                    "event": "offer.peek_shard", "shard_id": sid,
+                    "elapsed_sec": round(time.monotonic() - started, 3),
+                    "candidates_returned": len(shard_rows),
+                })
 
         def sort_key(row):
             score = row.domain_score

@@ -10,11 +10,10 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from libs.db.sharding.history_partition import (
+    ensure_partitions,
     month_start,
     next_month,
     partition_month,
-    partition_name,
-    partition_of_sql,
     list_partitions_sql,
 )
 
@@ -59,9 +58,10 @@ class CounterRolloffService:
         return datetime.combine(now_utc.date(), run_t, tzinfo=timezone.utc)
 
     def _prune_history(self, table: str, shard_id: int) -> int:
-        """Retention for the partitioned ``*_history`` tables: provision the
-        current/next month partitions, then DROP whole partitions that are
-        entirely older than the retention window.
+        """Retention for the partitioned ``*_history`` tables: DROP whole
+        partitions that are entirely older than the retention window.
+        (Current/next month partitions are created up front by
+        ``_provision_history_partitions``.)
 
         This is an O(1) metadata operation per partition: no row scan, no dead
         tuples, space returned to the OS immediately. Tables not yet migrated to
@@ -81,17 +81,6 @@ class CounterRolloffService:
 
             existing = {child for (child,) in sess.execute(text(list_partitions_sql(name)))}
 
-            # Keep the write target ahead of the clock. Checked against the
-            # existing-partitions list rather than relying on CREATE TABLE IF
-            # NOT EXISTS: on YSQL that clause does not suppress the
-            # duplicate-composite-type error when the partition already
-            # exists, so it is not actually idempotent there.
-            for m in (month_start(now), next_month(now)):
-                child_name = partition_name(name, m)
-                if child_name not in existing:
-                    self._exec_with_retry(sess, partition_of_sql(name, name, m))
-                    existing.add(child_name)
-
             dropped = 0
             for child in sorted(existing):
                 month = partition_month(child)
@@ -99,6 +88,27 @@ class CounterRolloffService:
                     self._exec_with_retry(sess, f"DROP TABLE {child}")
                     dropped += 1
         return dropped
+
+    def _provision_history_partitions(self) -> int:
+        """Create the current and next month partitions of every partitioned
+        ``*_history`` table. Runs before the rolloff, which writes history rows:
+        if a month partition is missing the rolloff fails, and provisioning that
+        only ran after it would never be reached (the 2026-11-01 outage).
+        Returns the number of partitions created."""
+        now = datetime.now(timezone.utc)
+        months = [month_start(now), next_month(now)]
+        created = 0
+        for table in ("url_state_history", "content_feature_history"):
+            parents = [f"{table}_{shard_id:03d}" for shard_id in range(self.cfg.total_shards)]
+            try:
+                created += len(ensure_partitions(self.Session, parents, months))
+            except Exception as e:
+                logger.error(
+                    "accounting.history_provision_error",
+                    extra={"event": "accounting.history_provision_error",
+                           "table": table, "error": str(e)},
+                )
+        return created
 
     def _exec_with_retry(self, sess, sql: str, attempts: int = 3) -> None:
         """Run one DDL statement, retrying on YugabyteDB's distributed-read
@@ -277,8 +287,11 @@ class CounterRolloffService:
             "history_count": 0,
             "marked_count": 0,
             "stalled_batches": 0,
+            "history_provisioned": 0,
             "history_pruned": 0,
         }
+
+        totals["history_provisioned"] = self._provision_history_partitions()
 
         for shard_id in range(self.cfg.total_shards):
             while True:

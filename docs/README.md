@@ -18,3 +18,4 @@ This documentation set describes the architecture implemented in this repository
 7. [07-grafana-loki-observability.md](./07-grafana-loki-observability.md)
 8. [08-sitemap-patroller.md](./08-sitemap-patroller.md)
 9. [09-youtube-discovery.md](./09-youtube-discovery.md)
+10. [10-frontier-trap-rules.md](./10-frontier-trap-rules.md)

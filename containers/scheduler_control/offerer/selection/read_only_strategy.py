@@ -110,12 +110,15 @@ class ReadOnlyStrategy(SelectionStrategy):
                   AND EXISTS (
                     SELECT 1 FROM url_state_current_{sid:03d} u
                     WHERE u.domain_id = d.domain_id AND u.should_crawl = TRUE
+                    OFFSET 0
                   )
                 ORDER BY d.domain_score DESC NULLS LAST, d.domain_id
                 LIMIT :limit
                 """)
                 params = dict(base_params)
                 params["shard_id"] = sid
+                # Preserve the correlated probe, as in the production strategy;
+                # YSQL otherwise may aggregate the entire crawlable URL index.
                 rows.extend(sess.execute(sql, params).fetchall())
 
         def sort_key(row):
