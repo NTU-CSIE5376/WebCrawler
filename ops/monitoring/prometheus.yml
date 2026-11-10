@@ -1,7 +1,7 @@
 global:
-  scrape_interval: 30s
+  scrape_interval: 60s
   scrape_timeout: 10s
-  evaluation_interval: 30s
+  evaluation_interval: 60s
 
 # Alert evaluation and notification belong to existing Grafana 11, not a second
 # Alertmanager. These target files are explicit production allowlists.

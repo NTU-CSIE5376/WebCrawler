@@ -47,11 +47,47 @@ jobs:
           import json
           from pathlib import Path
           base = Path('/tmp/crawler-monitoring-checks')
-          expected = json.loads((base/'alerting/webcrawler-rules.json').read_text())['groups'][0]['rules']
+          groups = json.loads((base/'alerting/webcrawler-rules.json').read_text())['groups']
+          expected = [r for g in groups for r in g['rules']]
           loaded = json.loads((base/'loaded.json').read_text())
           assert {r['uid'] for r in loaded} == {r['uid'] for r in expected}
           assert all(r['isPaused'] for r in loaded)
+          assert {g['interval'] for g in groups} == {'60s','300s','600s'}
           print(f'Grafana 11 loaded {len(loaded)} paused rules; no Discord contact point provisioned.')
+          PY
+      - name: Validate quiet child routing on isolated Grafana only
+        run: |
+          python - <<'PY'
+          import base64, json
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          base = 'http://127.0.0.1:13098/api/v1/provisioning/'
+          def api(path, body=None, method='GET'):
+              req = Request(base + path, method=method,
+                  data=None if body is None else json.dumps(body).encode(),
+                  headers={'Authorization': 'Basic ' + base64.b64encode(b'admin:admin').decode(),
+                           'Content-Type': 'application/json'})
+              with urlopen(req, timeout=10) as response:
+                  return json.loads(response.read() or b'{}')
+          # Paused rules only; this receiver is a loopback sink, never Discord.
+          api('contact-points', {'uid':'wc-ci-sink','name':'webcrawler-discord',
+              'type':'webhook','settings':{'url':'http://127.0.0.1:1/not-a-notifier'},
+              'disableResolveMessage':True}, 'POST')
+          original = api('policies')
+          route = json.loads(Path('ops/monitoring/notification-route.example.json').read_text())
+          policy = json.loads(json.dumps(original))
+          policy.setdefault('routes', []).append(route)
+          api('policies', policy, 'PUT')
+          actual = api('policies')
+          assert actual['receiver'] == original['receiver']
+          child = actual['routes'][-1]
+          assert child['group_by'] == ['project','severity','service']
+          assert child['repeat_interval'] == '2h'
+          warning = child['routes'][0]
+          assert warning['group_by'] == ['project','severity']
+          assert warning['group_wait'] == warning['group_interval'] == '1h'
+          assert warning['repeat_interval'] == '24h'
+          print('Grafana 11 accepted scoped grouping and quiet warning timing; no sender tested.')
           PY
       - name: Grafana smoke logs and cleanup
         if: always()

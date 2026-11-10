@@ -53,8 +53,41 @@ services:
     mem_limit: 128m
     logging: *logging
 
+  # Shadow is opt-in. It only queries metrics/logs and writes its own journal.
+  crawler-shadow:
+    profiles: [shadow]
+    image: python:3.12.12-slim-bookworm
+    restart: unless-stopped
+    command:
+      - python
+      - -B
+      - /app/shadow.py
+      - --config
+      - /app/monitoring.json
+      - --prometheus-url
+      - http://crawler-prometheus:9090
+      - --loki-url
+      - http://loki:3100
+      - --output-dir
+      - /state/shadow
+      - --groups
+      - ${SHADOW_GROUPS:-fast}
+    volumes:
+      - ./shadow.py:/app/shadow.py:ro
+      - ./render_alerting.py:/app/render_alerting.py:ro
+      - ./runtime/monitoring.json:/app/monitoring.json:ro
+      - crawler-shadow-data:/state
+    networks: [monitoring, crawler]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
+    cpus: 0.25
+    logging: *logging
+
 volumes:
   crawler-prometheus-data:
+  crawler-shadow-data:
 
 networks:
   monitoring:

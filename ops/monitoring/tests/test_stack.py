@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_prometheus_targets_and_grafana_datasource_agree():
     prom = yaml.safe_load((ROOT / "prometheus.yml").read_text())
     jobs = {item["job_name"]: item for item in prom["scrape_configs"]}
+    assert prom["global"]["scrape_interval"] == "60s"
     assert set(jobs) == {
         "crawler-prometheus",
         "crawler-node",
@@ -35,6 +36,7 @@ def test_prometheus_targets_and_grafana_datasource_agree():
     assert datasource["uid"] == "crawler-prometheus"
     assert datasource["isDefault"] is False
     assert datasource["url"] == "http://crawler-prometheus:9090"
+    assert datasource["jsonData"]["timeInterval"] == "60s"
 
 
 def test_stack_cannot_restart_business_services_or_mount_docker_socket():
@@ -44,6 +46,7 @@ def test_stack_cannot_restart_business_services_or_mount_docker_socket():
         "crawler-prometheus",
         "crawler-pipeline",
         "crawler-blackbox",
+        "crawler-shadow",
     }
     assert stack["networks"]["crawler"]["external"] is True
     for service in stack["services"].values():
@@ -56,6 +59,12 @@ def test_stack_cannot_restart_business_services_or_mount_docker_socket():
     assert pipeline["read_only"] is True
     assert pipeline["cap_drop"] == ["ALL"]
     assert stack["services"]["crawler-prometheus"]["ports"][0].startswith("127.0.0.1:")
+    shadow = stack["services"]["crawler-shadow"]
+    assert shadow["profiles"] == ["shadow"]
+    assert shadow["command"][-1] == "${SHADOW_GROUPS:-fast}"
+    assert not any("/data/ipc" in mount for mount in shadow["volumes"])
+    assert shadow["read_only"] is True
+    assert "DISCORD" not in str(shadow) and "GF_" not in str(shadow)
 
 
 def test_host_exporter_observes_host_and_excludes_virtual_filesystems():
@@ -113,3 +122,18 @@ def test_example_worker_manifest_matches_both_consumers():
     for stage in config["stages"]:
         assert set(stage["workers"]) == expected
         assert stage["interval_minutes"] == 10
+
+
+def test_route_fragment_groups_workers_and_keeps_warning_notifications_quiet():
+    # A child route fragment only: never a replace-all provisioning policy.
+    route = json.loads((ROOT / "notification-route.example.json").read_text())
+    assert "policies" not in route and "apiVersion" not in route
+    assert route["object_matchers"] == [["project", "=", "webcrawler"]]
+    assert route["group_by"] == ["project", "severity", "service"]
+    assert route["repeat_interval"] == "2h"
+    warning = route["routes"][0]
+    assert warning["object_matchers"] == [["severity", "=", "warning"]]
+    assert warning["group_by"] == ["project", "severity"]
+    assert warning["group_wait"] == warning["group_interval"] == "1h"
+    assert warning["repeat_interval"] == "24h"
+    assert "worker" not in str(route) and "alertname" not in str(route)

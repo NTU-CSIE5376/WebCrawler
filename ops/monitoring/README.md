@@ -30,6 +30,80 @@ HTTP/TCP 探測 ─────────────────┘          
 
 `request.start` 不是實際送出的 QPS，因此不拿它當成功產量。`request.end` 仍只是第一版代理指標：下一階段應增加「已保存的有效 HTML」與「已 commit 的筆數」。normal／API 的新增 source 標記也不是這版啟用的前提。
 
+## 先控制成本，再決定要不要通知
+
+規則分成三個 evaluation group，UID、門檻與查詢語意維持一致：
+
+| Group | 頻率 | 內容 |
+| --- | --- | --- |
+| `fast` | 60 秒 | 主機／採集健康、心跳、錯誤、IPC lag、golden 狀態 |
+| `symptoms` | 300 秒 | 各 worker 有工作卻沒有完成回應 |
+| `trends` | 600 秒 | 整體產量相對歷史基準下降 |
+
+Prometheus 每 60 秒抓一次資料，IPC 採集每 60 秒更新；DB probe 每台每分鐘只建立一次短暫 TCP 連線，不登入、不執行 SQL。這些依然有成本，不是零負擔。
+
+**門檻大多是未校準的起始值，不是根據長期 production 數據算出的 SLO。** 心跳預設 5 秒、FolderReader 的兩倍 interval、weekly cron 和已知 skipped 179 有現場／程式依據；15%／8%、一小時 lag、50% 產量下降與其他寬限時間仍需觀察。每 10 分鐘評估一次趨勢也可能漏掉短暫下降，不能宣稱連續逐秒觀測。
+
+2026-11-10 約 18:09 台北時間的唯讀單次量測：
+
+- 在 .2 對 48 組 stage／worker 完整採集約 35ms、CPU 約 28ms、Python 最高 RSS 約 19MiB；48 組皆成功。
+- 原本整體產量查詢約 4.47s，Loki 統計處理約 803MB／182 萬筆日誌。這不是實際磁碟讀取量，但證明不能每條規則都頻繁重掃。
+- .1 `/data` 可用比例約 7.85%，已低於起始 critical 門檻；inode 使用約 0.022%。本 PR 未部署，因此不會自動通知這個現況。
+
+這些只是快照，不是持續效能驗證，也不能證明新頻率對 crawler 沒影響。要依下列觀察流程再決定啟用哪些規則。
+
+## 真正不通知的觀察模式
+
+`paused` 的 Grafana 規則完全不評估，因此不能用來驗證誤報。本 PR 另有 `shadow.py`，直接使用**同一份 generator 的查詢、門檻、pending 與 group 頻率**，只 GET Prometheus／Loki、寫入自己的觀察紀錄。它不呼叫 Grafana、不讀 Discord secret，沒有通知程式，也不更動既有 notification policy。
+
+預設只開 `fast`。重查詢需明確加 `symptoms,trends`；第一次 symptoms／trends 分別延後 5／10 分鐘，不在啟動瞬間全部執行。一次只做一個查詢，拒絕同一輸出目錄多個 observer；同一輪相同查詢共用結果。每輪有 20 秒預算，超出就記錄 skipped／unknown，不能當正常；單查詢有 5 秒 server／socket timeout。預算是在查詢之間檢查，**不是後端 CPU 或整輪耗時的硬上限**。
+
+```bash
+# 只是操作範例：本 PR 不執行 production 部署。
+# 先確認基礎監控已部署，再選擇啟動觀察 profile，仍不啟用 Grafana 告警。
+docker compose -f compose.yml --profile shadow up -d crawler-shadow
+
+# 觀察採集成本穩定後，才逐組增加查詢。
+SHADOW_GROUPS=fast,symptoms,trends docker compose -f compose.yml --profile shadow up -d crawler-shadow
+
+# 報告只讀本機 state，不發查詢／通知。
+docker compose -f compose.yml --profile shadow exec -T crawler-shadow \
+  python -B /app/shadow.py --report --output-dir /state/shadow
+
+# 停止觀察只停新增的 observer，不動 crawler／ingestor／DB。
+docker compose -f compose.yml --profile shadow stop crawler-shadow
+```
+
+獨立 CLI 用法：
+
+```bash
+python ops/monitoring/shadow.py \
+  --config ops/monitoring/runtime/monitoring.json \
+  --prometheus-url http://127.0.0.1:9098 --loki-url http://127.0.0.1:3100 \
+  --output-dir ops/monitoring/runtime/shadow --groups fast
+python ops/monitoring/shadow.py --report --output-dir ops/monitoring/runtime/shadow
+```
+
+`--once` 只執行當下到期的工作，仍遵守 warm-up，不能用啟動時的一次執行宣稱已驗證 trends。預設 `fast` 觀察也不能宣稱覆蓋全部規則。
+
+觀察紀錄包括各規則觸發次數、狀態切換、查詢錯誤、漏評次數、耗時，以及 Loki 回傳的處理 bytes／lines。報告會列出 active groups／實際規則數、每條規則的觀察起點與資料新鮮度；停止 observer 後讀舊檔會標為 stale，最後已知狀態不代表當下健康。更動規則或重新加入停止觀察的 group 會開始新的該規則統計期間，不把不同版本混算。狀態與 journal 為 0600、目錄為 0700，journal 輪替保留最多三份、各最多 10MiB；累計統計保留在小型 state。只寫自己的 named volume，不寫 IPC 或 DB。shadow container 上限 0.25 CPU／128MiB；**此限制管不到既有 Loki 因查詢新增的工作量**。
+
+這是 threshold／pending 的觀察工具，不是 Grafana 的完整複製：missing series 的解除時機可能不同，報告的 firing episodes **不是 Discord 通知數**；分組、重送與通知成功都還需正式接線後實測。
+
+建議先比對 30～60 分鐘的基準，再從 `fast` 逐類加入；完整候選組觀察 24～48 小時。每次檢查 crawler 產量、IPC lag、Loki CPU／記憶體／query latency、磁碟等待與 observer 的錯誤／skip。若出現持續惡化或重查詢大量漏評，先停止該組並調整，不能為了告警拖慢業務。24～48 小時結束**不會自動啟用 Discord**。
+
+## 通知合併與降噪
+
+`notification-route.example.json` 是待人工加入既有 policy 的 **child route 片段**，不是可以直接匯入整棵 policy 的 provisioning 檔。generator 不會自動套用它。
+
+- 只匹配 `project=webcrawler`，保留其他人的 root receiver／路由。
+- 嚴重告警依 `project,severity,service` 合併，不以 worker 或 alertname 拆組；等 30 秒合併、更新至少間隔 5 分鐘、未變化每 2 小時重送。
+- warning 全部依 `project,severity` 合併；首次等 1 小時、更新至少間隔 1 小時、未變化每 24 小時重送。若在 group wait 內恢復，可能不發通知。
+- Discord message 只列最多 6 項簡短摘要及 Grafana 入口，避免一次大量 worker 錯誤塞滿訊息。
+- 已知事件用**有期限**的 silence；不是永久忽略容量不足。
+
+這是合併與節流，**不是每小時最多 N 則的硬上限**；多個 critical service group、恢復或反覆觸發仍可能產生多則。shadow 先用於辨識誤報與抖動，實際訊息數／傳送成功仍需接線測試。初次啟用建議只開容量、失聯、OOM、入庫批次失敗，其他規則等觀察結果合理再開。
+
 ## 設定與保護
 
 - `monitoring.example.json` 是明確的預期 worker 清單與進度路徑；部署時應比對 Supervisor **實際啟用**清單，不是把所有測試 container 都視為 production。worker 增減要同步改設定。
@@ -38,7 +112,7 @@ HTTP/TCP 探測 ─────────────────┘          
 - 指標 label 僅使用有限的 stage、worker、host、service，不放 URL、domain 或 job ID。
 - `compose.yml` 是獨立 project；`compose.node.yml` 是每台主機獨立 project。不要把它們當作正式 `docker-compose.yml` 的 override。
 - 本 PR 不修改現有 Compose、Grafana datasource provisioning、Loki 或 production hotfix。`grafana-datasource.yml` 是待部署的新 datasource 檔，不會自動載入。
-- 所有 Grafana 規則預設 **paused**。未提供 webhook、未確認 routing 時，generator 拒絕產生 enabled 規則。generator 不呼叫 Grafana／Discord，也不發測試通知。
+- 所有 Grafana 規則預設 **paused**。未提供 webhook、未確認 routing，或未逐項提供 `--enable-rule UID` 時，generator 拒絕產生 enabled 規則；其餘規則繼續 paused。generator 不呼叫 Grafana／Discord，也不發測試通知。
 - `runtime/` 不進 Git。生成目錄 0700、檔案 0600；contact point 檔含 webhook，勿貼到 PR、log 或聊天。Grafana 載入前要另以正確 UID 與唯讀權限安置檔案。
 
 ## 本機驗證（不部署、不發通知）
@@ -73,8 +147,8 @@ python ops/monitoring/pipeline_exporter.py \
 5. 檢查 Prometheus targets、採集錯誤、可用容量、lag 與 worker 心跳是否符合現場。Prometheus UI 綁 .2 loopback 9098；不要對外開放未認證的監控介面。先確認 target 清單與實際 production 相符，排除未部署服務。
 6. 待 review 核准後，只新增 `crawler-prometheus` datasource 檔與 paused 告警檔到**既有** Grafana provisioning。先查是否已有相同 UID，避免覆蓋別人的設定。現有 Loki datasource 不改、預設 datasource 不改。reload／重啟 Grafana 前先確認不影響他人；不需重啟 crawler。
 7. Discord 資訊提供後，用環境 secret 產生私有 contact point 檔，安置為 Grafana UID 可讀的唯讀檔。由現有 notification policy 加一條 `project=webcrawler` **child route** 指到 `webcrawler-discord`；保留其他路由。generator 刻意不產生 `policies`，避免整棵覆蓋。
-8. 建議 group by `project,severity,service,host`，group wait 30s、group interval 5m、repeat 2h，讓同一服務多個 worker 合併通知。維護時用 silence。Grafana 11 沒有這裡需要的自訂根因抑制，Loki 或主機失聯仍可能造成多組關聯告警。
-9. 經人工確認 routing 與 targets 後，`--enable --routing-confirmed` 才產生 enabled 檔。使用新的私有輸出目錄；替換前檢查差異。這個旗標是操作人員的確認，不會透過 API 驗證路由。
+8. 先依觀察模式分組試跑並檢查成本與誤報。之後才參考 `notification-route.example.json` 加入 child route，確認 grouping 不含 worker／alertname。Grafana 11 沒有這裡需要的自訂根因抑制，Loki 或主機失聯仍可能造成多組關聯告警。
+9. 經人工確認 routing、targets 與觀察結果後，以 `--enable --routing-confirmed --enable-rule wc-ingest-error` 等明確 UID 清單產生檔案；可重複 `--enable-rule`。只有列出的規則解除 paused，其餘維持暫停，CLI 會印出 enabled 數量。使用新的私有輸出目錄；替換前檢查差異。這個旗標是操作人員的確認，不會透過 API 驗證路由。
 10. 在隔離測試目標上依序驗證：worker 心跳缺席、target down、虛擬容量不足、IPC ready／未 ready、batch error，以及 Discord 收到與解除通知。不要停 production 程序來測告警。最後再次比對 hotfix hash、PID 與爬量。
 
 回滾只移除／暫停本 PR 新增的告警與監控 project；保留 Prometheus volume 供調查。不要對既有 production Compose 執行 `down` 或 `down -v`。

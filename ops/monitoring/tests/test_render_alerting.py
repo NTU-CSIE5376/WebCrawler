@@ -19,6 +19,25 @@ SPEC.loader.exec_module(renderer)
 CONFIG = {"expected_crawlers": ["00", "15"]}
 
 
+def test_costly_queries_are_separated_from_fast_incident_checks():
+    groups = renderer.build_provisioning(CONFIG)["webcrawler-rules.json"]["groups"]
+    by_rule = {
+        rule["uid"]: (group["name"], group["interval"])
+        for group in groups
+        for rule in group["rules"]
+    }
+    assert by_rule["wc-output-drop"] == ("webcrawler-trends", "600s")
+    assert by_rule["wc-no-output-0"] == ("webcrawler-symptoms", "300s")
+    assert by_rule["wc-no-output-15"] == ("webcrawler-symptoms", "300s")
+    for uid in (
+        "wc-target-down",
+        "wc-ingest-error",
+        "wc-heartbeat-0",
+        "wc-pipeline-lag",
+    ):
+        assert by_rule[uid] == ("webcrawler-fast", "60s")
+
+
 def webhook() -> str:
     # Deliberately synthetic; no real Discord credential is used or contacted.
     return "https://discord.com/api/" + "webhooks/123456789/" + "x" * 24
@@ -49,14 +68,41 @@ def test_enable_requires_both_secret_and_acknowledged_project_route():
     with pytest.raises(ValueError, match="Enabling requires"):
         renderer.build_provisioning(CONFIG, enabled=True, webhook=webhook())
     documents = renderer.build_provisioning(
-        CONFIG, enabled=True, webhook=webhook(), routing_confirmed=True
+        CONFIG,
+        enabled=True,
+        webhook=webhook(),
+        routing_confirmed=True,
+        enabled_rule_uids=["wc-ingest-error", "wc-heartbeat-0"],
     )
-    assert all(not rule["isPaused"] for rule in rules(documents).values())
+    assert {uid for uid, rule in rules(documents).items() if not rule["isPaused"]} == {
+        "wc-ingest-error",
+        "wc-heartbeat-0",
+    }
     contact = documents["webcrawler-contactpoints.json"]["contactPoints"][0]
     assert contact["name"] == "webcrawler-discord"
     assert contact["receivers"][0]["type"] == "discord"
     assert contact["receivers"][0]["settings"]["url"] == webhook()
     assert webhook() not in json.dumps(documents["webcrawler-rules.json"])
+    message = contact["receivers"][0]["settings"]["message"]
+    assert "lt $i 6" in message and "ExternalURL" in message
+    assert "default.message" not in message and "Annotations.description" not in message
+
+
+def test_enabling_cannot_accidentally_unpause_all_rules():
+    with pytest.raises(ValueError, match="explicit"):
+        renderer.build_provisioning(
+            CONFIG, enabled=True, webhook=webhook(), routing_confirmed=True
+        )
+    with pytest.raises(ValueError, match="unknown"):
+        renderer.build_provisioning(
+            CONFIG,
+            enabled=True,
+            webhook=webhook(),
+            routing_confirmed=True,
+            enabled_rule_uids=["wc-does-not-exist"],
+        )
+    with pytest.raises(ValueError, match="enable"):
+        renderer.build_provisioning(CONFIG, enabled_rule_uids=["wc-ingest-error"])
 
 
 @pytest.mark.parametrize(
@@ -189,6 +235,33 @@ def test_cli_does_not_echo_secret_in_failure_or_success(tmp_path, monkeypatch, c
     output = capsys.readouterr()
     assert "sensitive-invalid-credential" not in output.out + output.err
     assert not (tmp_path / "other").exists()
+
+
+def test_cli_requires_individually_reviewed_rules_before_enabling(
+    tmp_path, monkeypatch
+):
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps(CONFIG))
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", webhook())
+    output = tmp_path / "selected"
+    args = [
+        "--config",
+        str(config),
+        "--output",
+        str(output),
+        "--enable",
+        "--routing-confirmed",
+    ]
+    assert renderer.main(args) == 1
+    assert not output.exists()
+    assert renderer.main([*args, "--enable-rule", "wc-ingest-error"]) == 0
+    groups = json.loads((output / "webcrawler-rules.json").read_text())["groups"]
+    assert [
+        rule["uid"]
+        for group in groups
+        for rule in group["rules"]
+        if not rule["isPaused"]
+    ] == ["wc-ingest-error"]
 
 
 @pytest.mark.parametrize("workers", [[], ["00", "0"], [0], ["arbitrary-domain"], "00"])

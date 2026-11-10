@@ -1,7 +1,7 @@
 """Render opt-in Grafana 11 provisioning; never call Grafana or Discord.
 
 Default output has paused rules. To enable later, supply DISCORD_WEBHOOK_URL,
---enable and --routing-confirmed after adding the project=webcrawler child route
+--enable, explicit --enable-rule UIDs and --routing-confirmed after adding the project=webcrawler child route
 in Grafana. This tool deliberately never provisions the existing policy tree.
 Generated contact-point files contain a secret: keep the output directory private.
 """
@@ -19,6 +19,15 @@ from urllib.parse import urlsplit
 PROMETHEUS_UID = "crawler-prometheus"
 LOKI_UID = "loki"
 CONTACT_POINT = "webcrawler-discord"
+DISCORD_MESSAGE = (
+    "{{ .Status }} | {{ len .Alerts.Firing }} firing / "
+    "{{ len .Alerts.Resolved }} resolved\n"
+    "{{ range $i, $alert := .Alerts }}{{ if lt $i 6 }}"
+    "• {{ $alert.Annotations.summary }}"
+    "{{ with $alert.Labels.worker }} (worker {{ . }}){{ end }}\n"
+    "{{ end }}{{ end }}"
+    "最多列出 6 項；完整狀態：{{ .ExternalURL }}"
+)
 
 
 def validate_webhook(value: str) -> str:
@@ -142,6 +151,7 @@ def build_provisioning(
     enabled: bool = False,
     webhook: str | None = None,
     routing_confirmed: bool = False,
+    enabled_rule_uids: list[str] | None = None,
 ) -> dict[str, dict]:
     """Return independent provisioning documents; no API/notification side effects."""
     if not isinstance(config, dict):
@@ -152,6 +162,14 @@ def build_provisioning(
         raise ValueError(
             "Enabling requires DISCORD_WEBHOOK_URL and --routing-confirmed"
         )
+    if enabled and (
+        not isinstance(enabled_rule_uids, list)
+        or not enabled_rule_uids
+        or not all(isinstance(uid, str) for uid in enabled_rule_uids)
+    ):
+        raise ValueError("Enabling requires an explicit --enable-rule allowlist")
+    if not enabled and enabled_rule_uids:
+        raise ValueError("--enable-rule also requires --enable")
     org_id = config.get("org_id", 1)
     if isinstance(org_id, bool) or not isinstance(org_id, int) or org_id < 1:
         raise ValueError("org_id must be a positive integer")
@@ -173,7 +191,7 @@ def build_provisioning(
     rules = []
 
     def add(uid: str, title: str, expression: str, **kwargs) -> None:
-        rules.append(_rule(uid, title, expression, paused=not enabled, **kwargs))
+        rules.append(_rule(uid, title, expression, paused=True, **kwargs))
 
     add(
         "target-down",
@@ -394,17 +412,38 @@ def build_provisioning(
             description=f"本次 skipped_count 高於設定基準 {baseline}。確認新增的非法 URL、來源格式與 normalization；已知基準不會單獨重複觸發此告警。",
         )
 
+    if enabled:
+        requested = set(enabled_rule_uids)
+        if not requested <= {rule["uid"] for rule in rules}:
+            raise ValueError("unknown enabled rule UID")
+        for rule in rules:
+            rule["isPaused"] = rule["uid"] not in requested
+
+    # Only the expensive response scans are slowed down. Keep missing-worker and
+    # data-loss checks responsive without re-running 30-minute scans every minute.
+    grouped = {"fast": [], "symptoms": [], "trends": []}
+    for rule in rules:
+        if rule["uid"] == "wc-output-drop":
+            tier = "trends"
+        elif rule["uid"].startswith("wc-no-output-"):
+            tier = "symptoms"
+        else:
+            tier = "fast"
+        grouped[tier].append(rule)
+    intervals = {"fast": "60s", "symptoms": "300s", "trends": "600s"}
     documents = {
         "webcrawler-rules.json": {
             "apiVersion": 1,
             "groups": [
                 {
                     "orgId": org_id,
-                    "name": "webcrawler-health",
+                    "name": f"webcrawler-{tier}",
                     "folder": "WebCrawler Alerts",
-                    "interval": "60s",
-                    "rules": rules,
-                },
+                    "interval": intervals[tier],
+                    "rules": group_rules,
+                }
+                for tier, group_rules in grouped.items()
+                if group_rules
             ],
         }
     }
@@ -422,7 +461,7 @@ def build_provisioning(
                             "disableResolveMessage": False,
                             "settings": {
                                 "url": webhook,
-                                "message": '{{ template "default.message" . }}',
+                                "message": DISCORD_MESSAGE,
                             },
                         },
                     ],
@@ -450,6 +489,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--enable", action="store_true")
     parser.add_argument(
+        "--enable-rule",
+        action="append",
+        default=[],
+        help="Explicit rule UID to enable; repeat for each reviewed rule",
+    )
+    parser.add_argument(
         "--routing-confirmed",
         action="store_true",
         help="Confirm the existing Grafana policy has a project=webcrawler child route",
@@ -462,6 +507,7 @@ def main(argv: list[str] | None = None) -> int:
             enabled=args.enable,
             webhook=os.environ.get("DISCORD_WEBHOOK_URL"),
             routing_confirmed=args.routing_confirmed,
+            enabled_rule_uids=args.enable_rule,
         )
         write_documents(args.output, documents)
     except (OSError, ValueError, TypeError) as error:
@@ -471,8 +517,14 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    rules = [
+        rule
+        for group in documents["webcrawler-rules.json"]["groups"]
+        for rule in group["rules"]
+    ]
+    active = sum(not rule["isPaused"] for rule in rules)
     print(
-        f"Rendered {len(documents)} provisioning file(s); rules are {'enabled' if args.enable else 'paused'}."
+        f"Rendered {len(documents)} provisioning file(s); {active}/{len(rules)} rules enabled."
     )
     return 0
 

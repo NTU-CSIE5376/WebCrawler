@@ -8,5 +8,5 @@ datasources:
     isDefault: false
     jsonData:
       httpMethod: POST
-      timeInterval: 30s
+      timeInterval: 60s
       queryTimeout: 15s

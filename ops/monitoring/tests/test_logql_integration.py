@@ -7,6 +7,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 import pytest
+from ops.monitoring import shadow
 from ops.monitoring.render_alerting import LOKI_UID, build_provisioning
 
 
@@ -36,7 +37,8 @@ def rules():
     docs = build_provisioning({"expected_crawlers": ["00", "15"]})
     return {
         rule["uid"]: rule
-        for rule in docs["webcrawler-rules.json"]["groups"][0]["rules"]
+        for group in docs["webcrawler-rules.json"]["groups"]
+        for rule in group["rules"]
         if rule["data"][0]["datasourceUid"] == LOKI_UID
     }
 
@@ -94,3 +96,31 @@ def test_real_heartbeat_work_and_response_signals(loki):
     with urlopen(request, timeout=10) as response:
         assert response.status == 204
     assert maximum("wc-no-output-0") == 0
+
+
+def test_shadow_client_queries_real_loki_at_the_requested_time(loki):
+    now = time.time()
+    payload = {
+        "streams": [
+            {
+                "stream": {"event": "shadow.integration"},
+                "values": [[str(int((now - 1) * 1_000_000_000)), "test fixture"]],
+            }
+        ]
+    }
+    request = Request(
+        loki + "/loki/api/v1/push",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=10) as response:
+        assert response.status == 204
+    client = shadow.QueryClient("http://127.0.0.1:1", loki)
+    data = client.query(
+        LOKI_UID,
+        'sum(count_over_time({event="shadow.integration"}[2m])) or vector(0)',
+        now,
+    )
+    assert data["resultType"] == "vector"
+    assert max(float(sample["value"][1]) for sample in data["result"]) > 0
