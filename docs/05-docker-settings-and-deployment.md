@@ -82,6 +82,10 @@ parent, allowing it to drain and join parser children. After 60 seconds it kills
 the process group. Compose allows 90 seconds before forcibly stopping the
 container. Recreate the container to apply Compose environment or grace-period
 changes; rebuild the image when changing the copied Supervisor configuration.
+The crawler container sets both `nofile` limits to 4,096, and Supervisor sets
+`minfds=4096` so workers inherit enough descriptors for sockets, DNS, parser
+IPC, and output files. Recreate the container to apply the Compose limits;
+reloading Supervisor configuration does not change limits of running workers.
 On Linux, each parser child also registers `PR_SET_PDEATHSIG=SIGKILL` and checks
 the expected parent PID, so an abruptly killed crawler cannot leave its parser
 children running. Failure to register the signal fails worker initialization.
