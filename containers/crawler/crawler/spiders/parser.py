@@ -28,14 +28,21 @@ class CanonicalLinkExtractor(LinkExtractor):
         # Scrapy adds the leading dots; preserve its exact suffix strings.
         self._denied_suffixes = tuple(self.deny_extensions)
 
-    def _link_allowed(self, link: Link) -> bool:
+    def _link_allowed(self, link: Link, schemes: set[str] | None = None) -> bool:
         if (self.allow_res or self.deny_res or self.allow_domains
                 or self.deny_domains or self.restrict_text):
-            return super()._link_allowed(link)
-        return (
-            link.url.split("://", 1)[0] in {"http", "https", "file", "ftp"}
-            and not urlparse(link.url).path.lower().endswith(self._denied_suffixes)
-        )
+            if schemes is None:
+                return super()._link_allowed(link)
+            return super()._link_allowed(link, schemes)
+        parsed_url = urlparse(link.url)
+        if schemes is None:
+            # Before Scrapy 2.20, the callback used a fixed scheme whitelist.
+            if link.url.split("://", 1)[0] not in {"http", "https", "file", "ftp"}:
+                return False
+        elif schemes and parsed_url.scheme not in schemes:
+            # Scrapy 2.20 passes response/configured schemes; empty allows all.
+            return False
+        return not parsed_url.path.lower().endswith(self._denied_suffixes)
 
 
 class HtmlParser:

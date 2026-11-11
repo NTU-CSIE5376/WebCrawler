@@ -1,6 +1,7 @@
 """Keep stock Scrapy link semantics while optimizing the normal crawl path."""
 from html import escape
 import asyncio
+import inspect
 from pathlib import Path
 import sys
 from unittest.mock import Mock
@@ -47,7 +48,21 @@ HTML = ('<html><head><base href="https://example.com/base/"></head><body>'
     {"restrict_text": r"link [0-9]$"}, {"restrict_css": ".links"},
     {"restrict_xpaths": '//div[@class="links"]'}, {"unique": False},
 ])
-def test_links_match_stock_scrapy_including_order_and_metadata(options):
+@pytest.mark.parametrize("url", [
+    "https://example.com/root/index.html", "ftp://example.com/page", "file:///tmp/page",
+])
+def test_links_match_stock_scrapy_including_order_and_metadata(options, url):
+    expected = LinkExtractor(canonicalize=True, **options).extract_links(page(HTML, url))
+    actual = CanonicalLinkExtractor(**options).extract_links(page(HTML, url))
+    assert actual == expected
+
+
+@pytest.mark.skipif("schemes" not in inspect.signature(LinkExtractor).parameters,
+                    reason="Configurable schemes require Scrapy 2.20")
+@pytest.mark.parametrize("schemes", [[], ["https"], ["ftp", "file"], ["mailto"]])
+@pytest.mark.parametrize("filters", [{}, {"allow": r"example.com"}])
+def test_configured_schemes_match_stock_scrapy(schemes, filters):
+    options = {"schemes": schemes, **filters}
     expected = LinkExtractor(canonicalize=True, **options).extract_links(page(HTML))
     actual = CanonicalLinkExtractor(**options).extract_links(page(HTML))
     assert actual == expected
