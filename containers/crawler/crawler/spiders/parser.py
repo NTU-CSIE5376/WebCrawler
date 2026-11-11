@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 from scrapy.http import TextResponse
 from scrapy.link import Link
-from scrapy.linkextractors import LinkExtractor, _is_valid_url
+from scrapy.linkextractors import LinkExtractor
 from scrapy.utils.defer import maybe_deferred_to_future
 from twisted.internet.defer import Deferred, DeferredSemaphore, succeed
 from twisted.internet.threads import deferToThread
@@ -33,7 +33,7 @@ class CanonicalLinkExtractor(LinkExtractor):
                 or self.deny_domains or self.restrict_text):
             return super()._link_allowed(link)
         return (
-            _is_valid_url(link.url)
+            link.url.split("://", 1)[0] in {"http", "https", "file", "ftp"}
             and not urlparse(link.url).path.lower().endswith(self._denied_suffixes)
         )
 
