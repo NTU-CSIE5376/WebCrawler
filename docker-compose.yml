@@ -121,7 +121,10 @@ services:
       dockerfile: containers/crawler/Dockerfile
     container_name: crawler
     init: true
+    # Longer than Supervisor's 60-second worker shutdown timeout.
+    stop_grace_period: 90s
     environment:
+      - CRAWLER_PARSER_PROCESSES=${CRAWLER_PARSER_PROCESSES:-2}
       - MANUAL_BULK_CRAWL_SCHEDULING_POLICY=weighted
     dns:
       - 8.8.8.8

@@ -39,6 +39,14 @@ def host_of(url: str | None) -> str:
     return (urlsplit(url).hostname or "").lower() if url else ""
 
 
+def domain_of(url: str) -> str:
+    """Return the public-suffix domain, retaining IPs and suffixless names."""
+    import tldextract
+
+    extracted = tldextract.extract(url)
+    return ".".join(p for p in (extracted.domain, extracted.suffix) if p)
+
+
 def normalize_hostname(hostname: str) -> str:
     """Return an IDNA DNS name or canonical IP address, or raise ValueError.
 

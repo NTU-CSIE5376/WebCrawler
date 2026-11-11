@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 
-import tldextract
 from w3lib.url import canonicalize_url
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -10,23 +9,20 @@ from email.utils import parsedate_to_datetime
 import scrapy
 from scrapy import signals
 from scrapy.exceptions import DontCloseSpider, IgnoreRequest
-from scrapy.linkextractors import LinkExtractor
 from scrapy.spidermiddlewares.httperror import HttpError
 from twisted.internet import task as twisted_task
 
 from crawler.items import PageItem
 from crawler.queue_consumer import QueueConsumer
-from crawler.middlewares.youtube import normalize_youtube_url
 from crawler.manual_bulk_crawls import ManualBulkCrawlConsumer
+from crawler.spiders.parser import HtmlParserPool
 from libs.obslog import configure as configure_logging
-from libs.urls import host_of
+from libs.urls import domain_of, host_of
 
 logger = logging.getLogger("crawler")
 
 ACCEPTED_CONTENT_TYPES = ["text/html", "application/xhtml+xml"]
 
-# Cap below the PG btree row entry max (~2700 bytes).
-MAX_URL_LEN = 2500
 MAX_HEADER_VALUE_LEN = 500
 
 
@@ -56,7 +52,7 @@ class HtmlSpider(scrapy.Spider):
         qtpl = crawler.settings["URL_QUEUE_TEMPLATE"]
         spider.queue = QueueConsumer(queue_dir=qtpl.format(id=spider.crawler_id))
         spider.manual_bulk_crawls = ManualBulkCrawlConsumer(spider)
-        spider.link_extractor = LinkExtractor(canonicalize=True)
+        spider.html_parser_pool = HtmlParserPool(crawler.settings.getint("PARSER_PROCESSES", 2))
 
         spider.domain_low_watermark = max(
             0, crawler.settings.getint("IPC_DOMAIN_LOW_WATERMARK", 10)
@@ -289,12 +285,14 @@ class HtmlSpider(scrapy.Spider):
             self._maybe_top_up(reason=f"{reason}_low_watermark")
 
     def spider_opened(self, spider=None):
-        self.manual_bulk_crawls.start()
         settings = self.crawler.settings
+        parser_processes = settings.getint("PARSER_PROCESSES", 2)
+        self.manual_bulk_crawls.start()
         logger.info(
             "crawler.config",
             extra={
                 "event": "crawler.config",
+                "parser_processes": parser_processes,
                 "throttle_mode": settings.get("CRAWLER_THROTTLE_MODE", "fixed"),
                 "autothrottle_enabled": settings.getbool("AUTOTHROTTLE_ENABLED"),
                 "concurrent_requests": settings.getint("CONCURRENT_REQUESTS"),
@@ -332,6 +330,7 @@ class HtmlSpider(scrapy.Spider):
         if self._top_up_task is not None and self._top_up_task.running:
             self._top_up_task.stop()
         self._top_up_task = None
+        return self.html_parser_pool.close()
 
     def _emit_heartbeat(self):
         runtime = self._downloader_runtime()
@@ -349,6 +348,8 @@ class HtmlSpider(scrapy.Spider):
             "spider.heartbeat",
             extra={
                 "event": "spider.heartbeat",
+                "parser_inflight": self.html_parser_pool.inflight,
+                "parser_waiting": self.html_parser_pool.waiting,
                 "active_domains": len(self._domain_pending),
                 "pending": self._pending_requests,
                 "pending_max": self._max_pending_requests,
@@ -388,22 +389,32 @@ class HtmlSpider(scrapy.Spider):
         self._maybe_top_up(reason="idle", force=True)
         raise DontCloseSpider
 
-    def _extract_domain(self, url):
-        extracted = tldextract.extract(url)
-        domain = ".".join([p for p in [extracted.domain, extracted.suffix] if p])
-        return domain
+    async def parse(self, response):
+        reason = "parse"
+        try:
+            fields = None
+            ctype = response.headers.get("Content-Type", b"").decode().lower()
+            if not any(t in ctype for t in ACCEPTED_CONTENT_TYPES):
+                reason = "non_html"
+            else:
+                fields = await self.html_parser_pool.parse(response)
+            return list(self._parse_response(response, fields))
+        except BaseException:
+            reason = "parse_error"
+            raise
+        finally:
+            self._finish_owned_request(
+                reason=reason, domain_id=response.meta.get("_track_domain_id", 0),
+            )
 
-
-    def parse(self, response):
+    def _parse_response(self, response, fields=None):
         url = canonicalize_url(response.url)
         source_url = response.meta.get("source_url", response.url)
-        track_domain_id = response.meta.get("_track_domain_id", 0)
         fetched_url = canonicalize_url(response.url)
-        domain = self._extract_domain(fetched_url)
+        domain = domain_of(fetched_url)
 
         ctype = response.headers.get("Content-Type", b"").decode().lower()
         if not any(t in ctype for t in ACCEPTED_CONTENT_TYPES):
-            self._finish_owned_request(reason="non_html", domain_id=track_domain_id)
             yield PageItem(
                 url=url,
                 domain=domain,
@@ -417,39 +428,12 @@ class HtmlSpider(scrapy.Spider):
             )
             return
 
-        outlinks = []
-        seen_urls: set[str] = set()
-
-        for link in self.link_extractor.extract_links(response):
-            if link.nofollow:
-                continue
-            # watch?v=ID&t=.., /shorts/ID and youtu.be/ID collapse to one URL.
-            u = normalize_youtube_url(canonicalize_url(link.url))
-            if len(u) > MAX_URL_LEN or u in seen_urls:
-                continue
-            seen_urls.add(u)
-            outlinks.append({
-                "url": u,
-                "domain": self._extract_domain(u),
-                "anchor": (link.text or "").strip()[:200]
-            })
-
-        title = (response.xpath("//title/text()").get() or "").strip()[:500] or None
-        hreflang_count = len(response.xpath(
-            "//link[contains(concat(' ', normalize-space(@rel), ' '), ' alternate ') and @hreflang]"
-        ))
-        has_json_ld = bool(response.xpath('//script[@type="application/ld+json"]'))
-
-        self._finish_owned_request(reason="parse", domain_id=track_domain_id)
         yield PageItem(
             url=url,
             domain=domain,
             fail_reason=None,
             content=response.text,
-            outlinks=outlinks,
-            title=title,
-            hreflang_count=hreflang_count,
-            has_json_ld=has_json_ld,
+            **fields,
             **self._response_metadata(response),
         )
 
@@ -458,7 +442,7 @@ class HtmlSpider(scrapy.Spider):
         source_url = failure.request.meta.get("source_url", failure.request.url)
         track_domain_id = failure.request.meta.get("_track_domain_id", 0)
         fetched_url = canonicalize_url(failure.request.url)
-        domain = self._extract_domain(fetched_url)
+        domain = domain_of(fetched_url)
 
         item = PageItem(
             url=url,
