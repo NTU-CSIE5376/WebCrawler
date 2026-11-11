@@ -58,25 +58,25 @@ Crawler-specific networking:
 Total long-running app processes with default HTML parser pools fully started
 (excluding postgres internals and Python process-management helpers):
 
-- Default: `17 + 49 + 16 + 32 = 114`
-- With Golden Discovery Ranker v1 enabled: `21 + 49 + 16 + 32 = 118`
+- Default: `17 + 49 + 16 + 64 = 146`
+- With Golden Discovery Ranker v1 enabled: `21 + 49 + 16 + 64 = 150`
 
 Supervisor keeps per-process global concurrency and AutoThrottle target/start/max
 tuning. Baseline workers use global concurrency 256; the canary uses 384 and a
 150,000,000-byte scraper buffer. The default scraper buffer is 100,000,000 bytes;
 `CRAWLER_SCRAPER_SLOT_MAX_ACTIVE_SIZE` overrides it.
 
-HTML extraction runs in two child processes per crawler worker by default.
+HTML extraction runs in four child processes per crawler worker by default.
 `CRAWLER_PARSER_PROCESSES` controls this count; set it to `0` for inline parsing.
-With 16 crawler workers, the default adds 32 parser processes. At this setting,
-each worker submits at most four responses to its parser pool; additional responses wait
+With 16 crawler workers, the default adds 64 parser processes. At this setting,
+each worker submits at most eight responses to its parser pool; additional responses wait
 asynchronously under Scrapy's scraper size backpressure. Result writing and
 request accounting stay in the crawler process, and child processes return
 extracted fields without sending the HTML back. Manual bulk crawls use their
 existing save path. Heartbeats expose `parser_inflight` (submitted responses)
 and `parser_waiting` (callbacks waiting for a slot). Restart workers after
 changing this setting; pools drain and join during normal shutdown.
-Compose passes `CRAWLER_PARSER_PROCESSES` (default `2`) into the container, and
+Compose passes `CRAWLER_PARSER_PROCESSES` (default `4`) into the container, and
 both Supervisor programs inherit it. Supervisor sends TERM only to the crawler
 parent, allowing it to drain and join parser children. After 60 seconds it kills
 the process group. Compose allows 90 seconds before forcibly stopping the

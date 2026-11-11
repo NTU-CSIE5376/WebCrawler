@@ -128,7 +128,7 @@ services:
         soft: 4096
         hard: 4096
     environment:
-      - CRAWLER_PARSER_PROCESSES=${CRAWLER_PARSER_PROCESSES:-2}
+      - CRAWLER_PARSER_PROCESSES=${CRAWLER_PARSER_PROCESSES:-4}
       - MANUAL_BULK_CRAWL_SCHEDULING_POLICY=weighted
     dns:
       - 8.8.8.8

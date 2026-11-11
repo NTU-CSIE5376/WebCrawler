@@ -52,7 +52,7 @@ class HtmlSpider(scrapy.Spider):
         qtpl = crawler.settings["URL_QUEUE_TEMPLATE"]
         spider.queue = QueueConsumer(queue_dir=qtpl.format(id=spider.crawler_id))
         spider.manual_bulk_crawls = ManualBulkCrawlConsumer(spider)
-        spider.html_parser_pool = HtmlParserPool(crawler.settings.getint("PARSER_PROCESSES", 2))
+        spider.html_parser_pool = HtmlParserPool(crawler.settings.getint("PARSER_PROCESSES", 4))
 
         spider.domain_low_watermark = max(
             0, crawler.settings.getint("IPC_DOMAIN_LOW_WATERMARK", 10)
@@ -286,7 +286,7 @@ class HtmlSpider(scrapy.Spider):
 
     def spider_opened(self, spider=None):
         settings = self.crawler.settings
-        parser_processes = settings.getint("PARSER_PROCESSES", 2)
+        parser_processes = settings.getint("PARSER_PROCESSES", 4)
         self.manual_bulk_crawls.start()
         logger.info(
             "crawler.config",
