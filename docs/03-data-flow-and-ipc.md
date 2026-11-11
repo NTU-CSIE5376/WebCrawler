@@ -359,11 +359,15 @@ Responsibilities:
 - Consume only this crawler's queue partition. Run one live crawler process per
   crawler ID, as with normal IPC. Different crawlers can process one job
   concurrently without file locks.
-- Configure `MANUAL_BULK_CRAWL_SCHEDULING_POLICY` and
-  `MANUAL_BULK_CRAWL_SHARE_PERCENT` on the crawler (both passed through
-  Compose). Apply changes with a queue-preserving rollout; memory-backed crawlers
-  must drain or persist pending work before a restart. The default is `weighted`
-  with a share of 50. This crawler-wide setting applies to all jobs, including
+- `MANUAL_BULK_CRAWL_SHARE_PERCENT` is **20**, defined once in
+  `crawler/dispatch_defaults.py` and shared by settings and scheduler defaults.
+  Change this production value through a reviewed repository change. Settings
+  ignore the same-named host environment variable, and Compose does not pass it
+  through, so a stale `.env` cannot silently replace the approved value.
+  `MANUAL_BULK_CRAWL_SCHEDULING_POLICY` remains configurable and defaults to
+  `weighted`. Explicit Scrapy settings and constructor arguments remain available
+  for isolated scheduler tests; they are not a second production configuration.
+  This crawler-wide setting applies to all jobs, including
   already queued requests; jobs and requests carry no dispatch policy.
   Each crawler has two scheduler queues: normal and manual.
   In `weighted` mode, while both queues have requests, the manual queue gets
@@ -372,6 +376,14 @@ Responsibilities:
   does not bank them. Neither source starves while it has work. The share
   counts dispatches, not slot time; the per-host prefetch cap below keeps slow
   or dead manual hosts from holding many slots.
+  A source with no queued requests yields all its unused opportunities to the
+  other source. The 20% share is not a CPU, bandwidth or active-request guarantee.
+  For deployment, ship the new defaults module with settings and scheduler.
+  After this change is merged, remove redundant production-only share overrides
+  and verify effective settings and startup declarations both use 20. Existing
+  weighted-20 crawlers need no policy change or restart for this alignment.
+  Memory-backed crawlers must drain or persist pending work before any restart;
+  source checkout alone does not change an already loaded scheduler.
   In `balanced` mode, dispatch one normal request and one manual request in turn,
   skipping an empty queue so the other uses all available dispatch capacity.
   `manual_first` drains available manual requests before normal requests;
