@@ -114,7 +114,7 @@ def _parse_html(url, body, encoding, response_class):
 class HtmlParserPool:
     """Run HtmlParser in bounded child processes, or locally when disabled."""
 
-    def __init__(self, processes: int = 2):
+    def __init__(self, processes: int = 4):
         if processes < 0:
             raise ValueError("PARSER_PROCESSES must be non-negative")
         self._parser = HtmlParser() if processes == 0 else None
