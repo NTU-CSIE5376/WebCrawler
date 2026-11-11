@@ -279,6 +279,46 @@ The rest of the query keeps its original encoding and order byte for byte.
 the same way (`libs/urls.strip_srsltid`), so an injected golden row and the
 link the crawler discovers end up as the same URL.
 
+## Configuration and rollout
+
+The filter needs no config change to run. Every setting has a default in
+code (`ingestor/main.py::_load_trap_filter`, `TrapFilterConfig`), so a host
+that keeps its own `ingest.yaml` gets the reviewed behaviour after
+`git pull` and `docker compose restart scheduler_ingest`. The shipped
+`ingest.yaml` carries no `trap_filter` block for that reason.
+
+To override, add a block; missing keys keep their defaults:
+
+```yaml
+trap_filter:
+  enabled: true            # false = kill switch (restart to apply)
+  normalize: true
+  normalize_params: [srsltid]   # widen only together with golden_inject and coverage
+  shadow_normalize: true
+  drop: true
+  log_dir_template: "/data/ipc/trap_filter/ingestor_{id:02d}"
+```
+
+Each ingestor logs one startup event, with `config_source` set to `default`
+(no block) or `yaml`:
+
+- `ingest.trap_filter_enabled`: the filter is on; the event also lists the
+  effective settings.
+- `ingest.trap_filter_disabled`: the filter is off.
+
+A running filter adds `trap_dropped`, `url_normalized` and
+`url_would_normalize` to every `ingest.folder_done`. If neither startup event
+appears, the ingestor is still running code from before #105.
+
+Rollout notes:
+- `golden_inject.py` and `wiki_pageview_inject.py` run inside
+  `scheduler_ingest` (Monday 01:00 and 04:30 UTC); a restart kills them.
+  Check `ps` in the container first.
+- `/app` is bind-mounted, so `restart` is enough. Recreating the container is
+  not needed and drops anything written outside the mounts.
+- The audit log is not rotated. Check `/data/ipc/trap_filter/` disk usage on
+  the first day.
+
 ## Checking and changing the rules
 
 - Ingest logs every dropped / normalized / would-be-normalized link; `scripts/trap_filter_golden_check.py`
