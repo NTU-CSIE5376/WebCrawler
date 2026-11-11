@@ -62,6 +62,10 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+# Kill switch: requeue retries/redirects under their host, not the policy slot.
+SCHEDULER_RESTORE_POLICY_META = _env_bool("CRAWLER_SCHEDULER_RESTORE_POLICY_META", True)
+
+
 CONCURRENT_REQUESTS = int(os.getenv("CRAWLER_CONCURRENT_REQUESTS", "256"))
 SCRAPER_SLOT_MAX_ACTIVE_SIZE = int(
     os.getenv("CRAWLER_SCRAPER_SLOT_MAX_ACTIVE_SIZE", "100000000")

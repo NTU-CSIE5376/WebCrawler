@@ -8,13 +8,15 @@ from scrapy.settings import Settings
 from scrapy.statscollectors import MemoryStatsCollector
 
 from containers.crawler.crawler.fair_scheduler import FairScheduler
+from containers.crawler.crawler.middlewares.site_dispatcher import SiteMiddlewareDispatcher
+from containers.crawler.crawler.site_policies import SitePolicies
 
 
 @pytest.fixture
 def scheduler_factory(tmp_path):
     schedulers = []
 
-    def factory(disk=False, replace=None, policy="balanced", share=None):
+    def factory(disk=False, replace=None, policy="balanced", share=None, restore=None):
         if replace is not None:
             replace.close("restart")
             schedulers.remove(replace)
@@ -29,9 +31,13 @@ def scheduler_factory(tmp_path):
             settings.set("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", policy)
         if share is not None:
             settings.set("MANUAL_BULK_CRAWL_SHARE_PERCENT", share)
+        if restore is not None:
+            settings.set("SCHEDULER_RESTORE_POLICY_META", restore)
         if disk:
             settings.set("JOBDIR", str(tmp_path / "job"))
-        downloader = SimpleNamespace(slots={}, get_slot_key=lambda request: urlsplit(request.url).hostname)
+        # Like scrapy's Downloader: an explicit download_slot wins over the host.
+        downloader = SimpleNamespace(slots={}, get_slot_key=lambda request: (
+            request.meta.get("download_slot") or urlsplit(request.url).hostname))
         crawler = SimpleNamespace(settings=settings, engine=SimpleNamespace(downloader=downloader))
         crawler.stats = MemoryStatsCollector(crawler)
         spider = Spider(name="fair-test")
@@ -290,3 +296,85 @@ def test_weighted_idle_source_does_not_bank_turns(scheduler_factory, idle):
 def test_invalid_share_is_rejected_at_startup(scheduler_factory, share):
     with pytest.raises(ValueError, match="MANUAL_BULK_CRAWL_SHARE_PERCENT"):
         scheduler_factory(policy="weighted", share=share)
+
+
+@pytest.fixture
+def wiki_dispatcher():
+    return SiteMiddlewareDispatcher(SitePolicies({
+        "domains": {"wikipedia.org": {"request_limits": {"download_slot": "wikipedia"}}},
+    }))
+
+
+def serve_until(scheduler, url, turns):
+    """Serve up to `turns` requests while idle hosts keep arriving; return the match."""
+    for i in range(turns):
+        scheduler.enqueue_request(Request(f"https://idle{i}.example/page"))
+        served = scheduler.next_request()
+        if served.url == url:
+            return served
+    return None
+
+
+@pytest.mark.parametrize("disk", [False, True])
+@pytest.mark.parametrize("restore,expect_served", [(None, True), (True, True), (False, False)])
+def test_retry_is_not_starved_by_a_busy_shared_policy_slot(
+        scheduler_factory, wiki_dispatcher, disk, restore, expect_served):
+    # Production 2026-11-11: manual crawls kept the shared "wikipedia" slot at
+    # 8+ active downloads, and a normal retry queued under that slot never left
+    # the downloader-aware queue, so its domain never finished its batch.
+    scheduler = scheduler_factory(disk=disk, policy="weighted", restore=restore)
+    scheduler.normal.crawler.engine.downloader.slots["wikipedia"] = SimpleNamespace(active=set(range(8)))
+    url = "https://fr.wikipedia.org/wiki/Stuck"
+    first = Request(url)
+    wiki_dispatcher.process_request(first)
+    assert first.meta["download_slot"] == "wikipedia"
+    scheduler.enqueue_request(first.copy())  # RetryMiddleware requeues a copy.
+    served = serve_until(scheduler, url, 50)
+    assert (served is not None) == expect_served
+    if served is not None:
+        assert "download_slot" not in served.meta
+        wiki_dispatcher.process_request(served)
+        assert served.meta["download_slot"] == "wikipedia"
+
+
+def test_redirect_off_the_policy_domain_is_queued_under_its_new_host(scheduler_factory, wiki_dispatcher):
+    scheduler = scheduler_factory()
+    first = Request("https://en.wikipedia.org/wiki/Moved")
+    wiki_dispatcher.process_request(first)
+    scheduler.enqueue_request(first.replace(url="https://moved.example/page"))
+    assert scheduler.next_request().meta.get("download_slot") is None
+
+
+def test_request_slot_set_before_the_policy_is_kept(scheduler_factory, wiki_dispatcher):
+    scheduler = scheduler_factory()
+    first = Request("https://en.wikipedia.org/wiki/Own", meta={"download_slot": "own"})
+    wiki_dispatcher.process_request(first)
+    assert first.meta["download_slot"] == "wikipedia"
+    scheduler.enqueue_request(first.copy())
+    assert scheduler.next_request().meta["download_slot"] == "own"
+
+
+@pytest.mark.parametrize("value,expected", [(None, True), ("false", False), ("1", True)])
+def test_crawler_environment_switches_policy_meta_restore(monkeypatch, value, expected):
+    import runpy
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    monkeypatch.syspath_prepend(str(root))
+    monkeypatch.chdir(root)
+    if value is None:
+        monkeypatch.delenv("CRAWLER_SCHEDULER_RESTORE_POLICY_META", raising=False)
+    else:
+        monkeypatch.setenv("CRAWLER_SCHEDULER_RESTORE_POLICY_META", value)
+    settings = runpy.run_module("containers.crawler.crawler.settings")
+    assert settings["SCHEDULER_RESTORE_POLICY_META"] is expected
+
+
+@pytest.mark.parametrize("restore,event", [
+    (None, "crawler.scheduler_restore_policy_meta_enabled"),
+    (False, "crawler.scheduler_restore_policy_meta_disabled"),
+])
+def test_startup_logs_whether_policy_meta_restore_is_enabled(scheduler_factory, caplog, restore, event):
+    with caplog.at_level("INFO", logger="crawler"):
+        scheduler_factory(restore=restore)
+    assert [record.event for record in caplog.records if hasattr(record, "event")] == [event]

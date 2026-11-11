@@ -1,11 +1,16 @@
 """Share download dispatch between normal crawling and manual API work."""
+import logging
 from pathlib import Path
 
 from scrapy.core.scheduler import BaseScheduler, Scheduler
 from scrapy.dupefilters import BaseDupeFilter
 
+from .middlewares.site_dispatcher import restore_scheduling_meta
+
 POLICIES = ("weighted", "balanced", "manual_first", "normal_first")
 MANUAL = "manual_bulk_crawl_job_id"
+
+logger = logging.getLogger("crawler")
 
 
 class FairScheduler(BaseScheduler):
@@ -19,9 +24,11 @@ class FairScheduler(BaseScheduler):
     both sources have requests (stride scheduling), and gives a source every
     turn the other cannot use.
     """
-    def __init__(self, normal, manual, scheduling_policy="weighted", share_percent=50):
+    def __init__(self, normal, manual, scheduling_policy="weighted", share_percent=50,
+                 restore_policy_meta=True):
         self.normal = normal
         self.manual = manual
+        self.restore_policy_meta = restore_policy_meta
         if scheduling_policy not in POLICIES:
             raise ValueError("MANUAL_BULK_CRAWL_SCHEDULING_POLICY must be weighted, balanced, "
                              "manual_first or normal_first")
@@ -47,9 +54,13 @@ class FairScheduler(BaseScheduler):
             logunser=normal.logunser, stats=crawler.stats,
             pqclass=normal.pqclass, crawler=crawler,
         )
+        restore = crawler.settings.getbool("SCHEDULER_RESTORE_POLICY_META", True)
+        event = f"crawler.scheduler_restore_policy_meta_{'enabled' if restore else 'disabled'}"
+        logger.info(event, extra={"event": event})
         return cls(normal, manual,
                    crawler.settings.get("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", "weighted"),
-                   crawler.settings.get("MANUAL_BULK_CRAWL_SHARE_PERCENT", 50))
+                   crawler.settings.get("MANUAL_BULK_CRAWL_SHARE_PERCENT", 50),
+                   restore)
 
     def open(self, spider):
         self.manual.open(spider)
@@ -60,6 +71,9 @@ class FairScheduler(BaseScheduler):
         return self.normal.close(reason)
 
     def enqueue_request(self, request):
+        if self.restore_policy_meta:
+            # Queue a retry/redirect under its own host, not the policy slot.
+            restore_scheduling_meta(request)
         queue = self.manual if MANUAL in request.meta else self.normal
         return queue.enqueue_request(request)
 
