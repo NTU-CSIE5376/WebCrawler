@@ -1,0 +1,49 @@
+# Apply only through compose.sh, alongside the repository's root Compose file.
+# Image bindings select the already-validated dependency images; /app supplies
+# the reviewed source and Supervisor configuration on every container start.
+services:
+  scheduler_control:
+    image: ${WEBCRAWLER_SCHEDULER_CONTROL_IMAGE:?Pin the scheduler_control image}
+    pull_policy: never
+    command: ["/usr/bin/supervisord", "-n", "-c", "/app/ops/production/supervisord.conf"]
+    environment:
+      WEBCRAWLER_SUPERVISOR_CONFIG: /app/containers/scheduler_control/supervisord.conf
+
+  api:
+    image: ${WEBCRAWLER_API_IMAGE:?Pin the API image}
+    pull_policy: never
+    command: ["/usr/bin/supervisord", "-n", "-c", "/app/ops/production/supervisord.conf"]
+    environment:
+      WEBCRAWLER_SUPERVISOR_CONFIG: /app/containers/api/supervisord.conf
+      API_CONFIG_PATH: /app/containers/api/config/config.yml
+
+  scheduler_ingest:
+    image: ${WEBCRAWLER_SCHEDULER_INGEST_IMAGE:?Pin the scheduler_ingest image}
+    pull_policy: never
+    command: ["/usr/bin/supervisord", "-n", "-c", "/app/ops/production/supervisord.conf"]
+    environment:
+      WEBCRAWLER_SUPERVISOR_CONFIG: /app/containers/scheduler_ingest/supervisord.conf
+
+  crawler:
+    image: ${WEBCRAWLER_CRAWLER_IMAGE:?Pin the crawler image}
+    pull_policy: never
+    command: ["/usr/bin/supervisord", "-n", "-c", "/app/ops/production/supervisord.conf"]
+    environment:
+      WEBCRAWLER_SUPERVISOR_CONFIG: /app/containers/crawler/supervisord.conf
+      MANUAL_BULK_CRAWL_SCHEDULING_POLICY: weighted
+
+  sitemap_patroller:
+    image: ${WEBCRAWLER_SITEMAP_PATROLLER_IMAGE:?Pin the sitemap_patroller image}
+    pull_policy: never
+    command: ["/usr/bin/supervisord", "-n", "-c", "/app/ops/production/supervisord.conf"]
+    environment:
+      WEBCRAWLER_SUPERVISOR_CONFIG: /app/containers/sitemap_patroller/supervisord.conf
+
+  postgres:
+    profiles: [legacy-postgres]
+
+  loki:
+    profiles: [infrastructure]
+
+  grafana:
+    profiles: [infrastructure]
