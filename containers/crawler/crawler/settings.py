@@ -48,6 +48,9 @@ DEFAULT_REQUEST_HEADERS = {
 # Apply site identity before RobotsTxtMiddleware (100). Header overrides also
 # cover retries, redirects, robots.txt, and both normal and manual requests.
 DOWNLOADER_MIDDLEWARES = {
+    # First: drops a redirect hop to a recently fetched target before any
+    # site policy or concurrency lease is taken.
+    "crawler.redirect_dedup.RedirectTargetDedupMiddleware": 50,
     "crawler.middlewares.site_dispatcher.SiteMiddlewareDispatcher": 80,
     "crawler.middlewares.retry_after.RetryAfterMiddleware": 90,
     # Last before the downloader, first on responses/exceptions: robots fetches
@@ -118,6 +121,12 @@ EXTENSIONS = {
     "scrapy.extensions.logstats.LogStats": 500,
     "scrapy.extensions.memusage.MemoryUsage": 500,
 }
+
+# Skip re-fetching a redirect target fetched successfully within the TTL; the
+# queued URL is still reported (ok, no content). See crawler/redirect_dedup.py.
+REDIRECT_DEDUP_ENABLED = _env_bool("CRAWLER_REDIRECT_DEDUP_ENABLED", True)
+REDIRECT_DEDUP_TTL_SEC = float(os.getenv("CRAWLER_REDIRECT_DEDUP_TTL_SEC", "3600"))
+REDIRECT_DEDUP_MAX_ENTRIES = int(os.getenv("CRAWLER_REDIRECT_DEDUP_MAX_ENTRIES", "200000"))
 
 ITEM_PIPELINES = {
     "crawler.pipelines.JsonPipeline": 500,

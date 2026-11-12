@@ -57,7 +57,7 @@ class JsonPipeline:
             "url": item.get("url"),
             "domain": item.get("domain"),
             "fetched_at": _now_iso(),
-            "status": "ok" if item.get("content") else "fail",
+            "status": "ok" if item.get("content") or item.get("redirect_deduped") else "fail",
             "fail_reason": item.get("fail_reason"),
             "content": item.get("content"),
             "outlinks": item.get("outlinks", []),
@@ -70,6 +70,12 @@ class JsonPipeline:
             "is_redirect": item.get("is_redirect"),
             "redirect_hop_count": item.get("redirect_hop_count"),
         }
+
+        source_url = item.get("source_url")
+        if source_url and source_url != rec["url"]:
+            rec["source_url"] = source_url
+        if item.get("redirect_deduped"):
+            rec["redirect_deduped"] = True
 
         append_jsonl(path, rec)
         return item

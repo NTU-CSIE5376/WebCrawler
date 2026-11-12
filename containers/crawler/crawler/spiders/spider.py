@@ -17,6 +17,7 @@ from twisted.internet import task as twisted_task
 from crawler.items import PageItem
 from crawler.queue_consumer import QueueConsumer
 from crawler.middlewares.youtube import normalize_youtube_url
+from crawler.redirect_dedup import DuplicateRedirectTarget, RecentFetches
 from crawler.manual_bulk_crawls import ManualBulkCrawlConsumer
 from libs.obslog import configure as configure_logging
 from libs.urls import host_of
@@ -60,6 +61,15 @@ class HtmlSpider(scrapy.Spider):
 
         spider.domain_low_watermark = max(
             0, crawler.settings.getint("IPC_DOMAIN_LOW_WATERMARK", 10)
+        )
+        # Read by RedirectTargetDedupMiddleware; None disables the dedup.
+        spider.recent_fetches = (
+            RecentFetches(
+                ttl_sec=crawler.settings.getfloat("REDIRECT_DEDUP_TTL_SEC", 3600.0),
+                max_entries=crawler.settings.getint("REDIRECT_DEDUP_MAX_ENTRIES", 200000),
+            )
+            if crawler.settings.getbool("REDIRECT_DEDUP_ENABLED", False)
+            else None
         )
 
         crawler.signals.connect(spider.on_idle, signal=signals.spider_idle)
@@ -406,6 +416,7 @@ class HtmlSpider(scrapy.Spider):
             self._finish_owned_request(reason="non_html", domain_id=track_domain_id)
             yield PageItem(
                 url=url,
+                source_url=source_url,
                 domain=domain,
                 fail_reason="NonHTML content-type",
                 content=None,
@@ -440,9 +451,14 @@ class HtmlSpider(scrapy.Spider):
         ))
         has_json_ld = bool(response.xpath('//script[@type="application/ld+json"]'))
 
+        recent = getattr(self, "recent_fetches", None)
+        if recent is not None:
+            recent.add(url)
+
         self._finish_owned_request(reason="parse", domain_id=track_domain_id)
         yield PageItem(
             url=url,
+            source_url=source_url,
             domain=domain,
             fail_reason=None,
             content=response.text,
@@ -462,6 +478,7 @@ class HtmlSpider(scrapy.Spider):
 
         item = PageItem(
             url=url,
+            source_url=source_url,
             domain=domain,
             fail_reason=failure.type.__name__,
             content=None,
@@ -475,6 +492,25 @@ class HtmlSpider(scrapy.Spider):
             is_redirect=bool(failure.request.meta.get("redirect_times")),
             redirect_hop_count=int(failure.request.meta.get("redirect_times") or 0),
         )
+
+        if failure.check(DuplicateRedirectTarget):
+            # The redirect target was fetched recently: the queued URL is
+            # resolved, and its content already lives on the target's row.
+            item["fail_reason"] = None
+            item["redirect_deduped"] = True
+            item["is_redirect"] = True
+            logger.info(
+                "request.redirect_dedup",
+                extra={
+                    "event": "request.redirect_dedup",
+                    "url": url,
+                    "source_url": source_url,
+                    "domain": host_of(url),
+                },
+            )
+            self._finish_owned_request(reason="redirect_dedup", domain_id=track_domain_id)
+            yield item
+            return
 
         status = None
         if failure.check(HttpError):

@@ -42,7 +42,9 @@ class ExtractService:
 
             for rec in recs:
                 try:
-                    if rec.get("status") == "ok":
+                    # Redirect-source records only carry the queued URL's
+                    # fetch outcome; content and features stay on the final URL.
+                    if rec.get("status") == "ok" and not rec.get("redirect_source"):
                         feat = extract_basic(rec)
                         self.db.process(feat)
                         yt = extract_youtube(rec)
