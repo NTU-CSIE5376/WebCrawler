@@ -1,5 +1,6 @@
 import os
 
+from crawler.dispatch_defaults import MANUAL_SHARE_PERCENT
 from crawler.site_policies import SitePolicies
 
 BOT_NAME = "crawler"
@@ -15,7 +16,8 @@ DUPEFILTER_CLASS = "scrapy.dupefilters.BaseDupeFilter" # Disable dupefilter
 # One dispatch policy for all jobs on this crawler; weighted gives manual work
 # MANUAL_BULK_CRAWL_SHARE_PERCENT of the dispatches while both sources have work.
 MANUAL_BULK_CRAWL_SCHEDULING_POLICY = os.getenv("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", "weighted")
-MANUAL_BULK_CRAWL_SHARE_PERCENT = int(os.getenv("MANUAL_BULK_CRAWL_SHARE_PERCENT", "50"))
+# This production value is owned by main, not the host environment.
+MANUAL_BULK_CRAWL_SHARE_PERCENT = MANUAL_SHARE_PERCENT
 # FIFO keeps newly fed
 # requests from overtaking older ones at the same priority, including startup.
 SCHEDULER = "crawler.fair_scheduler.FairScheduler"

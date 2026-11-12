@@ -154,7 +154,7 @@ def test_both_disk_partitions_resume_after_restart(scheduler_factory):
 ])
 @pytest.mark.parametrize("disk", [False, True])
 def test_dispatch_policy_preserves_source_preference_across_storage(scheduler_factory, policy, expected, disk):
-    scheduler = scheduler_factory(disk=disk, policy=policy)
+    scheduler = scheduler_factory(disk=disk, policy=policy, share=50)
     for i in range(3):
         scheduler.enqueue_request(request("normal", i))
         scheduler.enqueue_request(request("manual", i))
@@ -169,7 +169,7 @@ def test_dispatch_policy_preserves_source_preference_across_storage(scheduler_fa
     ("normal_first", ["normal"] * 3 + ["manual"] * 3),
 ])
 def test_request_metadata_cannot_override_crawler_policy(scheduler_factory, policy, expected):
-    scheduler = scheduler_factory(policy=policy)
+    scheduler = scheduler_factory(policy=policy, share=50)
     for i, old_policy in enumerate(("normal_first", "balanced", "manual_first")):
         scheduler.enqueue_request(request("manual", i, meta={"manual_bulk_crawl_scheduling_policy": old_policy}))
         scheduler.enqueue_request(request("normal", i))
@@ -205,18 +205,35 @@ def test_restart_applies_current_policy_to_already_queued_requests(scheduler_fac
     assert [source(resumed.next_request()) for _ in range(2)] == expected
 
 
-def test_unspecified_policy_defaults_to_weighted_half(scheduler_factory):
-    scheduler = scheduler_factory(policy=None)
-    for i in range(3):
-        scheduler.enqueue_request(request("manual", i))
-        scheduler.enqueue_request(request("normal", i))
+@pytest.mark.parametrize("direct", [False, True])
+def test_unspecified_dispatch_defaults_to_repository_weighted_twenty(scheduler_factory, direct):
+    opened = scheduler_factory(policy=None)
+    scheduler = FairScheduler(opened.normal, opened.manual) if direct else opened
     assert scheduler.scheduling_policy == "weighted"
-    assert [source(scheduler.next_request()) for _ in range(6)] == ["normal", "manual"] * 3
+    served = refilled(scheduler, 100)
+    assert served.count("normal") == 80
+    assert served.count("manual") == 20
+
+
+def test_disk_restart_keeps_work_and_repository_twenty_percent(scheduler_factory):
+    scheduler = scheduler_factory(disk=True, policy=None)
+    for i in range(100):
+        scheduler.enqueue_request(request("normal", i))
+        scheduler.enqueue_request(request("manual", i))
+    first = [scheduler.next_request() for _ in range(50)]
+    assert sum(source(item) == "manual" for item in first) == 10
+    resumed = scheduler_factory(disk=True, policy=None, replace=scheduler)
+    assert len(resumed) == 150
+    second = [resumed.next_request() for _ in range(50)]
+    assert sum(source(item) == "manual" for item in second) == 10
+    remaining = [resumed.next_request() for _ in range(100)]
+    assert len({item.url for item in first + second + remaining}) == 200
+    assert not resumed.has_pending_requests()
 
 
 @pytest.mark.parametrize("policy", [None, "weighted", "balanced", "manual_first", "normal_first"])
-@pytest.mark.parametrize("share", [None, "30"])
-def test_crawler_environment_sets_dispatch_policy(monkeypatch, policy, share):
+@pytest.mark.parametrize("share", [None, "20", "30", "50", "invalid"])
+def test_crawler_share_comes_from_repository_not_ambient_environment(monkeypatch, policy, share):
     import runpy
     from pathlib import Path
 
@@ -233,7 +250,25 @@ def test_crawler_environment_sets_dispatch_policy(monkeypatch, policy, share):
             monkeypatch.setenv(name, value)
     settings = runpy.run_module("containers.crawler.crawler.settings")
     assert settings["MANUAL_BULK_CRAWL_SCHEDULING_POLICY"] == (policy or "weighted")
-    assert settings["MANUAL_BULK_CRAWL_SHARE_PERCENT"] == int(share or 50)
+    assert settings["MANUAL_BULK_CRAWL_SHARE_PERCENT"] == 20
+
+
+def test_compose_does_not_import_an_unversioned_manual_share(monkeypatch):
+    from pathlib import Path
+
+    import yaml
+
+    root = Path(__file__).resolve().parents[3]
+    monkeypatch.setenv("MANUAL_BULK_CRAWL_SHARE_PERCENT", "50")
+    manifest = yaml.safe_load((root / "docker-compose.yml").read_text())
+    environment = manifest["services"]["crawler"].get("environment", {})
+    keys = environment if isinstance(environment, dict) else {
+        value.split("=", 1)[0] for value in environment
+    }
+    assert "MANUAL_BULK_CRAWL_SHARE_PERCENT" not in keys
+    assert "MANUAL_BULK_CRAWL_SHARE_PERCENT" not in (
+        root / "containers/crawler/supervisord.conf"
+    ).read_text()
 
 
 def refilled(scheduler, dispatches):

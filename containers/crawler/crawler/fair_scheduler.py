@@ -5,6 +5,7 @@ from pathlib import Path
 from scrapy.core.scheduler import BaseScheduler, Scheduler
 from scrapy.dupefilters import BaseDupeFilter
 
+from .dispatch_defaults import MANUAL_SHARE_PERCENT
 from .middlewares.site_dispatcher import restore_scheduling_meta
 
 POLICIES = ("weighted", "balanced", "manual_first", "normal_first")
@@ -24,7 +25,7 @@ class FairScheduler(BaseScheduler):
     both sources have requests (stride scheduling), and gives a source every
     turn the other cannot use.
     """
-    def __init__(self, normal, manual, scheduling_policy="weighted", share_percent=50,
+    def __init__(self, normal, manual, scheduling_policy="weighted", share_percent=MANUAL_SHARE_PERCENT,
                  restore_policy_meta=True):
         self.normal = normal
         self.manual = manual
@@ -59,7 +60,7 @@ class FairScheduler(BaseScheduler):
         logger.info(event, extra={"event": event})
         return cls(normal, manual,
                    crawler.settings.get("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", "weighted"),
-                   crawler.settings.get("MANUAL_BULK_CRAWL_SHARE_PERCENT", 50),
+                   crawler.settings.get("MANUAL_BULK_CRAWL_SHARE_PERCENT", MANUAL_SHARE_PERCENT),
                    restore)
 
     def open(self, spider):
