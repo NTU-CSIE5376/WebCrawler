@@ -85,6 +85,16 @@ def test_structured_database_uses_main_endpoint_and_external_credentials(databas
     assert url.password == "fixture@password:/%?"
 
 
+def test_explicit_null_password_preserves_passwordless_authentication(database_config):
+    _, credentials_path, save = database_config
+    credentials_path.write_text(json.dumps({"username": "fixture-user", "password": None}))
+    url = load_api_config(save())["postgres"]["dsn"]
+    assert url.password is None
+    assert url.translate_connect_args() == {
+        "host": "172.16.191.2", "port": 5433, "database": "crawlerdb", "username": "fixture-user",
+    }
+
+
 def test_router_receives_unmasked_url_without_connecting(database_config, tmp_path, monkeypatch):
     from unittest.mock import Mock
 
@@ -114,7 +124,10 @@ def test_missing_database_secret_fails_without_falling_back(database_config):
     "not JSON containing fixture-secret",
     "[]",
     '{"username":"fixture-secret"}',
-    '{"username":"fixture-user","password":null}',
+    '{"username":"fixture-user","password":false}',
+    '{"username":null,"password":null}',
+    '{"username":"","password":null}',
+    '{"password":null}',
     '{"username":"fixture-user","password":""}',
     '{"username":"fixture-user","password":"fixture-secret","host":"stale-postgres"}',
 ])

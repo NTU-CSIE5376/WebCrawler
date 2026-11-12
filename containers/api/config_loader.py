@@ -44,8 +44,13 @@ def _database_url(postgres: dict) -> URL | str:
     except (ValueError, UnicodeError):
         raise ValueError("API database credentials_file must contain valid JSON") from None
     if (not isinstance(credentials, dict) or set(credentials) != {"username", "password"}
-            or any(not isinstance(value, str) or not value for value in credentials.values())):
-        raise ValueError("API database credentials_file requires only non-empty username and password")
+            or not isinstance(credentials["username"], str) or not credentials["username"]
+            or (credentials["password"] is not None
+                and (not isinstance(credentials["password"], str) or not credentials["password"]))):
+        raise ValueError(
+            "API database credentials_file requires a non-empty username and an explicit password "
+            "(non-empty string or null) only"
+        )
     # Keep the URL object: str(URL) masks the password, while create_engine
     # accepts the object directly and correctly handles reserved characters.
     return URL.create(

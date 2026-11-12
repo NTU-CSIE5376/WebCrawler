@@ -9,8 +9,12 @@ Compose mounts the `crawler_api_database` secret at
 `/run/secrets/crawler_api_database`. Its host source defaults to
 `/data/secrets/webcrawler/api-database.json`. Set
 `CRAWLER_API_DB_CREDENTIALS_FILE` only when the credential file lives elsewhere.
-The file is a JSON object containing exactly two non-empty string fields:
-`username` and `password`. Do not add endpoint settings or a DSN to the secret;
+The file is a JSON object containing exactly `username` and `password`.
+`username` must be a non-empty string. `password` must be a non-empty string or
+explicit JSON `null`. The latter preserves an intentionally passwordless
+connection, as used by the currently working production API; it does not borrow
+another service's credentials. The password field is still required, and an
+empty string is rejected. Do not add endpoint settings or a DSN to the secret;
 those belong in the checked-in configuration.
 
 Provision this file with restrictive permissions readable by the API runtime
