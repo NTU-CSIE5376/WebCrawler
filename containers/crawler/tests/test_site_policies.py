@@ -254,8 +254,9 @@ def test_bundled_config_uses_autothrottle_with_wikipedia_minimum(monkeypatch):
     assert policies.resolve("example.com").request_limits.target_concurrent_requests == 4
     assert policies.resolve("www.youtube.com").request_limits.target_concurrent_requests == 4
     assert policies.resolve("www.youtube.com").request_limits.max_qps == 3
-    assert policies.shared_budgets("en.wikipedia.org") == (("domain:wikipedia.org", 8),)
-    assert policies.shared_budgets("zh.wikipedia.org") == (("domain:wikipedia.org", 8),)
+    assert policies.shared_budgets("en.wikipedia.org") == (("domain:wikipedia.org", 7),)
+    assert policies.shared_budgets("zh.wikipedia.org") == (("domain:wikipedia.org", 7),)
+    assert policies.download_slots()["wikipedia"]["concurrency"] == 7
     assert "crawler.middlewares.shared_concurrency.SharedConcurrencyMiddleware" in settings["DOWNLOADER_MIDDLEWARES"]
     assert policies.resolve("en.wikipedia.org").request_limits.min_request_delay_sec == pytest.approx(1 / 15)
 

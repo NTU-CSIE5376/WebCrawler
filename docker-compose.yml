@@ -73,6 +73,10 @@ services:
       - /data/ipc:/data/ipc
     environment:
       - GOLDEN_DISCOVERY_RANKER_V1_ENABLED=true
+      - GOLDEN_DISCOVERY_RANKER_V1_MODEL_KIND=v2
+      - GOLDEN_DISCOVERY_RANKER_V1_ARTIFACT=/app/artifacts/golden_discovery_ranker_v2.joblib
+      - GOLDEN_DISCOVERY_RANKER_V1_V1_FALLBACK_ARTIFACT=/app/artifacts/golden_discovery_ranker_v1.joblib
+      - GOLDEN_DISCOVERY_RANKER_V1_DOMAIN_PRIORITY_STEERING_ENABLED=true
       - OFFERER_STRATEGY=golden_discovery_ranker_v1
     logging: *loki-logging
 
@@ -118,7 +122,7 @@ services:
     container_name: crawler
     init: true
     environment:
-      - MANUAL_BULK_CRAWL_SCHEDULING_POLICY
+      - MANUAL_BULK_CRAWL_SCHEDULING_POLICY=weighted
     dns:
       - 8.8.8.8
       - 1.1.1.1

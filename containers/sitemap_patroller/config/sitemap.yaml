@@ -26,10 +26,10 @@ patrol:
   # Rows older than this are due for re-fetch.
   due_interval_hours: 24
   # Max rows per patrol pass.
-  batch_limit: 500
+  batch_limit: 1000
   # Sleep between sitemap fetches (global rate limit).
-  global_delay_sec: 2.0
+  global_delay_sec: 0.5
   # Skip a row if its domain was fetched within this window in the same pass.
   per_domain_cooldown_sec: 60
-  # Sleep between patrol passes. Default: 10 min.
-  loop_interval_sec: 600
+  # Sleep between patrol passes. The approved deployment waits one minute.
+  loop_interval_sec: 60
