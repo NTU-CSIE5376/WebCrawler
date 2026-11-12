@@ -55,12 +55,11 @@ def main() -> None:
         run_minute_utc=int(gc.get("run_minute_utc", 0)),
         check_interval_sec=int(gc.get("check_interval_sec", 3600)),
         catch_up_on_start=bool(gc.get("catch_up_on_start", True)),
-        state_path=gc.get("state_path"),
     )
 
     svc = FrontierGCService(cfg=cfg, Session=Session)
     if args.once:
-        svc.run_once_and_record()
+        svc.run_once()
         return
     svc.run_forever()
 

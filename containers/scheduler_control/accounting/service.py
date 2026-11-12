@@ -9,7 +9,6 @@ from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
-from containers.scheduler_control.daily_state import load_last_success_day, save_last_success_day
 from libs.db.sharding.history_partition import (
     ensure_partitions,
     month_start,
@@ -34,16 +33,13 @@ class CounterRolloffConfig:
     run_minute_utc: int
     check_interval_sec: int
     catch_up_on_start: bool
-    state_path: str | None = None
 
 
 class CounterRolloffService:
     def __init__(self, cfg: CounterRolloffConfig, Session: sessionmaker):
         self.cfg = cfg
         self.Session = Session
-        self._last_run_for_day = load_last_success_day(
-            cfg.state_path, service="accounting", today_utc=datetime.now(timezone.utc).date(),
-        )
+        self._last_run_for_day: date | None = None
 
     @staticmethod
     def _tcur(shard_id: int) -> str:
@@ -339,13 +335,6 @@ class CounterRolloffService:
             },
         )
 
-    def run_once_and_record(self, day_utc: date | None = None) -> None:
-        day_utc = day_utc or datetime.now(timezone.utc).date()
-        self.run_once()
-        # Preserve the existing same-process guard even if persistence fails.
-        self._last_run_for_day = day_utc
-        save_last_success_day(self.cfg.state_path, service="accounting", day_utc=day_utc)
-
     def run_forever(self) -> None:
         while True:
             now_utc = datetime.now(timezone.utc)
@@ -360,7 +349,8 @@ class CounterRolloffService:
 
             if should_run:
                 try:
-                    self.run_once_and_record(now_utc.date())
+                    self.run_once()
+                    self._last_run_for_day = now_utc.date()
                 except Exception as e:
                     logger.error(
                         "accounting.run_error",

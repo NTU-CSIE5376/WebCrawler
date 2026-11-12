@@ -1,6 +1,3 @@
-x-pipeline-command: &pipeline-command
-  ["/usr/bin/supervisord", "-n", "-c", "/app/ops/production/supervisord.conf"]
-
 x-loki-logging: &loki-logging
   driver: loki
   options:
@@ -30,7 +27,6 @@ x-loki-logging: &loki-logging
 
 services:
   postgres:
-    profiles: [legacy-postgres]
     image: postgres:16
     container_name: postgres
     command: >
@@ -70,15 +66,17 @@ services:
       context: .
       dockerfile: containers/scheduler_control/Dockerfile
     container_name: scheduler_control
-    command: *pipeline-command
     init: true
     restart: unless-stopped
     volumes:
       - ./:/app
       - /data/ipc:/data/ipc
     environment:
-      - WEBCRAWLER_SUPERVISOR_CONFIG=/app/containers/scheduler_control/supervisord.conf
       - GOLDEN_DISCOVERY_RANKER_V1_ENABLED=true
+      - GOLDEN_DISCOVERY_RANKER_V1_MODEL_KIND=v2
+      - GOLDEN_DISCOVERY_RANKER_V1_ARTIFACT=/app/artifacts/golden_discovery_ranker_v2.joblib
+      - GOLDEN_DISCOVERY_RANKER_V1_V1_FALLBACK_ARTIFACT=/app/artifacts/golden_discovery_ranker_v1.joblib
+      - GOLDEN_DISCOVERY_RANKER_V1_DOMAIN_PRIORITY_STEERING_ENABLED=true
       - OFFERER_STRATEGY=golden_discovery_ranker_v1
     logging: *loki-logging
 
@@ -87,16 +85,10 @@ services:
       context: .
       dockerfile: containers/api/Dockerfile
     container_name: api
-    command: *pipeline-command
     cpus: 8
     init: true
     restart: unless-stopped
     stop_grace_period: 140s
-    environment:
-      WEBCRAWLER_SUPERVISOR_CONFIG: /app/containers/api/supervisord.conf
-      API_CONFIG_PATH: /app/containers/api/config/config.yml
-    secrets:
-      - crawler_api_database
     ports:
       - "${API_BIND_ADDRESS:-127.0.0.1}:${API_PORT:-4000}:8080"
     volumes:
@@ -113,7 +105,6 @@ services:
       context: .
       dockerfile: containers/scheduler_ingest/Dockerfile
     container_name: scheduler_ingest
-    command: *pipeline-command
     cpus: 32
     init: true
     restart: unless-stopped
@@ -121,7 +112,6 @@ services:
       - ./:/app
       - /data/ipc:/data/ipc
     environment:
-      - WEBCRAWLER_SUPERVISOR_CONFIG=/app/containers/scheduler_ingest/supervisord.conf
       - GOLDEN_DISCOVERY_RANKER_V1_INGEST_INLINE_ENABLED=true
     logging: *loki-logging
 
@@ -130,10 +120,8 @@ services:
       context: .
       dockerfile: containers/crawler/Dockerfile
     container_name: crawler
-    command: *pipeline-command
     init: true
     environment:
-      - WEBCRAWLER_SUPERVISOR_CONFIG=/app/containers/crawler/supervisord.conf
       - MANUAL_BULK_CRAWL_SCHEDULING_POLICY=weighted
     dns:
       - 8.8.8.8
@@ -150,10 +138,7 @@ services:
       context: .
       dockerfile: containers/sitemap_patroller/Dockerfile
     container_name: sitemap_patroller
-    command: *pipeline-command
     init: true
-    environment:
-      WEBCRAWLER_SUPERVISOR_CONFIG: /app/containers/sitemap_patroller/supervisord.conf
     dns:
       - 8.8.8.8
       - 1.1.1.1
@@ -164,7 +149,6 @@ services:
     logging: *loki-logging
 
   loki:
-    profiles: [infrastructure]
     image: grafana/loki:3.0.0
     container_name: loki
     restart: unless-stopped
@@ -186,7 +170,6 @@ services:
         max-file: "5"
 
   grafana:
-    profiles: [infrastructure]
     image: grafana/grafana:11.0.0
     container_name: grafana
     restart: unless-stopped
@@ -213,7 +196,3 @@ services:
 volumes:
   loki-data:
   grafana-data:
-
-secrets:
-  crawler_api_database:
-    file: "${CRAWLER_API_DB_CREDENTIALS_FILE:-/data/secrets/webcrawler/api-database.json}"

@@ -9,22 +9,6 @@ permissions:
   contents: read
 
 jobs:
-  production_profile:
-    name: production_profile
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-      - name: Install existing runtime parser for configuration verification
-        run: >-
-          python -m pip install pytest==8.4.2 PyYAML==6.0.2
-          supervisor==4.2.5 'setuptools<81'
-      - name: Test production Compose and actual Supervisor parsing
-        run: python -m pytest -q tests/test_production_compose.py
-
   test:
     name: ${{ matrix.service }}
     runs-on: ubuntu-latest
@@ -48,19 +32,10 @@ jobs:
         run: task install
       - name: Test
         run: task test
-      - name: Test crawler checkpoint operations
-        if: matrix.service == 'crawler'
-        working-directory: .
-        run: >-
-          containers/crawler/.venv/bin/python -m pytest -q
-          tests/test_crawler_checkpoint_ops.py
-      - name: Test approved production configuration
+      - name: Test approved configuration
         if: matrix.service == 'scheduler_ingest'
         working-directory: .
-        run: >-
-          containers/scheduler_ingest/.venv/bin/python -m pytest -q
-          tests/test_approved_control_sitemap_config.py
-          tests/test_daily_maintenance_state.py
+        run: containers/scheduler_ingest/.venv/bin/python -m pytest -q tests/test_approved_control_sitemap_config.py
 
   golden_inject:
     name: golden_inject

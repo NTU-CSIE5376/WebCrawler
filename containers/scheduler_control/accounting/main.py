@@ -49,12 +49,11 @@ def main() -> None:
         run_minute_utc=int(accounting.get("run_minute_utc", 0)),
         check_interval_sec=int(accounting.get("check_interval_sec", 30)),
         catch_up_on_start=bool(accounting.get("catch_up_on_start", True)),
-        state_path=accounting.get("state_path"),
     )
 
     svc = CounterRolloffService(cfg=cfg, Session=Session)
     if args.once:
-        svc.run_once_and_record()
+        svc.run_once()
         return
     svc.run_forever()
 
