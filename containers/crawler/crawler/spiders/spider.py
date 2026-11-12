@@ -18,6 +18,7 @@ from crawler.items import PageItem
 from crawler.queue_consumer import QueueConsumer
 from crawler.middlewares.youtube import normalize_youtube_url
 from crawler.manual_bulk_crawls import ManualBulkCrawlConsumer
+from crawler.restart_recovery import RestartRecovery
 from libs.obslog import configure as configure_logging
 from libs.urls import host_of
 
@@ -76,6 +77,7 @@ class HtmlSpider(scrapy.Spider):
         spider.top_up_interval_sec = float(
             crawler.settings.getfloat("IPC_TOP_UP_INTERVAL_SEC", 5.0)
         )
+        spider.restart_recovery = RestartRecovery.prepare(crawler, spider)
 
         return spider
 
