@@ -342,6 +342,30 @@ def test_corrupt_handoff_fails_closed_without_dispatch(env):
     assert not env[0].engine.requests
 
 
+def test_recreated_container_can_reuse_numeric_pid_without_false_overlap(env, monkeypatch):
+    crawler, _, _, _, _, payload = env
+    import os
+    payload["pid"] = os.getpid()
+    env[3]["workers"]["2"]["old_pid"] = payload["pid"]
+    payload["process_identity"] = {"boot_id": "same-boot", "pid_namespace": "old-namespace", "start_ticks": 100}
+    update_payload(env)
+    monkeypatch.setattr(recovery, "_namespace_identity", lambda: {"boot_id": "same-boot", "pid_namespace": "new-namespace"})
+    instance = prepare(env)
+    assert instance is not None and not crawler.engine.requests
+
+
+def test_same_original_process_is_rejected_but_later_pid_reuse_is_allowed(env, monkeypatch):
+    _, _, _, _, _, payload = env
+    payload["process_identity"] = {"boot_id": "boot", "pid_namespace": "namespace", "start_ticks": 100}
+    update_payload(env)
+    monkeypatch.setattr(recovery, "_namespace_identity", lambda: {"boot_id": "boot", "pid_namespace": "namespace"})
+    monkeypatch.setattr(recovery, "_start_ticks", lambda pid: 100)
+    with pytest.raises(recovery.RecoveryError):
+        prepare(env)
+    monkeypatch.setattr(recovery, "_start_ticks", lambda pid: 200)
+    assert prepare(env) is not None
+
+
 def test_handoff_failure_stops_before_dispatch_and_preserves_pending_checkpoint(env, monkeypatch):
     async def run():
         crawler, _, *_ = env

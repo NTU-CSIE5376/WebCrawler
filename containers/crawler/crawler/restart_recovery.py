@@ -107,6 +107,40 @@ def _write_handoff(path, receipt):
     _write_receipt(path, receipt)
 
 
+def _namespace_identity():
+    return {
+        "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+        "pid_namespace": os.readlink("/proc/self/ns/pid"),
+    }
+
+
+def _start_ticks(pid):
+    return int((Path("/proc") / str(pid) / "stat").read_text().rpartition(")")[2].split()[19])
+
+
+def _old_worker_alive(payload):
+    old_pid = payload["pid"]
+    identity = payload.get("process_identity")
+    if identity is not None:
+        if (not isinstance(identity, dict) or not isinstance(identity.get("boot_id"), str)
+                or not identity["boot_id"] or not isinstance(identity.get("pid_namespace"), str)
+                or not identity["pid_namespace"] or type(identity.get("start_ticks")) is not int
+                or identity["start_ticks"] < 0):
+            raise RecoveryError("Invalid old worker process identity")
+        current = _namespace_identity()
+        if any(current[key] != identity[key] for key in ("boot_id", "pid_namespace")):
+            # PIDs can reset after a container/host restart. The host controller
+            # must verify the old container stopped; a new namespace cannot
+            # infer that an equal numeric PID identifies the original process.
+            return False
+        try:
+            return _start_ticks(old_pid) == identity["start_ticks"]
+        except FileNotFoundError:
+            return False
+    # Compatibility with an older schema-2 producer in the same namespace.
+    return old_pid == os.getpid() or (Path("/proc") / str(old_pid)).exists()
+
+
 class RestartRecovery:
     @classmethod
     def prepare(cls, crawler, spider):
@@ -207,7 +241,7 @@ class RestartRecovery:
             # must never overlap its original worker. Once fully completed,
             # its old source pin must not block unrelated later deployments.
             if not handed_off:
-                if payload["pid"] == os.getpid() or (Path("/proc") / str(payload["pid"])).exists():
+                if _old_worker_alive(payload):
                     raise RecoveryError("The old worker must stop before replay")
                 for path, digest in source_paths:
                     if hashlib.sha256(path.read_bytes()).hexdigest() != digest:

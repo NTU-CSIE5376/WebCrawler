@@ -274,6 +274,13 @@ def _write_checkpoint(directory, payload):
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     if directory.is_symlink():
         raise RuntimeError("Checkpoint directory must not be a symlink")
+    # Capture process provenance in the worker thread. Equal numeric PIDs in
+    # a replacement container must not be mistaken for the old live process.
+    payload = {**payload, "process_identity": {
+        "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+        "pid_namespace": os.readlink("/proc/self/ns/pid"),
+        "start_ticks": int(Path("/proc/self/stat").read_text().rpartition(")")[2].split()[19]),
+    }}
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     digest = hashlib.sha256(raw).hexdigest()
     path = directory / f"worker-{payload['crawler_id']:02d}-{payload['pid']}-{digest}.json"

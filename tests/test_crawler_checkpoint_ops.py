@@ -119,6 +119,9 @@ def test_checkpoint_fsyncs_all_normal_work_and_keeps_original_objects(env, tmp_p
         raw = await asyncio.to_thread(Path(saved["path"]).read_bytes)
         assert hashlib.sha256(raw).hexdigest() == saved["sha256"]
         payload = json.loads(raw)
+        assert payload["process_identity"]["boot_id"]
+        assert payload["process_identity"]["pid_namespace"].startswith("pid:[")
+        assert payload["process_identity"]["start_ticks"] > 0
         assert saved["request_count"] == 3
         assert {row["request_id"] for row in payload["requests"]} == {id(request) for request in requests}
         assert len(crawler.engine._slot.scheduler.normal) == 0
