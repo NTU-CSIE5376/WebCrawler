@@ -22,7 +22,8 @@ domains:
     request_limits:
       download_slot: wikipedia
       target_concurrent_requests: 8
-      max_concurrent_requests: 8
+      # Reserve one concurrent request for each independent sitemap worker.
+      max_concurrent_requests: 7
       max_qps: 15 # ref: https://wikitech.wikimedia.org/wiki/Robot_policy
     headers:
       User-Agent: "WebCrawlerBot/1.0 (+https://github.com/NTU-CSIE5376/WebCrawler)"
