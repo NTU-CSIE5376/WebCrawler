@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -123,13 +126,63 @@ class PipelineExporterTests(unittest.TestCase):
                 self.assertNotIn("ready_buckets", collector.render())
                 self.assertFalse(collector.healthy())
 
+    def test_read_json_accepts_small_regular_metadata(self):
+        self.assertEqual(
+            exporter._read_json(self.progress, self.root),
+            {"date": None, "time": None},
+        )
+
+    def test_fifo_without_writer_is_rejected_without_blocking(self):
+        self.progress.unlink()
+        os.mkfifo(self.progress)
+        self.assert_metadata_rejected_without_blocking()
+
+    def assert_metadata_rejected_without_blocking(self):
+        # A subprocess timeout bounds the regression even if opening the FIFO
+        # accidentally becomes blocking again.
+        program = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "from ops.monitoring.pipeline_exporter import _read_json\n"
+            "try:\n"
+            "    _read_json(Path(sys.argv[1]), Path(sys.argv[2]))\n"
+            "except ValueError:\n"
+            "    sys.exit(0)\n"
+            "sys.exit(1)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", program, str(self.progress), str(self.root)],
+            cwd=Path(__file__).resolve().parents[3],
+            capture_output=True,
+            timeout=2,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+    def test_fifo_data_is_not_consumed(self):
+        self.progress.unlink()
+        os.mkfifo(self.progress)
+        descriptor = os.open(self.progress, os.O_RDWR | os.O_NONBLOCK)
+        self.addCleanup(os.close, descriptor)
+        payload = b'{"date":null,"time":null}'
+        os.write(descriptor, payload)
+        self.assert_metadata_rejected_without_blocking()
+        self.assertEqual(os.read(descriptor, len(payload)), payload)
+
+    def test_symlink_replaced_after_path_check_is_not_followed(self):
+        metadata = self.root / "other.json"
+        metadata.write_text('{"date":null,"time":null}')
+        self.progress.unlink()
+        self.progress.symlink_to(metadata)
+        with patch.object(exporter, "_safe_path"), self.assertRaises(OSError):
+            exporter._read_json(self.progress, self.root)
+
     def test_missing_input_directory_or_read_error_is_failure(self):
         self.base.rmdir()
         collector = self.collector()
         collector.refresh(self.now)
         self.assertFalse(collector.healthy())
         self.base.mkdir()
-        with patch.object(exporter.Path, "open", side_effect=PermissionError("test")):
+        with patch.object(exporter.os, "open", side_effect=PermissionError("test")):
             collector.refresh(self.now)
         self.assertFalse(collector.healthy())
 

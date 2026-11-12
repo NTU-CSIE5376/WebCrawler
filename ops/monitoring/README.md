@@ -1,6 +1,10 @@
 # WebCrawler 告警：第一版
 
-這是一組**獨立、選擇性啟用**的監控工具。PR 合併不會啟動服務、改爬速或重啟 crawler。先 review，之後才另外安排部署與 Discord 測試。
+這是一組**獨立、選擇性啟用**的監控工具。PR 合併本身不會啟動服務、改爬速或重啟 crawler；實際啟用需另外操作。
+
+2026-11-13 已依操作人員授權接上既有 Grafana 與私人 Discord：四台主機的 node exporter、唯讀 IPC 採集、Loki readiness 探測均已啟用。正式啟用 `fast` 35 條及 `trends` 1 條，共 36 條；16 條逐 worker 的 `symptoms` 暫停，避免同時增加未試跑的日誌掃描。沒有部署 DB TCP 探測，不能把這次啟用說成完整 DB readiness 監控。
+
+`fast` 每分鐘評估；整體產量下降每十分鐘評估。嚴重通知合併後首次等待 30 秒、更新至少間隔 5 分鐘、未變化每 2 小時重送；warning 首次等待 1 小時、更新至少間隔 1 小時、未變化每 24 小時重送。這不是通知數的硬上限。操作備份與無秘密的驗證收據位於 Host2 `/home/r14922138/ops-backups/monitor-enable-20261113/`，其中 `activation-receipt.json`、`verification-receipt.json` 記錄範圍與驗證；同目錄其他備份可能有秘密，不可整份公開。
 
 沿用現有 **Grafana 11 + Loki 3**：新增獨立 Prometheus 收集主機、服務探測與管線狀態，讓 Grafana 評估告警並通知 Discord。這版不需要 Alertmanager，也不修改其他人的監控服務。
 
@@ -19,7 +23,7 @@ HTTP/TCP 探測 ─────────────────┘          
 | DB／Loki 探測失敗 | 指定 TCP／HTTP 探測失敗兩分鐘 | DB TCP 成功只代表能連線，不代表 SQL 正常或 YB 有 quorum |
 | 容量或 inode 不足 | 可用容量低於 15%／8%、inode 低於 5%，以及容量成長預測 | 僅 `/`、`/data`；門檻是起始設定，並非量測後的 SLO |
 | 記憶體不足／OOM | MemAvailable 長期低於 5%、近期 OOM kill | 不因 swap 歷史占用高就發告警 |
-| 特定 crawler 消失 | 每個預期 worker 超過兩分鐘沒有 `spider.heartbeat` | 單一 worker 死掉也能發現；Loki 壞掉也會觸發，需要看相關告警 |
+| 特定 crawler 消失 | 近兩分鐘沒有 `spider.heartbeat`，且持續兩分鐘 | 單一 worker 死掉也能發現；查詢錯誤保留上次狀態，由監控資料源告警另外通知 |
 | 有工作但停止產出 | scheduler 有工作，五分鐘沒有成功 HTTP 回應 | 使用 `request.end` 的 2xx，排除 202；這不是「HTML 已入庫」證明 |
 | 整體完成量下降 | 有 scheduler 工作，完成回應速率低於近期基準一半，持續十分鐘 | 網站組合與冷卻也可能影響，要校準門檻 |
 | Router／Ingestor／Extractor 積壓 | 最老的可處理資料已等超過一小時，持續十分鐘 | 已扣除每階段原本刻意等待的兩個 interval，預設共 20 分鐘 |
@@ -48,7 +52,7 @@ Prometheus 每 60 秒抓一次資料，IPC 採集每 60 秒更新；DB probe 每
 
 - 在 .2 對 48 組 stage／worker 完整採集約 35ms、CPU 約 28ms、Python 最高 RSS 約 19MiB；48 組皆成功。
 - 原本整體產量查詢約 4.47s，Loki 統計處理約 803MB／182 萬筆日誌。這不是實際磁碟讀取量，但證明不能每條規則都頻繁重掃。
-- .1 `/data` 可用比例約 7.85%，已低於起始 critical 門檻；inode 使用約 0.022%。本 PR 未部署，因此不會自動通知這個現況。
+- .1 `/data` 可用比例約 7.85%，已低於起始 critical 門檻；inode 使用約 0.022%。這是 11/10 尚未啟用通知時的快照。
 
 這些只是快照，不是持續效能驗證，也不能證明新頻率對 crawler 沒影響。要依下列觀察流程再決定啟用哪些規則。
 
@@ -88,7 +92,7 @@ python ops/monitoring/shadow.py --report --output-dir ops/monitoring/runtime/sha
 
 觀察紀錄包括各規則觸發次數、狀態切換、查詢錯誤、漏評次數、耗時，以及 Loki 回傳的處理 bytes／lines。報告會列出 active groups／實際規則數、每條規則的觀察起點與資料新鮮度；停止 observer 後讀舊檔會標為 stale，最後已知狀態不代表當下健康。更動規則或重新加入停止觀察的 group 會開始新的該規則統計期間，不把不同版本混算。狀態與 journal 為 0600、目錄為 0700，journal 輪替保留最多三份、各最多 10MiB；累計統計保留在小型 state。只寫自己的 named volume，不寫 IPC 或 DB。shadow container 上限 0.25 CPU／128MiB；**此限制管不到既有 Loki 因查詢新增的工作量**。
 
-這是 threshold／pending 的觀察工具，不是 Grafana 的完整複製：missing series 的解除時機可能不同，報告的 firing episodes **不是 Discord 通知數**；分組、重送與通知成功都還需正式接線後實測。
+這是 threshold／pending 的觀察工具，不是 Grafana 的完整複製：missing series 的解除時機可能不同，報告的 firing episodes **不是 Discord 通知數**；分組、重送與通知成功都還需正式接線後實測。觀察器尚未模擬正式規則的 `KeepLast` 錯誤策略，因此 query-error episode 不可解讀成正式業務告警。
 
 建議先比對 30～60 分鐘的基準，再從 `fast` 逐類加入；完整候選組觀察 24～48 小時。每次檢查 crawler 產量、IPC lag、Loki CPU／記憶體／query latency、磁碟等待與 observer 的錯誤／skip。若出現持續惡化或重查詢大量漏評，先停止該組並調整，不能為了告警拖慢業務。24～48 小時結束**不會自動啟用 Discord**。
 
@@ -161,6 +165,6 @@ python ops/monitoring/pipeline_exporter.py \
 - **持久化成功量與排程狀態**：需要明確 commit/save counter、可執行工作及冷卻資訊，才能區分合理限速與故障。第一版的輸出下降只發 warning。
 - **通知傳遞本身**：仍需接上外部 watchdog 並定期實測 Discord；本 PR 尚未取得 webhook，也未做真實傳送測試。
 
-Grafana 11 的 NoData／Error 會跳過 pending period；本版不把缺資料設成 OK，而是以明確時間視窗檢查 worker absence，並另外通知採集失明。
+Grafana 11 的 NoData／Error 可能跳過 pending period。本版業務查詢錯誤使用 `KeepLast` 保留上次狀態，由獨立 Loki／Prometheus 基本查詢規則通知監控失明；基本查詢成功仍不能證明所有複雜查詢成功，應同時查看規則 health。真正缺資料仍不視為 OK。Worker absence 使用明確時間視窗；reducer 使用 Grafana 11 支援的預設嚴格模式（空 settings），不可傳入不支援的 `mode: strict`。
 
 參考：[Grafana 11 Discord](https://grafana.com/docs/grafana/v11.0/alerting/configure-notifications/manage-contact-points/integrations/configure-discord/)、[Grafana 11 provisioning](https://grafana.com/docs/grafana/v11.0/alerting/set-up/provision-alerting-resources/file-provisioning/)、[node exporter 主機掛載](https://github.com/prometheus/node_exporter/tree/v1.9.1#docker)、[blackbox exporter](https://github.com/prometheus/blackbox_exporter/blob/v0.26.0/CONFIGURATION.md)。

@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import stat
 import threading
 import time
 from dataclasses import dataclass
@@ -139,7 +140,15 @@ def _bucket(date: str, clock: str) -> datetime:
 
 def _read_json(path: Path, root: Path) -> dict:
     _safe_path(path, root)
-    with path.open("rb") as stream:
+    # A maintenance FIFO must neither block collection nor lose business data.
+    # Check the opened descriptor, so replacing the final path after validation
+    # cannot turn this bounded metadata read into a pipe or symlink read.
+    descriptor = os.open(
+        path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+    )
+    with os.fdopen(descriptor, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError("metadata must be a regular file")
         data = stream.read(MAX_JSON_BYTES + 1)
     if len(data) > MAX_JSON_BYTES:
         raise ValueError("JSON exceeds small metadata limit")

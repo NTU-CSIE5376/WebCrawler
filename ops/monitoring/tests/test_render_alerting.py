@@ -34,6 +34,8 @@ def test_costly_queries_are_separated_from_fast_incident_checks():
         "wc-ingest-error",
         "wc-heartbeat-0",
         "wc-pipeline-lag",
+        "wc-loki-query-health",
+        "wc-prometheus-query-health",
     ):
         assert by_rule[uid] == ("webcrawler-fast", "60s")
 
@@ -84,7 +86,9 @@ def test_enable_requires_both_secret_and_acknowledged_project_route():
     assert contact["receivers"][0]["settings"]["url"] == webhook()
     assert webhook() not in json.dumps(documents["webcrawler-rules.json"])
     message = contact["receivers"][0]["settings"]["message"]
-    assert "lt $i 6" in message and "ExternalURL" in message
+    assert "lt $i 6" in message and "172.16.191.2:3000/alerting/list" in message
+    assert "Labels.host" in message and "Labels.mountpoint" in message
+    assert "Labels.stage" in message
     assert "default.message" not in message and "Annotations.description" not in message
 
 
@@ -136,10 +140,14 @@ def test_grafana_models_keep_dimensions_and_have_correct_datasource_refs():
         assert reduce["model"]["expression"] == "A"
         assert reduce["model"]["type"] == "reduce"
         assert reduce["model"]["reducer"] == "last"
+        # Grafana 11 rejects settings.mode="strict"; strict is the default.
+        assert reduce["model"].get("settings", {}) == {}
         assert threshold["model"]["expression"] == "B"
         assert threshold["model"]["type"] == "threshold"
         assert threshold["model"]["conditions"][0]["evaluator"]["type"] == "gt"
-        assert rule["noDataState"] == rule["execErrState"] == "Alerting"
+        assert rule["noDataState"] == "Alerting"
+        if uid not in {"wc-loki-query-health", "wc-prometheus-query-health"}:
+            assert rule["execErrState"] == "KeepLast"
         assert rule["labels"]["project"] == "webcrawler"
 
 
@@ -151,10 +159,31 @@ def test_each_expected_worker_has_explicit_absence_rule_even_when_others_are_ali
         assert f'worker_id="{log_worker}"' in expression
         assert "absent_over_time(" in expression and "[2m]" in expression
         assert "or vector(0)" in expression
-        # Delay is in the explicit lookback, not Grafana 11's no-data pending.
-        assert rule["for"] == "0s"
+        # Require repeated absence after the lookback; a single evaluation must
+        # not turn a brief logging interruption into a stopped-worker incident.
+        assert rule["for"] == "2m"
+        assert "連續" in rule["title"]
+        assert "連續" in rule["annotations"]["description"]
         assert rule["labels"]["worker"] == display
     assert "wc-heartbeat-1" not in generated
+
+
+def test_query_failures_raise_monitoring_alerts_instead_of_business_failures():
+    generated = rules(renderer.build_provisioning(CONFIG))
+    for uid, datasource in (
+        ("wc-loki-query-health", "loki"),
+        ("wc-prometheus-query-health", "crawler-prometheus"),
+    ):
+        rule = generated[uid]
+        query = rule["data"][0]
+        assert query["datasourceUid"] == datasource
+        assert query["model"]["expr"] == "vector(0)"
+        assert rule["execErrState"] == "Alerting"
+        assert rule["labels"]["severity"] == "critical"
+        assert rule["labels"]["service"] == "monitoring"
+        assert "監控查詢失敗" in rule["title"]
+        assert "不代表" in rule["annotations"]["description"]
+        assert rule["isPaused"] is True
 
 
 def test_output_alert_uses_completed_responses_and_ready_work_not_admission_or_ghost_pending():

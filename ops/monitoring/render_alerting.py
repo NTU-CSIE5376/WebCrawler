@@ -24,9 +24,12 @@ DISCORD_MESSAGE = (
     "{{ len .Alerts.Resolved }} resolved\n"
     "{{ range $i, $alert := .Alerts }}{{ if lt $i 6 }}"
     "• {{ $alert.Annotations.summary }}"
+    "{{ with $alert.Labels.host }} | {{ . }}{{ end }}"
+    "{{ with $alert.Labels.mountpoint }} {{ . }}{{ end }}"
+    "{{ with $alert.Labels.stage }} | {{ . }}{{ end }}"
     "{{ with $alert.Labels.worker }} (worker {{ . }}){{ end }}\n"
     "{{ end }}{{ end }}"
-    "最多列出 6 項；完整狀態：{{ .ExternalURL }}"
+    "最多列出 6 項；告警狀態：http://172.16.191.2:3000/alerting/list"
 )
 
 
@@ -84,6 +87,7 @@ def _rule(
     description: str = "",
     paused: bool = True,
     labels: dict | None = None,
+    error_state: str = "KeepLast",
 ) -> dict:
     return {
         "uid": f"wc-{uid}",
@@ -100,7 +104,7 @@ def _rule(
                     "type": "reduce",
                     "expression": "A",
                     "reducer": "last",
-                    "settings": {"mode": "strict"},
+                    "settings": {},
                     "datasource": {"type": "__expr__", "uid": "__expr__"},
                 },
             },
@@ -125,10 +129,10 @@ def _rule(
                 },
             },
         ],
-        # Grafana 11 bypasses `for` for these states. Missing telemetry is a blind
-        # spot, not a healthy worker. Sustained absence uses explicit query windows.
+        # Missing telemetry remains a blind spot. Query errors are reported by
+        # dedicated monitoring rules instead of inventing business failures.
         "noDataState": "Alerting",
-        "execErrState": "Alerting",
+        "execErrState": error_state,
         "for": pending,
         "isPaused": paused,
         "labels": {
@@ -192,6 +196,25 @@ def build_provisioning(
 
     def add(uid: str, title: str, expression: str, **kwargs) -> None:
         rules.append(_rule(uid, title, expression, paused=True, **kwargs))
+
+    for uid, title, datasource in (
+        ("loki-query-health", "Loki 監控查詢失敗", LOKI_UID),
+        (
+            "prometheus-query-health",
+            "Prometheus 監控查詢失敗",
+            PROMETHEUS_UID,
+        ),
+    ):
+        add(
+            uid,
+            title,
+            "vector(0)",
+            datasource=datasource,
+            severity="critical",
+            service="monitoring",
+            error_state="Alerting",
+            description="監控資料來源的基本查詢失敗，部分業務狀態可能無法更新；這不代表 crawler 或其他業務程序已停止。先確認監控服務與查詢錯誤。",
+        )
 
     add(
         "target-down",
@@ -325,13 +348,14 @@ def build_provisioning(
         )
         add(
             f"heartbeat-{worker}",
-            f"Crawler {worker.zfill(2)} 超過兩分鐘沒有心跳",
+            f"Crawler {worker.zfill(2)} 連續缺少心跳",
             f"absent_over_time({selector}[2m]) or vector(0)",
             datasource=LOKI_UID,
+            pending="2m",
             severity="critical",
             service="crawler",
             labels={"worker": worker.zfill(2)},
-            description="指定的 crawler 或其日誌路徑失去心跳；先分辨程序停止、Loki 問題或採集遺失，不自動重啟有記憶體佇列的程序。",
+            description="近兩分鐘沒有心跳，且此情況連續維持兩分鐘才觸發。指定的 crawler 或其日誌路徑可能失去心跳；先分辨程序停止、Loki 問題或採集遺失，不自動重啟有記憶體佇列的程序。",
         )
         completed = f'{{service="crawler",worker_id="{worker}",event="request.end"}} | json status="status" | status >= 200 | status < 300 | status != 202 | __error__=""'
         ready = f'{selector} | json scheduler_size="scheduler_size" | scheduler_size > 0 | __error__=""'
