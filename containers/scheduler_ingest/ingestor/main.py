@@ -21,6 +21,7 @@ from .db_ops import IngestDB
 
 LOGGER = logging.getLogger("ingestor")
 RANKER_ENV_PREFIX = "GOLDEN_DISCOVERY_RANKER_V1"
+TRAP_LOG_DIR_TEMPLATE = "/data/ipc/trap_filter/ingestor_{id:02d}"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -105,10 +106,22 @@ def _inline_score_batch_size(raw: dict[str, Any]) -> int:
 
 
 def _load_trap_filter(raw: dict[str, Any], ingestor_id: int) -> TrapFilter | None:
+    """Build the trap filter from the optional `trap_filter` block.
+
+    Every key defaults to the reviewed rollout (#105), so a host that keeps its
+    own ingest.yaml without the block runs the filter after a pull + restart.
+    `trap_filter: {enabled: false}` is the kill switch. The startup log states
+    which way it went and where the setting came from.
+    """
+    source = "yaml" if "trap_filter" in raw else "default"
     tf = dict(raw.get("trap_filter") or {})
-    if not tf.get("enabled", False):
+    if not tf.get("enabled", True):
+        LOGGER.info(
+            "ingest.trap_filter_disabled",
+            extra={"event": "ingest.trap_filter_disabled", "config_source": source},
+        )
         return None
-    log_dir_template = tf.get("log_dir_template")
+    log_dir_template = tf.get("log_dir_template", TRAP_LOG_DIR_TEMPLATE)
     cfg = TrapFilterConfig(
         enabled=True,
         normalize=bool(tf.get("normalize", True)),
@@ -121,7 +134,8 @@ def _load_trap_filter(raw: dict[str, Any], ingestor_id: int) -> TrapFilter | Non
     )
     LOGGER.info(
         "ingest.trap_filter_enabled",
-        extra={"event": "ingest.trap_filter_enabled", "normalize": cfg.normalize,
+        extra={"event": "ingest.trap_filter_enabled", "config_source": source,
+               "normalize": cfg.normalize,
                "normalize_params": ",".join(sorted(cfg.normalize_params)),
                "shadow_normalize": cfg.shadow_normalize, "drop": cfg.drop, "drop_rules": ",".join(sorted(cfg.drop_rules)),
                "log_dir": cfg.log_dir},
