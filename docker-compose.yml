@@ -85,6 +85,8 @@ services:
     init: true
     restart: unless-stopped
     stop_grace_period: 140s
+    secrets:
+      - crawler_api_database
     ports:
       - "${API_BIND_ADDRESS:-127.0.0.1}:${API_PORT:-4000}:8080"
     volumes:
@@ -192,3 +194,7 @@ services:
 volumes:
   loki-data:
   grafana-data:
+
+secrets:
+  crawler_api_database:
+    file: "${CRAWLER_API_DB_CREDENTIALS_FILE:-/data/secrets/webcrawler/api-database.json}"
