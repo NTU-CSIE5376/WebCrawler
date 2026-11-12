@@ -398,6 +398,14 @@ class RestartRecovery:
             # the engine before it becomes running, leaving the durable data
             # available for the next startup instead of releasing traffic.
             engine.pause()
+            self.spider._reserve_urls = lambda *args, **kwargs: []
+            consumer = getattr(self.spider, "manual_bulk_crawls", None)
+            if consumer is not None:
+                consumer.refill = lambda *args, **kwargs: None
+                try:
+                    consumer.close()
+                except Exception:
+                    logger.exception("crawler.restart_consumer_close_failed")
             await engine.stop_async()
             raise
 

@@ -11,6 +11,7 @@ from scrapy.utils.reactor import install_reactor
 
 install_reactor("twisted.internet.asyncioreactor.AsyncioSelectorReactor")
 
+import crawler.restart_recovery as recovery_module
 import tldextract
 from crawler.spiders.spider import HtmlSpider
 from scrapy.crawler import CrawlerProcess
@@ -66,6 +67,16 @@ def main():
                 "cooldown_deadlines_epoch": {"127.0.0.1": deadline}}
     active = runtime / "active.json"
     active.write_text(json.dumps(manifest))
+    input_file = root / "queue" / "crawler_02" / "domain_99.json"
+    input_bytes = json.dumps({"urls": [base + "/must-not-be-read"]}).encode()
+    if mode == "handoff_failure":
+        input_file.parent.mkdir(parents=True)
+        input_file.write_bytes(input_bytes)
+
+        def fail_handoff(*args):
+            raise OSError("isolated handoff fsync failure")
+
+        recovery_module._write_handoff = fail_handoff
     settings = Settings()
     settings.setmodule("crawler.settings", priority="project")
     overrides = {
@@ -99,6 +110,16 @@ def main():
     server.server_close()
     if failures:
         raise RuntimeError(failures)
+    if mode == "handoff_failure":
+        assert not visits and input_file.read_bytes() == input_bytes
+        assert not (runtime / "proof" / "worker-02.done.json").exists()
+        assert not (runtime / "proof" / "worker-02.handoff.json").exists()
+        assert not crawler.engine.running and crawler.engine.spider is None
+        assert crawler.spider.manual_bulk_crawls.closed
+        print(json.dumps({"proof_restart_recovery": True, "mode": mode,
+                          "http_requests": 0, "normal_input_preserved": True,
+                          "engine_stopped": True}))
+        return
     assert crawler.spider.restart_recovery.cooldown_middleware is not None
     records = []
     for file in (root / "results").rglob("*.jsonl"):
