@@ -15,6 +15,24 @@ SERVICES = ("crawler", "api", "scheduler_control", "scheduler_ingest", "sitemap_
 IMAGE_KEYS = {service: f"WEBCRAWLER_{service.upper()}_IMAGE" for service in SERVICES}
 
 
+def test_root_compose_cannot_revive_baked_supervisor_configuration():
+    services = yaml.safe_load((ROOT / "docker-compose.yml").read_text())["services"]
+    for service in SERVICES:
+        config = services[service]
+        assert config["command"] == [
+            "/usr/bin/supervisord", "-n", "-c", "/app/ops/production/supervisord.conf"
+        ]
+        environment = config["environment"]
+        if isinstance(environment, list):
+            environment = dict(item.split("=", 1) for item in environment)
+        assert environment["WEBCRAWLER_SUPERVISOR_CONFIG"] == (
+            f"/app/containers/{service}/supervisord.conf"
+        )
+    assert services["postgres"]["profiles"] == ["legacy-postgres"]
+    assert services["loki"]["profiles"] == ["infrastructure"]
+    assert services["grafana"]["profiles"] == ["infrastructure"]
+
+
 @pytest.fixture
 def binding_file(tmp_path):
     credential_file = tmp_path / "credentials.json"

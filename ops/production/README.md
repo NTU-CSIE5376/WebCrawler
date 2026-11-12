@@ -45,7 +45,11 @@ This wrapper does not perform either drain automatically. Stage required secrets
 before the API restart, and verify a small end-to-end job afterwards.
 
 Every pipeline container starts Supervisor with the root configuration in this
-directory. Its include path is a fixed per-service value in `compose.yml`, so
+directory. The root Compose file also selects this entry point, so a deployment
+without the production overlay cannot revive an old image's baked-in Supervisor
+configuration. Legacy PostgreSQL and monitoring services require their explicit
+profiles even with the root Compose file alone.
+The include path is a fixed per-service value in the checked-in Compose files, so
 container starts and Docker restarts read the service configuration from the
 current `/app` checkout. This avoids a configuration baked into an old image or
 an individual bind-mounted file retaining an old inode after Git replaces it.
