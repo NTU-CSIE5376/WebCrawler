@@ -23,6 +23,8 @@ postgres:
   dsn: "postgresql+psycopg2://yugabyte:yugabyte@172.16.191.3:5433/crawlerdb"
 
 gc:
+  # Durable UTC pass completion; prevents catch-up repeating after recreation.
+  state_path: "/data/ipc/progress/daily/gc.json"
   total_shards: 256
 
   # Frontier budget. Freeze a domain (stop inserting its newly discovered
@@ -48,6 +50,8 @@ gc:
   catch_up_on_start: true
 
 accounting:
+  # Durable UTC pass completion; prevents catch-up repeating after recreation.
+  state_path: "/data/ipc/progress/daily/accounting.json"
   total_shards: 256
   event_retention_days: 90
   batch_size: 1000
