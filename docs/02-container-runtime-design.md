@@ -129,6 +129,12 @@ writes remain per record. `route.folder_done` includes `record_cnt` and
 `duration_sec` to measure throughput and compare it with the ten-minute input
 interval.
 
+On TERM or INT, a router finishes its current folder and saves progress before
+exiting. Supervisor allows 20 minutes before forcing termination; Compose gives
+the scheduler-ingest container 21 minutes. Rebuild/recreate the container to
+apply these deployment settings. A crash or forced kill can still replay the
+last incomplete folder under the existing folder-level checkpoint scheme.
+
 ### Ingestor (x16)
 
 Input: router output folders `ingestor_{id}`.
