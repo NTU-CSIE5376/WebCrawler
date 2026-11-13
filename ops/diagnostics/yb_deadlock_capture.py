@@ -21,7 +21,7 @@ SESSION_OPTIONS = (
     "-c default_transaction_read_only=on -c statement_timeout={timeout}ms "
     "-c lock_timeout=100ms -c yb_enable_memory_tracking=off "
     "-c yb_enable_pg_locks={lock_info} -c yb_locks_max_transactions=4 "
-    "-c yb_locks_txn_locks_per_tablet=5"
+    "-c yb_locks_txn_locks_per_tablet={lock_limit}"
 )
 ACTIVITY_SQL = """
 SELECT pid, query_id::text AS query_id, yb_backend_xid::text AS transaction_id,
@@ -32,9 +32,9 @@ SELECT pid, query_id::text AS query_id, yb_backend_xid::text AS transaction_id,
       WHEN query ILIKE '%INSERT INTO%url_state_current_%' THEN 'ingest_links'
       WHEN query ILIKE '%FOR UPDATE%' AND query ILIKE '%inlink_count_approx%'
       THEN 'score_select'
+      WHEN query ILIKE '%num_scheduled_90d%' AND query ILIKE '%FOR UPDATE%' THEN 'offerer'
       WHEN query ILIKE '%UPDATE%url_state_current_%' AND query ILIKE '%url_score_updated_at%'
        AND query NOT ILIKE '%num_fetch_ok_90d%' THEN 'score_update'
-      WHEN query ILIKE '%num_scheduled_90d%' AND query ILIKE '%FOR UPDATE%' THEN 'offerer'
       WHEN query ILIKE '%DELETE FROM%url_state_current_%' THEN 'delete_current'
       ELSE 'other' END AS statement_kind,
  substring(query FROM 'url_state_current_[0-9]{3}') AS relation_name,
@@ -56,14 +56,29 @@ ORDER BY sample_time DESC LIMIT 257
 """
 LOCK_SQL = """
 SELECT pid,node,tablet_id,relation::text AS relation_oid,
- transaction_id::text AS transaction_id,blocked_by::text[] AS blocked_by,granted,mode,waitstart::text
+ transaction_id::text AS transaction_id,blocked_by::text[] AS blocked_by,granted,mode,waitstart::text,
+ subtransaction_id,attnum,column_id,is_explicit,multiple_rows_locked,locktype,
+ CASE WHEN hash_cols IS NULL AND range_cols IS NULL THEN NULL
+      ELSE md5(json_build_array(hash_cols,range_cols)::text) END AS key_fingerprint
 FROM yb_lock_status(NULL,%s::uuid) LIMIT 257
+"""
+PREWAIT_SQL = """
+SELECT extract(epoch FROM sample_time)::float8 AS sample_time,
+ pid,query_id::text AS query_id,substring(wait_event_aux,1,15) AS tablet_prefix,wait_event
+FROM yb_active_session_history(now()-interval '2 seconds',now())
+WHERE wait_event_component='TServer'
+ AND (wait_event ILIKE '%conflict%' OR wait_event ILIKE '%waitqueue%'
+      OR wait_event_type='Lock' OR wait_event_class ILIKE '%lock%')
+ AND wait_event_aux ~ '^[0-9a-f]{15}([0-9a-f]{17})?$'
+ORDER BY sample_time DESC LIMIT 65
 """
 ALLOWED = {
     'pid', 'query_id', 'transaction_id', 'application_name', 'client_addr', 'client_port',
     'state', 'wait_event_type', 'wait_event', 'xact_start', 'statement_kind', 'relation_name',
     'sample_time', 'root_request_id', 'node', 'wait_event_component', 'wait_event_class',
-    'tablet_id', 'relation_oid', 'blocked_by', 'granted', 'mode', 'waitstart',
+    'tablet_id', 'tablet_prefix', 'relation_oid', 'blocked_by', 'granted', 'mode', 'waitstart',
+    'subtransaction_id', 'attnum', 'column_id', 'is_explicit', 'multiple_rows_locked',
+    'locktype', 'key_fingerprint',
 }
 UUID_RE = re.compile(r'\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b')
 HEADER = re.compile(r'^(\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d(?:[.,]\d{1,9})?(?: [A-Za-z0-9:+-]{1,16})?)\s+\[(\d+)\]\s+(ERROR|DETAIL|STATEMENT|CONTEXT):\s*(.*)$')
@@ -112,9 +127,10 @@ def safe_statement_shape(text):
 
 
 class Database:
-    def __init__(self, host, timeout=250, connect=None, uuid_info=True):
+    def __init__(self, host, timeout=250, connect=None, uuid_info=True, lock_limit=5):
         self.host, self.timeout, self.connect, self.connection = host, timeout, connect, None
         self.uuid_info = uuid_info
+        self.lock_limit = lock_limit
 
     def query(self, sql, params=None):
         if self.connection is None or self.connection.closed:
@@ -124,7 +140,7 @@ class Database:
                 connect = psycopg2.connect
             self.connection = connect(host=self.host, port=5433, dbname='crawlerdb', user='yugabyte',
                 connect_timeout=2, application_name='wc-deadlock-capture',
-                options=SESSION_OPTIONS.format(timeout=self.timeout, lock_info='on' if self.uuid_info else 'off'), keepalives=1,
+                options=SESSION_OPTIONS.format(timeout=self.timeout, lock_info='on' if self.uuid_info else 'off', lock_limit=self.lock_limit), keepalives=1,
                 keepalives_idle=5, keepalives_interval=2, keepalives_count=2, tcp_user_timeout=5000)
             self.connection.autocommit = True
         try:
@@ -239,11 +255,11 @@ class Output:
 
 class Capture:
     def __init__(self, nodes, output, log_command=None, interval=1.0, duration=21600,
-                 database_factory=Database, clock=time.monotonic):
+                 database_factory=Database, clock=time.monotonic, wait_probe=None, stop_after_incidents=0):
         self.nodes, self.output, self.log_command = nodes, output, log_command
         self.interval, self.duration, self.factory, self.clock = interval, duration, database_factory, clock
         self.databases = {n: database_factory(n) for n in nodes}
-        self.ring = deque(maxlen=512)
+        self.ring = deque(maxlen=1024 if wait_probe is not None else 512)
         self.events = queue.Queue(maxsize=32)
         self.pending = []
         self.state = {n: {'samples': 0, 'errors': 0, 'slow': 0, 'backoff': interval, 'next': 0,
@@ -253,11 +269,25 @@ class Capture:
         self.tail = None
         self.pool = ThreadPoolExecutor(max_workers=1)
         self.metrics = {'incidents': 0, 'cooldown_drops': 0, 'queue_drops': 0,
-                        'tail_eof': False, 'output_limit': False, 'ash_errors': 0, 'ash_capped': 0}
+                        'tail_eof': False, 'output_limit': False, 'ash_errors': 0, 'ash_capped': 0,
+                        'saved_incidents': 0}
+        self.stop_after_incidents = stop_after_incidents
         self.running = False
         self.metadata_only_nodes = []
         self.last_incident = -float('inf')
         self.last_ash = self.last_status = -float('inf')
+        self.wait_probe = wait_probe
+        self.wait_pool = ThreadPoolExecutor(max_workers=1) if wait_probe is not None else None
+        self.wait_future = None
+        self.next_wait = -float('inf')
+        self.last_live_locks = -float('inf')
+        self.last_wait_evidence = -float('inf')
+        self.wait_state = {'enabled': wait_probe is not None, 'ash_queries': 0,
+            'ash_errors': 0, 'ash_capped': 0, 'http_samples': 0, 'http_errors': 0,
+            'edges': 0, 'live_lock_probes': 0, 'slow_rounds': 0, 'busy_skips': 0,
+            'last_success': None, 'last_error': None, 'last_http_success': None,
+            'last_http_error': None, 'current_capped': False, 'backoff': interval,
+            'http_backoff': interval, 'http_error_types': {}}
 
     def tail_logs(self):
         try:
@@ -275,8 +305,9 @@ class Capture:
         except Exception:
             self.metrics['tail_eof'] = True
 
-    def locks(self, event):
-        db = self.factory(self.nodes[0], timeout=1000)
+    def locks(self, event, timeout=1000):
+        db = self.factory(self.nodes[0], timeout=timeout)
+        db.lock_limit = 32  # Only this short-lived, UUID-specific connection.
         result = []
         try:
             for transaction in event['transaction_ids'][:4]:
@@ -289,6 +320,111 @@ class Capture:
         finally:
             db.close()
         return result
+
+    def probe_waits(self, frames, collect_locks):
+        snapshots = self.wait_probe.sample(frames)
+        transactions = []
+        for snapshot in snapshots:
+            for edge in snapshot.get('edges', []):
+                for key in ['waiter_transaction_id', 'blocker_transaction_id']:
+                    value = edge.get(key)
+                    if value and value not in transactions:
+                        transactions.append(value)
+        if collect_locks and transactions:
+            # Only two exact UUID probes, at most once a minute. Never a
+            # periodic all-cluster lock scan; keys remain excluded by LOCK_SQL.
+            started = time.time()
+            rows = self.locks({'transaction_ids': transactions[:2]}, timeout=250)
+            snapshots.append({'at': time.time(), 'started_at': started, 'kind': 'live_locks',
+                'source': 'live_waitqueue', 'locks_per_tablet_limit': 32, 'transactions': rows})
+        return snapshots
+
+    def sample_waits(self, now):
+        if self.wait_probe is None:
+            return
+        if self.wait_future is not None:
+            if not self.wait_future.done():
+                self.wait_state['busy_skips'] += 1
+                return
+            try:
+                snapshots = self.wait_future.result()
+                http_seen = http_failed = http_slow = False
+                for snapshot in snapshots:
+                    self.ring.append(snapshot)
+                    if snapshot.get('kind') == 'live_locks':
+                        self.last_live_locks = now
+                        self.wait_state['live_lock_probes'] += 1
+                    else:
+                        http_seen = True
+                        self.wait_state['http_samples'] += 1
+                        self.wait_state['edges'] += len(snapshot.get('edges', []))
+                        if snapshot.get('error_type') or snapshot.get('truncated'):
+                            self.wait_state['http_errors'] += 1
+                            error_type = snapshot.get('error_type') or 'Truncated'
+                            counts = self.wait_state['http_error_types']
+                            counts[error_type] = counts.get(error_type, 0) + 1
+                            http_failed = True
+                        else:
+                            if snapshot.get('latency_ms', 0) > 100:
+                                self.wait_state['slow_rounds'] += 1
+                                http_slow = True
+                if http_failed:
+                    self.wait_state.update(last_error=now, last_http_error=now)
+                elif http_seen:
+                    self.wait_state['last_http_success'] = now
+                if http_failed or http_slow:
+                    self.wait_state['http_backoff'] = min(30, max(2, self.wait_state['http_backoff'] * 2))
+                    self.next_wait = max(self.next_wait, now + self.wait_state['http_backoff'])
+                elif http_seen:
+                    self.wait_state['http_backoff'] = self.interval
+                if any(snapshot.get('edges') for snapshot in snapshots) and now-self.last_wait_evidence >= 60:
+                    self.output.write('last-live-wait.json', {'at': time.time(), 'snapshots': snapshots,
+                        'note': 'Live wait relationships; not necessarily a deadlock or complete lock set'})
+                    self.last_wait_evidence = now
+            except OutputLimit:
+                raise
+            except Exception as exc:
+                self.wait_state['http_errors'] += 1
+                self.wait_state.update(last_error=now, last_http_error=now, error_type=type(exc).__name__)
+                self.wait_state['http_backoff'] = min(30, max(2, self.wait_state['http_backoff'] * 2))
+                self.next_wait = max(self.next_wait, now + self.wait_state['http_backoff'])
+            self.wait_future = None
+        if now < self.next_wait:
+            return
+        started = self.clock()
+        frames = []
+        failed = False
+        self.wait_state['current_capped'] = False
+        for node, db in self.databases.items():
+            # Respect activity sampler backoff rather than adding more work to
+            # a node that is already slow or unavailable.
+            if self.state[node]['backoff'] > self.interval:
+                continue
+            try:
+                rows = db.query(PREWAIT_SQL)
+                self.wait_state['ash_queries'] += 1
+                self.wait_state['ash_capped'] += int(len(rows) > 64)
+                self.wait_state['current_capped'] |= len(rows) > 64
+                frame = {'at': time.time(), 'node': node, 'kind': 'prewait_ash',
+                    'rows': safe_rows(rows[:64]), 'capped': len(rows) > 64}
+                frames.append(frame)
+                self.ring.append(frame)
+            except Exception as exc:
+                failed = True
+                self.wait_state['ash_errors'] += 1
+                self.wait_state.update(last_error=now, error_type=type(exc).__name__)
+            if self.clock() - started > .1:
+                failed = True
+                self.wait_state['slow_rounds'] += 1
+                break
+        elapsed = round((self.clock() - started) * 1000, 3)
+        self.wait_state['ash_round_ms'] = elapsed
+        self.wait_state['backoff'] = min(30, max(2, self.wait_state['backoff'] * 2)) if failed else self.interval
+        if not failed and frames:
+            self.wait_state['last_success'] = now
+        self.next_wait = self.clock() + max(self.wait_state['backoff'], self.wait_state['http_backoff'])
+        if frames:
+            self.wait_future = self.wait_pool.submit(self.probe_waits, frames, now - self.last_live_locks >= 60)
 
     def sample(self, node, now):
         state = self.state[node]
@@ -338,10 +474,24 @@ class Capture:
                               'omitted_for_privacy': shape is None}
         return list(found.values())
 
+    def incident_windows(self, event):
+        # An HTTP graph can arrive after the error while its sampling time is
+        # before the error. Include these late completions instead of losing
+        # them between the frozen "before" list and the "after" time filter.
+        before = list(event['before'])
+        seen = {id(snapshot) for snapshot in before}
+        start = event['started_at']
+        for snapshot in self.ring:
+            if start - 60 <= snapshot['at'] < start and id(snapshot) not in seen:
+                before.append(snapshot)
+        before.sort(key=lambda snapshot: snapshot['at'])
+        return before, [snapshot for snapshot in self.ring if snapshot['at'] >= start]
+
     def tick(self):
         now = self.clock()
         for node in self.nodes:
             self.sample(node, now)
+        self.sample_waits(now)
         if now - self.last_ash >= 10:
             self.last_ash = now
             for node, db in self.databases.items():
@@ -365,17 +515,23 @@ class Capture:
             self.metrics['incidents'] += 1
             event_id = f'event-{time.time_ns()}'
             self.pending.append({'name': event_id, 'event': event, 'started_at': time.time(), 'before': list(self.ring),
-                                 'end': now + 10, 'future': self.pool.submit(self.locks, event)})
+                                 'end': now + 10, 'wait_future_at_error': self.wait_future,
+                                 'future': self.pool.submit(self.locks, event)})
         for event in list(self.pending):
-            if now < event['end'] or not event['future'].done():
+            pending_wait = event.get('wait_future_at_error')
+            if now < event['end'] or not event['future'].done() or (pending_wait is not None and not pending_wait.done()):
                 continue
-            payload = {k: v for k, v in event.items() if k not in {'future', 'end', 'name'}}
-            payload.update(after=[s for s in self.ring if s['at'] >= event['started_at']],
+            payload = {k: v for k, v in event.items() if k not in {'future', 'wait_future_at_error', 'end', 'name'}}
+            before, after = self.incident_windows(event)
+            payload.update(before=before, after=after,
                            post_window_complete=True, locks=event['future'].result())
             payload['normalized_statements'] = self.statement_shapes(
                 event['event'], event['before'] + payload['after'])
             try:
                 self.output.write(event['name'] + '.json', payload)
+                self.metrics['saved_incidents'] += 1
+                if self.stop_after_incidents and self.metrics['saved_incidents'] >= self.stop_after_incidents:
+                    self.stop.set()
             except OutputLimit:
                 self.metrics['output_limit'] = True
                 self.output.write('budget-trigger.json', {'event': event['event'],
@@ -389,9 +545,14 @@ class Capture:
     def status(self):
         healthy = all(s['last_success'] is not None and (s['last_error'] is None or s['last_success'] > s['last_error'])
                       for s in self.state.values()) and all(s['backoff'] == self.interval and not s['current_capped'] and self.clock()-s['last_success'] <= max(5, 3*self.interval) for s in self.state.values()) and not self.metrics['tail_eof'] and not self.metrics['output_limit'] and not self.metrics['queue_drops'] and self.running
-        self.output.write('status.json', {'at': time.time(), 'healthy': healthy, 'nodes': self.state,
+        wait_healthy = (self.wait_probe is None or
+            (not self.wait_state['current_capped'] and self.wait_state['last_success'] is not None and self.clock()-self.wait_state['last_success'] < 10
+             and (self.wait_state['last_http_error'] is None or
+                  (self.wait_state['last_http_success'] is not None and self.wait_state['last_http_success'] > self.wait_state['last_http_error']))))
+        self.output.write('status.json', {'at': time.time(), 'healthy': healthy and wait_healthy, 'nodes': self.state,
             'metrics': self.metrics, 'tail_line_truncations': self.parser.truncated,
             'running': self.running, 'metadata_only_nodes': self.metadata_only_nodes,
+            'wait_probe': self.wait_state,
             'sample_ages_seconds': {n: round(self.clock()-s['last_success'], 2) if s['last_success'] is not None else None for n,s in self.state.items()}, 'ring_snapshots': len(self.ring), 'pending_events': len(self.pending), 'bytes': self.output.used}, status=True)
 
     def run(self):
@@ -422,9 +583,17 @@ class Capture:
                     except subprocess.TimeoutExpired:
                         self.tail.kill()
             self.pool.shutdown(wait=True)
+            if self.wait_pool is not None:
+                self.wait_pool.shutdown(wait=True)
+                if self.wait_future is not None:
+                    try:
+                        self.ring.extend(self.wait_future.result())
+                    except Exception:
+                        self.wait_state['http_errors'] += 1
             for event in list(self.pending):
-                payload = {k: v for k, v in event.items() if k not in {'future', 'end', 'name'}}
-                payload.update(after=[s for s in self.ring if s['at'] >= event['started_at']],
+                payload = {k: v for k, v in event.items() if k not in {'future', 'wait_future_at_error', 'end', 'name'}}
+                before, after = self.incident_windows(event)
+                payload.update(before=before, after=after,
                                post_window_complete=False, locks=event['future'].result())
                 payload['normalized_statements'] = self.statement_shapes(
                     event['event'], event['before'] + payload['after'])
@@ -451,11 +620,15 @@ def main():
     parser.add_argument('--max-bytes', type=int, default=128 * 1024**2)
     parser.add_argument('--metadata-only-node', action='append', default=[],
                         help='Skip activity UUID RPC here; PID/query ID/ASH remain available')
+    parser.add_argument('--waitqueue-tablet-map', help='Opt-in cached tablet map JSON; enables bounded pre-error wait probes')
+    parser.add_argument('--stop-after-incidents', type=int, default=0, help='Stop after saving this many complete incidents; 0 keeps observing')
     args = parser.parse_args()
     if not 1 <= args.interval <= 60 or not 1 <= args.duration_seconds <= 86400:
         parser.error('Interval/duration outside bounded range')
     if not 32768 <= args.max_bytes <= 128 * 1024**2 or not 1 <= len(set(args.nodes)) <= 3:
         parser.error('Output/connection budget outside bounded range')
+    if not 0 <= args.stop_after_incidents <= 100:
+        parser.error('Incident stop count outside bounded range')
     metadata_only = set(args.metadata_only_node)
     if not metadata_only.issubset(args.nodes) or args.nodes[0] in metadata_only:
         parser.error('Metadata-only nodes must be sampled secondary nodes')
@@ -465,8 +638,13 @@ def main():
     def factory(host, timeout=250):
         return Database(host, timeout=timeout, uuid_info=host not in metadata_only)
 
+    wait_probe = None
+    if args.waitqueue_tablet_map:
+        from yb_waitqueue_probe import WaitQueueProbe
+        wait_probe = WaitQueueProbe(json.loads(Path(args.waitqueue_tablet_map).read_text()))
     capture = Capture(args.nodes, Output(args.output, args.max_bytes), command, args.interval,
-                      args.duration_seconds, database_factory=factory)
+                      args.duration_seconds, database_factory=factory, wait_probe=wait_probe,
+                      stop_after_incidents=args.stop_after_incidents)
     capture.metadata_only_nodes = sorted(metadata_only)
     for sig in [signal.SIGTERM, signal.SIGINT]:
         signal.signal(sig, lambda *_: capture.stop.set())

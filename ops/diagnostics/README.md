@@ -26,7 +26,11 @@ scorer merely because the index is named `golden_discovery_v2_rescore`.
   seconds of following samples. Normal operation writes a small status file.
 - On a new deadlock, up to four exact transaction-UUID lock lookups, at most
   one detailed incident per minute. No periodic all-cluster `pg_locks` query.
-  Lock keys, URL values, SQL literals and raw SQL are not persisted.
+  Raw lock keys, URL values, SQL literals and raw SQL are not persisted.
+  UUID-specific lock snapshots retain a server-computed MD5 key fingerprint,
+  relation/tablet, lock mode and subtransaction so samples can be compared
+  without writing key values. Fingerprints are identifiers, not proof of a
+  complete lock graph; the exact-UUID session allows at most 32 locks/tablet.
 
 `yb_deadlock_log_reader.py` follows the existing PostgreSQL log directory and
 reconstructs only ERROR/DETAIL timestamps, PIDs and UUIDs. It follows newer
@@ -147,3 +151,51 @@ Query IDs are serialized as strings to preserve 64-bit identifiers when JSON is
 later opened by JavaScript-based tools. The private observer environment reuses
 the exact psycopg2 2.9.11 binary already installed in scheduler_ingest; no existing
 application environment, image or global Python installation is changed.
+
+## Optional pre-error wait capture (2026-11-14)
+
+Two incidents have now identified the same Ingestor result UPSERT versus Offerer
+claim CTE. This identifies the writers, not the complete lock-acquisition cycle.
+The optional `--waitqueue-tablet-map /private/tablet-map.json` adds live waiting
+evidence rather than repeatedly querying locks after their transaction aborted:
+
+1. Load a private, one-time metadata map of `{node, tablet_id, relation_name}`
+   from the three nodes' `yb_local_tablets()` rows. Never read partition keys or
+   crawl URLs. The map covers current-state tables, their indexes and daily
+   event tables. It is not refreshed automatically; an unknown or ambiguous
+   tablet prefix remains explicitly unknown.
+2. Once per sampler interval, query only the latest two seconds of TServer
+   conflict/lock ASH samples, at most 65 rows/node. ASH carries only 15 tablet-ID
+   characters, so require a unique same-node match to the cached full ID.
+   Reuse the existing three read-only connections. Query failure/slow-round
+   backoff remains visible; DB-wide logging and the underlying ASH sampling
+   frequency are unchanged.
+3. One background job can read at most three candidate `/waitqueue?id=...`
+   pages, with a 150 ms deadline each and 64 KiB response cap. Only fixed
+   internal nodes are allowed; no proxy or redirect. Parse the exact tablet
+   heading and known table headers, retaining only safe transaction edges and
+   request IDs. Unknown, truncated or shutting-down pages are not healthy empty
+   queues. HTTP errors have independent exponential backoff up to 30 seconds.
+4. If an actual edge is present, at most once a minute query locks for two exact
+   UUIDs, with 250 ms statement timeouts. This occasionally adds one connection;
+   a concurrent error-triggered probe may add another. Per-tablet lock limits
+   and row caps mean these remain samples, not a complete transaction history.
+5. Keep a 60-second bounded RAM ring, append late-arriving pre-error snapshots
+   to the correct incident, and retain at most one small `last-live-wait.json`
+   update per minute. Actual deadlocks save the preceding and following samples
+   under the existing private 128 MiB evidence budget. No raw HTML, key, URL or
+   SQL payload is written. `--stop-after-incidents 1` stops only after the next
+   complete incident has been persisted; the duration limit remains a fallback.
+
+The 35-second pilot captured real waiting edges and one pair of live lock
+samples (256/96 rows). Total observer Python CPU was about 0.39 seconds and peak
+RSS 36 MiB. Warm ASH-peek point measurements were 0.7–1.9 ms/node; the one-time
+tablet-map reads took 0.5–0.84 seconds/node. Some bounded queries timed out and
+recovered during the pilot, so these measurements are not a zero-impact or
+complete-coverage guarantee. The exact-UUID pair took about 295 ms; it is not a
+per-second operation. Millisecond-lived deadlocks can still evade sampling.
+
+The authorized deployment replaces only the diagnostic observer, preserving its
+old evidence and all application/DB configuration. No application service is
+restarted. It runs for at most 24 hours or the next saved incident. The observer
+does not retry failed application transactions or restore failed batches.
