@@ -103,10 +103,15 @@ contain transaction UUIDs. Empty evidence does not exonerate a writer, and a
 `blocked_by` list may be capped. Always inspect sample errors, age, capping,
 incident cooldown drops and the time window before claiming a complete cycle.
 
-The sampler retains no normalized SQL text. A captured query ID can be looked up
-separately in `pg_stat_statements`, with a privacy review before exporting its
-normalized statement. A complete real-world counterparty capture is still needed
-before blaming a component or declaring a Yugabyte implementation bug.
+For the exact incident transaction UUIDs only, the sampler archives up to eight
+matching normalized statement shapes per node from `pg_stat_statements`. This
+avoids losing the query-ID mapping to later statistics eviction. The shape gate
+rejects SQL literals, comments, dollar-quoted content, URL/sensitive markers and
+unrelated commands; omitted shapes remain explicitly marked. Text is capped at
+16 KiB and a capped prefix is marked truncated. This does not enable SQL logging
+or persist runtime bind values. A complete real-world counterparty capture is
+still needed before blaming a component or declaring a Yugabyte implementation
+bug.
 
 ## Local verification
 

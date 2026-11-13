@@ -58,6 +58,13 @@ SELECT pid,node,tablet_id,relation::text AS relation_oid,
  transaction_id::text AS transaction_id,blocked_by::text[] AS blocked_by,granted,mode,waitstart::text
 FROM yb_lock_status(NULL,%s::uuid) LIMIT 257
 """
+STATEMENT_SQL = """
+SELECT queryid::text AS query_id, left(query,16384) AS statement_shape
+FROM pg_stat_statements
+WHERE queryid=ANY(%s::bigint[])
+ AND dbid=(SELECT oid FROM pg_database WHERE datname=current_database())
+LIMIT 8
+"""
 ALLOWED = {
     'pid', 'query_id', 'transaction_id', 'application_name', 'client_addr', 'client_port',
     'state', 'wait_event_type', 'wait_event', 'xact_start', 'statement_kind', 'relation_name',
@@ -84,6 +91,21 @@ def safe_value(value):
 
 def safe_rows(rows):
     return [{k: safe_value(v) for k, v in row.items() if k in ALLOWED} for row in rows[:256]]
+
+
+def safe_statement_shape(text):
+    """Accept only relevant normalized DML with no literal payloads."""
+    if not isinstance(text, str) or len(text) > 16384:
+        return None
+    if not re.match(r'^\s*(SELECT|INSERT|UPDATE|WITH)\b', text, re.I):
+        return None
+    if not re.search(r'\burl_state_current_[0-9]{3}\b', text):
+        return None
+    if ("'" in text or '--' in text or '/*' in text
+            or re.search(r'\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$', text)
+            or any(s in text.lower() for s in ['://', 'password', 'secret', 'token='])):
+        return None
+    return text
 
 
 class Database:
@@ -228,7 +250,8 @@ class Capture:
         self.tail = None
         self.pool = ThreadPoolExecutor(max_workers=1)
         self.metrics = {'incidents': 0, 'cooldown_drops': 0, 'queue_drops': 0,
-                        'tail_eof': False, 'output_limit': False, 'ash_errors': 0, 'ash_capped': 0}
+                        'tail_eof': False, 'output_limit': False, 'ash_errors': 0, 'ash_capped': 0,
+                        'statement_lookup_errors': 0}
         self.running = False
         self.metadata_only_nodes = []
         self.last_incident = -float('inf')
@@ -289,6 +312,38 @@ class Capture:
             state['backoff'] = min(30, max(2, state['backoff'] * 2))
         state['next'] = self.clock() + state['backoff']
 
+    def statement_shapes(self, event, snapshots):
+        # Snapshot statistics can evict query IDs later, so archive a small,
+        # privacy-checked normalized shape only for this cycle's transactions.
+        transactions = set(event['transaction_ids'])
+        wanted = {}
+        for snapshot in reversed(snapshots):
+            if snapshot.get('kind') != 'activity':
+                continue
+            for row in snapshot['rows']:
+                value = str(row.get('query_id') or '')
+                if row.get('transaction_id') not in transactions or not re.fullmatch(r'-?[0-9]{1,20}', value):
+                    continue
+                number = int(value)
+                if number and -(2**63) <= number < 2**63:
+                    group = wanted.setdefault(snapshot['node'], set())
+                    if len(group) < 8:
+                        group.add(number)
+        found = []
+        for node, query_ids in wanted.items():
+            try:
+                rows = self.databases[node].query(STATEMENT_SQL, (sorted(query_ids),))
+                for row in rows:
+                    shape = safe_statement_shape(row.get('statement_shape'))
+                    found.append({'node': node, 'query_id': str(row['query_id']),
+                                  'statement_shape': shape,
+                                  'statement_shape_truncated': bool(shape and len(shape) == 16384),
+                                  'omitted_for_privacy': shape is None})
+            except Exception as exc:
+                self.metrics['statement_lookup_errors'] += 1
+                found.append({'node': node, 'error_type': type(exc).__name__})
+        return found
+
     def tick(self):
         now = self.clock()
         for node in self.nodes:
@@ -323,6 +378,8 @@ class Capture:
             payload = {k: v for k, v in event.items() if k not in {'future', 'end', 'name'}}
             payload.update(after=[s for s in self.ring if s['at'] >= event['started_at']],
                            post_window_complete=True, locks=event['future'].result())
+            payload['normalized_statements'] = self.statement_shapes(
+                event['event'], event['before'] + payload['after'])
             try:
                 self.output.write(event['name'] + '.json', payload)
             except OutputLimit:
@@ -375,6 +432,8 @@ class Capture:
                 payload = {k: v for k, v in event.items() if k not in {'future', 'end', 'name'}}
                 payload.update(after=[s for s in self.ring if s['at'] >= event['started_at']],
                                post_window_complete=False, locks=event['future'].result())
+                payload['normalized_statements'] = self.statement_shapes(
+                    event['event'], event['before'] + payload['after'])
                 try:
                     self.output.write(event['name']+'.json', payload)
                 except OutputLimit:
