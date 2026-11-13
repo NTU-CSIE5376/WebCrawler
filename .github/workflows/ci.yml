@@ -36,6 +36,10 @@ jobs:
         if: matrix.service == 'scheduler_ingest'
         working-directory: .
         run: containers/scheduler_ingest/.venv/bin/python -m pytest -q tests/test_approved_control_sitemap_config.py
+      - name: Test optional deadlock diagnostics without a database
+        if: matrix.service == 'scheduler_ingest'
+        working-directory: .
+        run: containers/scheduler_ingest/.venv/bin/python -m pytest -q ops/diagnostics/tests
 
   golden_inject:
     name: golden_inject
