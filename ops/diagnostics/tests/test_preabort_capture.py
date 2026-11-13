@@ -123,6 +123,15 @@ def test_pre_wait_error_backs_off_without_disabling_activity(tmp_path):
     capture.output.close()
 
 
+def test_recent_ash_failure_cannot_reuse_earlier_success_as_healthy(tmp_path):
+    now = [2.0]; capture = run(tmp_path, now, Probe())
+    capture.sample('node', 2)
+    capture.wait_state.update(last_success=1, last_error=2)
+    capture.status()
+    assert not json.loads((tmp_path/'status.json').read_text())['healthy']
+    capture.output.close()
+
+
 def test_wait_query_uses_only_tserver_aux_and_clips_rows():
     assert "wait_event_component='TServer'" in c.PREWAIT_SQL
     assert "interval '2 seconds'" in c.PREWAIT_SQL

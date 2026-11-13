@@ -547,6 +547,7 @@ class Capture:
                       for s in self.state.values()) and all(s['backoff'] == self.interval and not s['current_capped'] and self.clock()-s['last_success'] <= max(5, 3*self.interval) for s in self.state.values()) and not self.metrics['tail_eof'] and not self.metrics['output_limit'] and not self.metrics['queue_drops'] and self.running
         wait_healthy = (self.wait_probe is None or
             (not self.wait_state['current_capped'] and self.wait_state['last_success'] is not None and self.clock()-self.wait_state['last_success'] < 10
+             and (self.wait_state['last_error'] is None or self.wait_state['last_success'] > self.wait_state['last_error'])
              and (self.wait_state['last_http_error'] is None or
                   (self.wait_state['last_http_success'] is not None and self.wait_state['last_http_success'] > self.wait_state['last_http_error']))))
         self.output.write('status.json', {'at': time.time(), 'healthy': healthy and wait_healthy, 'nodes': self.state,
