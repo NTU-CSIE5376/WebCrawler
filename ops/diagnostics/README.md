@@ -117,3 +117,27 @@ python -m pytest -q ops/diagnostics/tests
 Tests use fake database adapters, real disposable log-reader subprocesses and
 local temporary files. They do not connect to a production database. The
 scheduler-ingest CI job runs these tests using its existing dependencies.
+
+## Initial operator profile (2026-11-13)
+
+The initial live observation overrides the default to **24 hours**, covering the
+next historical overnight failure window, with the same 128 MiB cap. Node 3 is
+the current write endpoint and retains full transaction UUID collection; node 2
+also retains it. Node 4 uses `--metadata-only-node 172.16.191.4`: its optional
+activity-UUID RPC was too slow for the 250 ms sampling budget. It still supplies
+PID/query ID/wait/ASH metadata, and event-triggered UUID lock lookups still contact
+all live TServers. This coverage distinction is explicit in `status.json`; do not
+claim full continuous transaction-UUID coverage on node 4.
+
+A canceled autocommit sampling statement only retains its connection after the
+driver confirms transaction status IDLE. This allows warm catalog state to be
+reused after a cold-query timeout; connection failures and other failures still
+close the connection. Timeout/error/backoff counters remain visible. A subsequent
+30-second pilot obtained 28/28/24 successful samples on nodes 3/2/4, zero ASH caps,
+and final sample ages below 1.1 seconds; node 4 had one recovered startup timeout.
+These short pilots do not establish long-term absence of performance impact.
+
+Query IDs are serialized as strings to preserve 64-bit identifiers when JSON is
+later opened by JavaScript-based tools. The private observer environment reuses
+the exact psycopg2 2.9.11 binary already installed in scheduler_ingest; no existing
+application environment, image or global Python installation is changed.

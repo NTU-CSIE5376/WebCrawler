@@ -252,3 +252,40 @@ def test_literal_sql_percent_is_not_interpolated_as_empty_parameters():
     db.query(c.LOCK_SQL, (U1,))
     assert con.cur.sql[-1][1] == (U1,)
     db.close()
+
+
+def test_metadata_only_mode_avoids_uuid_rpc_only_for_its_own_connection():
+    seen=[]
+    con=Connection()
+    def connect(**kwargs):
+        seen.append(kwargs)
+        return con
+    db=c.Database('secondary',connect=connect,uuid_info=False)
+    db.query(c.ACTIVITY_SQL)
+    assert 'yb_enable_pg_locks=off' in seen[0]['options']
+    assert 'default_transaction_read_only=on' in seen[0]['options']
+    db.close()
+
+
+def test_canceled_autocommit_sample_reuses_a_verified_idle_session():
+    class Canceled(Exception):
+        pgcode='57014'
+    con=Connection()
+    con.get_transaction_status=lambda: 0
+    seen=[]
+    def connect(**kw):
+        seen.append(kw)
+        return con
+    real=con.cur.execute
+    calls=[]
+    def execute(sql,params):
+        calls.append(sql)
+        if len(calls)==1:raise Canceled()
+        return real(sql,params)
+    con.cur.execute=execute
+    db=c.Database('node',connect=connect)
+    with pytest.raises(Canceled):db.query(c.ACTIVITY_SQL)
+    assert not con.closed
+    assert db.query(c.ACTIVITY_SQL)==[{'pid':123,'query_id':456}]
+    assert len(seen)==1
+    db.close()

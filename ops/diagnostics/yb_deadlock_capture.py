@@ -20,7 +20,7 @@ import uuid
 SESSION_OPTIONS = (
     "-c default_transaction_read_only=on -c statement_timeout={timeout}ms "
     "-c lock_timeout=100ms -c yb_enable_memory_tracking=off "
-    "-c yb_enable_pg_locks=on -c yb_locks_max_transactions=4 "
+    "-c yb_enable_pg_locks={lock_info} -c yb_locks_max_transactions=4 "
     "-c yb_locks_txn_locks_per_tablet=5"
 )
 ACTIVITY_SQL = """
@@ -87,8 +87,9 @@ def safe_rows(rows):
 
 
 class Database:
-    def __init__(self, host, timeout=250, connect=None):
+    def __init__(self, host, timeout=250, connect=None, uuid_info=True):
         self.host, self.timeout, self.connect, self.connection = host, timeout, connect, None
+        self.uuid_info = uuid_info
 
     def query(self, sql, params=None):
         if self.connection is None or self.connection.closed:
@@ -98,7 +99,7 @@ class Database:
                 connect = psycopg2.connect
             self.connection = connect(host=self.host, port=5433, dbname='crawlerdb', user='yugabyte',
                 connect_timeout=2, application_name='wc-deadlock-capture',
-                options=SESSION_OPTIONS.format(timeout=self.timeout), keepalives=1,
+                options=SESSION_OPTIONS.format(timeout=self.timeout, lock_info='on' if self.uuid_info else 'off'), keepalives=1,
                 keepalives_idle=5, keepalives_interval=2, keepalives_count=2, tcp_user_timeout=5000)
             self.connection.autocommit = True
         try:
@@ -107,8 +108,17 @@ class Database:
                 names = [x[0] for x in cur.description]
                 rows = [dict(zip(names, row)) for row in cur.fetchall()]
             return rows
-        except Exception:
-            self.close()
+        except Exception as exc:
+            # A canceled autocommit metadata statement is already rolled back.
+            # Keep the usable session and its warmed catalog caches; reconnecting
+            # after every cold-query timeout can otherwise prevent any sample.
+            idle_after_cancel = (
+                getattr(exc, 'pgcode', None) == '57014'
+                and not self.connection.closed
+                and getattr(self.connection, 'get_transaction_status', lambda: None)() == 0
+            )
+            if not idle_after_cancel:
+                self.close()
             raise
 
     def close(self):
@@ -220,6 +230,7 @@ class Capture:
         self.metrics = {'incidents': 0, 'cooldown_drops': 0, 'queue_drops': 0,
                         'tail_eof': False, 'output_limit': False, 'ash_errors': 0, 'ash_capped': 0}
         self.running = False
+        self.metadata_only_nodes = []
         self.last_incident = -float('inf')
         self.last_ash = self.last_status = -float('inf')
 
@@ -329,7 +340,8 @@ class Capture:
                       for s in self.state.values()) and all(s['backoff'] == self.interval and not s['current_capped'] and self.clock()-s['last_success'] <= max(5, 3*self.interval) for s in self.state.values()) and not self.metrics['tail_eof'] and not self.metrics['output_limit'] and not self.metrics['queue_drops'] and self.running
         self.output.write('status.json', {'at': time.time(), 'healthy': healthy, 'nodes': self.state,
             'metrics': self.metrics, 'tail_line_truncations': self.parser.truncated,
-            'running': self.running, 'sample_ages_seconds': {n: round(self.clock()-s['last_success'], 2) if s['last_success'] is not None else None for n,s in self.state.items()}, 'ring_snapshots': len(self.ring), 'pending_events': len(self.pending), 'bytes': self.output.used}, status=True)
+            'running': self.running, 'metadata_only_nodes': self.metadata_only_nodes,
+            'sample_ages_seconds': {n: round(self.clock()-s['last_success'], 2) if s['last_success'] is not None else None for n,s in self.state.items()}, 'ring_snapshots': len(self.ring), 'pending_events': len(self.pending), 'bytes': self.output.used}, status=True)
 
     def run(self):
         self.running = True
@@ -384,15 +396,25 @@ def main():
     parser.add_argument('--duration-seconds', type=float, default=21600)
     parser.add_argument('--interval', type=float, default=1)
     parser.add_argument('--max-bytes', type=int, default=128 * 1024**2)
+    parser.add_argument('--metadata-only-node', action='append', default=[],
+                        help='Skip activity UUID RPC here; PID/query ID/ASH remain available')
     args = parser.parse_args()
     if not 1 <= args.interval <= 60 or not 1 <= args.duration_seconds <= 86400:
         parser.error('Interval/duration outside bounded range')
     if not 32768 <= args.max_bytes <= 128 * 1024**2 or not 1 <= len(set(args.nodes)) <= 3:
         parser.error('Output/connection budget outside bounded range')
+    metadata_only = set(args.metadata_only_node)
+    if not metadata_only.issubset(args.nodes) or args.nodes[0] in metadata_only:
+        parser.error('Metadata-only nodes must be sampled secondary nodes')
     command = json.loads(args.log_command_json) if args.log_command_json else None
     if command is not None and (not isinstance(command, list) or not command or not all(isinstance(x, str) for x in command)):
         parser.error('log command must be a nonempty argv list')
-    capture = Capture(args.nodes, Output(args.output, args.max_bytes), command, args.interval, args.duration_seconds)
+    def factory(host, timeout=250):
+        return Database(host, timeout=timeout, uuid_info=host not in metadata_only)
+
+    capture = Capture(args.nodes, Output(args.output, args.max_bytes), command, args.interval,
+                      args.duration_seconds, database_factory=factory)
+    capture.metadata_only_nodes = sorted(metadata_only)
     for sig in [signal.SIGTERM, signal.SIGINT]:
         signal.signal(sig, lambda *_: capture.stop.set())
     capture.run()
