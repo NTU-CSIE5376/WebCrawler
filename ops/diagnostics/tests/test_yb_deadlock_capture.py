@@ -302,7 +302,7 @@ def test_normalized_shape_gate_rejects_payloads_and_unrelated_commands(query):
     assert c.safe_statement_shape(query) is None
 
 
-def test_normalized_shape_lookup_uses_only_exact_incident_transactions(tmp_path):
+def test_live_shapes_use_only_exact_incident_transactions_without_db_lookup(tmp_path):
     class Shapes:
         def __init__(self,*args,**kw):self.calls=[]
         def query(self,sql,params=None):
@@ -311,12 +311,19 @@ def test_normalized_shape_lookup_uses_only_exact_incident_transactions(tmp_path)
                     {'query_id':'9','statement_shape':"SELECT url FROM url_state_current_242 WHERE url='private'"}]
         def close(self):pass
     run=c.Capture(['node'],c.Output(tmp_path),database_factory=Shapes)
-    snapshots=[{'node':'node','kind':'activity','rows':[{'transaction_id':U1,'query_id':'9223372036854770000'},
-                                                      {'transaction_id':U2,'query_id':'9'},
+    snapshots=[{'node':'node','kind':'activity','rows':[{'transaction_id':U1,'query_id':'9223372036854770000','statement_prefix':'SELECT url FROM url_state_current_242 WHERE url=$1'},
+                                                      {'transaction_id':U2,'query_id':'9','statement_prefix':"SELECT url FROM url_state_current_242 WHERE url='private'"},
                                                       {'transaction_id':'unrelated','query_id':'10'}]}]
     got=run.statement_shapes({'transaction_ids':[U1,U2]},snapshots)
-    assert run.databases['node'].calls[0][1]==([9,9223372036854770000],)
-    assert got[0]['statement_shape'].endswith('url=$1')
+    assert run.databases['node'].calls==[]
+    assert got[0]['statement_shape'].endswith('url=?')
     assert got[1]['statement_shape'] is None and got[1]['omitted_for_privacy']
     assert 'private' not in json.dumps(got)
     run.pool.shutdown();run.output.close()
+
+
+def test_live_prefix_projection_removes_numeric_values_preserving_identifiers():
+    row={'pid':1,'statement_prefix':'SELECT url FROM url_state_current_242 WHERE x=123 AND y=1.25e-4 AND z=$9'}
+    got,=c.safe_rows([row])
+    assert got['statement_prefix']=='SELECT url FROM url_state_current_242 WHERE x=? AND y=? AND z=?'
+    assert got['statement_prefix_partial'] is True

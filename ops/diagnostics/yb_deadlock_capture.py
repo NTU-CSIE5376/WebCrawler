@@ -37,7 +37,8 @@ SELECT pid, query_id::text AS query_id, yb_backend_xid::text AS transaction_id,
       WHEN query ILIKE '%num_scheduled_90d%' AND query ILIKE '%FOR UPDATE%' THEN 'offerer'
       WHEN query ILIKE '%DELETE FROM%url_state_current_%' THEN 'delete_current'
       ELSE 'other' END AS statement_kind,
- substring(query FROM 'url_state_current_[0-9]{3}') AS relation_name
+ substring(query FROM 'url_state_current_[0-9]{3}') AS relation_name,
+ split_part(query,chr(39),1) AS statement_prefix
 FROM pg_stat_get_activity(NULL)
 WHERE datid=(SELECT oid FROM pg_database WHERE datname=current_database())
  AND backend_type='client backend' AND COALESCE(application_name,'') <> 'wc-deadlock-capture'
@@ -57,13 +58,6 @@ LOCK_SQL = """
 SELECT pid,node,tablet_id,relation::text AS relation_oid,
  transaction_id::text AS transaction_id,blocked_by::text[] AS blocked_by,granted,mode,waitstart::text
 FROM yb_lock_status(NULL,%s::uuid) LIMIT 257
-"""
-STATEMENT_SQL = """
-SELECT queryid::text AS query_id, left(query,16384) AS statement_shape
-FROM pg_stat_statements
-WHERE queryid=ANY(%s::bigint[])
- AND dbid=(SELECT oid FROM pg_database WHERE datname=current_database())
-LIMIT 8
 """
 ALLOWED = {
     'pid', 'query_id', 'transaction_id', 'application_name', 'client_addr', 'client_port',
@@ -90,7 +84,14 @@ def safe_value(value):
 
 
 def safe_rows(rows):
-    return [{k: safe_value(v) for k, v in row.items() if k in ALLOWED} for row in rows[:256]]
+    result = []
+    for row in rows[:256]:
+        projected = {k: safe_value(v) for k, v in row.items() if k in ALLOWED}
+        if 'statement_prefix' in row:
+            projected['statement_prefix'] = safe_statement_shape(row['statement_prefix'])
+            projected['statement_prefix_partial'] = True
+        result.append(projected)
+    return result
 
 
 def safe_statement_shape(text):
@@ -105,7 +106,9 @@ def safe_statement_shape(text):
             or re.search(r'\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$', text)
             or any(s in text.lower() for s in ['://', 'password', 'secret', 'token='])):
         return None
-    return text
+    # Server-side clipping stops before the first quoted value. Remove numeric
+    # literals too; identifiers such as url_state_current_242 remain intact.
+    return re.sub(r'\$[0-9]+|(?<![A-Za-z0-9_])(?:0x[0-9a-fA-F]+|(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)(?![A-Za-z0-9_])', '?', text)
 
 
 class Database:
@@ -250,8 +253,7 @@ class Capture:
         self.tail = None
         self.pool = ThreadPoolExecutor(max_workers=1)
         self.metrics = {'incidents': 0, 'cooldown_drops': 0, 'queue_drops': 0,
-                        'tail_eof': False, 'output_limit': False, 'ash_errors': 0, 'ash_capped': 0,
-                        'statement_lookup_errors': 0}
+                        'tail_eof': False, 'output_limit': False, 'ash_errors': 0, 'ash_capped': 0}
         self.running = False
         self.metadata_only_nodes = []
         self.last_incident = -float('inf')
@@ -313,10 +315,10 @@ class Capture:
         state['next'] = self.clock() + state['backoff']
 
     def statement_shapes(self, event, snapshots):
-        # Snapshot statistics can evict query IDs later, so archive a small,
-        # privacy-checked normalized shape only for this cycle's transactions.
+        # Preserve safe live prefixes before query IDs can leave statistics.
+        # This path performs no pg_stat_statements text-file scan or DB query.
         transactions = set(event['transaction_ids'])
-        wanted = {}
+        found = {}
         for snapshot in reversed(snapshots):
             if snapshot.get('kind') != 'activity':
                 continue
@@ -325,24 +327,16 @@ class Capture:
                 if row.get('transaction_id') not in transactions or not re.fullmatch(r'-?[0-9]{1,20}', value):
                     continue
                 number = int(value)
-                if number and -(2**63) <= number < 2**63:
-                    group = wanted.setdefault(snapshot['node'], set())
-                    if len(group) < 8:
-                        group.add(number)
-        found = []
-        for node, query_ids in wanted.items():
-            try:
-                rows = self.databases[node].query(STATEMENT_SQL, (sorted(query_ids),))
-                for row in rows:
-                    shape = safe_statement_shape(row.get('statement_shape'))
-                    found.append({'node': node, 'query_id': str(row['query_id']),
-                                  'statement_shape': shape,
-                                  'statement_shape_truncated': bool(shape and len(shape) == 16384),
-                                  'omitted_for_privacy': shape is None})
-            except Exception as exc:
-                self.metrics['statement_lookup_errors'] += 1
-                found.append({'node': node, 'error_type': type(exc).__name__})
-        return found
+                if not number or not -(2**63) <= number < 2**63:
+                    continue
+                key = (snapshot['node'], value)
+                if key in found or sum(k[0] == key[0] for k in found) >= 8:
+                    continue
+                shape = safe_statement_shape(row.get('statement_prefix'))
+                found[key] = {'node': key[0], 'query_id': value, 'statement_shape': shape,
+                              'statement_shape_truncated': True, 'source': 'live_prefix',
+                              'omitted_for_privacy': shape is None}
+        return list(found.values())
 
     def tick(self):
         now = self.clock()

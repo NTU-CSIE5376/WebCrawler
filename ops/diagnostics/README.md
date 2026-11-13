@@ -16,8 +16,9 @@ scorer merely because the index is named `golden_discovery_v2_rescore`.
   existing project's `psycopg2-binary==2.9.11` is sufficient.
 - Activity metadata about once per second: transaction UUID, PID, query ID,
   client address/port, state, wait event and a server-side SQL-category hint.
-  SQL text is not selected into the result. The category is a heuristic, not
-  proof of the application or worker identity.
+  A server-clipped SQL structure prefix stops before the first quoted value;
+  numeric literals are replaced and unsafe prefixes are omitted before the
+  RAM ring. The category is a heuristic, not proof of worker identity.
 - Conflict/lock waits from the existing ASH ring's last 12 seconds every 10
   seconds, using its native time-window function; its sampling interval is not
   changed. Filtering avoids filling the evidence cap with unrelated RPC work.
@@ -104,14 +105,14 @@ contain transaction UUIDs. Empty evidence does not exonerate a writer, and a
 incident cooldown drops and the time window before claiming a complete cycle.
 
 For the exact incident transaction UUIDs only, the sampler archives up to eight
-matching normalized statement shapes per node from `pg_stat_statements`. This
-avoids losing the query-ID mapping to later statistics eviction. The shape gate
-rejects SQL literals, comments, dollar-quoted content, URL/sensitive markers and
-unrelated commands; omitted shapes remain explicitly marked. Text is capped at
-16 KiB and a capped prefix is marked truncated. This does not enable SQL logging
-or persist runtime bind values. A complete real-world counterparty capture is
-still needed before blaming a component or declaring a Yugabyte implementation
-bug.
+matching safe statement prefixes per node. This avoids statistics eviction and
+does not add a `pg_stat_statements` text-file scan: a production probe took about
+691 ms and several active query IDs were not yet available there. The prefix
+gate rejects literals, comments, dollar quoting, URL/sensitive markers and
+unrelated commands. Prefixes are always marked partial; the deployed activity
+text limit is 1024 bytes, and a complete statement is not promised. No runtime
+bind values are retained. A complete real-world counterparty capture is still
+needed before blaming a component or declaring a Yugabyte implementation bug.
 
 ## Local verification
 
