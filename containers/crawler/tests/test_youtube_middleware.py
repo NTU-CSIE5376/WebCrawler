@@ -30,6 +30,15 @@ def run_output(middleware, response, items, *, asynchronous=False):
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
+def test_errback_output_without_response_is_preserved(middleware, asynchronous):
+    failure = PageItem(url="https://youtube.com/watch?v=abcdefghijk", content=None,
+                       outlinks=[], fail_reason="IgnoreRequest Forbidden by robots.txt")
+    retry = Request("https://example.com/retry")
+    assert run_output(middleware, None, [failure, retry], asynchronous=asynchronous) == [failure, retry]
+    assert failure["outlinks"] == []
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize("body", [
     '<script>var ytInitialData = {"items":[{"videoId":"abcdefghijk"},{"videoId":"lmnopqrstuv"},{"videoId":"abcdefghijk"}]};</script>',
     '<script>ytInitialPlayerResponse = {"videoDetails":{"videoId":"lmnopqrstuv"}};</script>',

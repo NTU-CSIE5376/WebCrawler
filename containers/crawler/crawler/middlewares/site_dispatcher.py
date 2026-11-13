@@ -6,6 +6,7 @@ response_downloaded(response, request, policy). They are constructed once
 per configured class, using from_crawler when available, like Scrapy middleware.
 """
 from scrapy import Request, signals
+from scrapy.exceptions import IgnoreRequest
 from scrapy.utils.httpobj import urlparse_cached
 from scrapy.utils.misc import build_from_crawler, load_object
 from scrapy.utils.asyncgen import as_async_generator
@@ -89,6 +90,8 @@ class SiteMiddlewareDispatcher:
         if url.scheme not in {"http", "https"} or url.hostname is None:
             return
         policy = self.policies.resolve(url.hostname)
+        if not policy.allow:
+            raise IgnoreRequest(f"Crawling disabled by site policy for {url.hostname}")
         before = request.headers.copy()
         timeout_present = "download_timeout" in request.meta
         timeout = request.meta.get("download_timeout")
@@ -115,12 +118,15 @@ class SiteMiddlewareDispatcher:
         return result
 
     async def process_spider_output(self, response, result, spider=None):
-        url = urlparse_cached(response)
-        if url.scheme in {"http", "https"} and url.hostname is not None:
-            policy = self.policies.resolve(url.hostname)
-            handler = self.handlers.get(policy.middleware)
-            hook = getattr(handler, "process_spider_output", None)
-            if hook is not None:
-                result = hook(response, result, policy)
+        # Downloader failures (including robots and policy denials) have no
+        # response. Preserve errback output without selecting a site handler.
+        if response is not None:
+            url = urlparse_cached(response)
+            if url.scheme in {"http", "https"} and url.hostname is not None:
+                policy = self.policies.resolve(url.hostname)
+                handler = self.handlers.get(policy.middleware)
+                hook = getattr(handler, "process_spider_output", None)
+                if hook is not None:
+                    result = hook(response, result, policy)
         async for item in as_async_generator(result):
             yield item
