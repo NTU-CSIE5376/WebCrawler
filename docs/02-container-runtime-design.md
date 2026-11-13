@@ -101,7 +101,7 @@ Crawler worker behavior:
 
 ## 2.4 `scheduler_ingest` Container
 
-The container has an 8-CPU limit shared by 4 program families via `supervisord`:
+The container has a 32-CPU limit shared by 4 program families via `supervisord`:
 
 - `router` x16
 - `ingestor` x16
@@ -120,6 +120,20 @@ Responsibilities:
 - For fetch-success records, compute `content_hash` (SHA-1 of content).
 - For each outlink, ensure destination domain exists and emit separate `status="new"` records.
 - Write transformed records to `ingestor_{id}` bucket JSONL files.
+
+Each router caches up to 65,536 hostname routing decisions using its startup
+sharding configuration. Parent-page scores are queried per shard in batches of
+at most 256 records and refreshed for each batch. A failed batch lookup falls
+back to the original per-record query/retry path; domain resolution and output
+writes remain per record. `route.folder_done` includes `record_cnt` and
+`duration_sec` to measure throughput and compare it with the ten-minute input
+interval.
+
+On TERM or INT, a router finishes its current folder and saves progress before
+exiting. Supervisor allows 20 minutes before forcing termination; Compose gives
+the scheduler-ingest container 21 minutes. Rebuild/recreate the container to
+apply these deployment settings. A crash or forced kill can still replay the
+last incomplete folder under the existing folder-level checkpoint scheme.
 
 ### Ingestor (x16)
 

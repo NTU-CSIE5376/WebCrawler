@@ -9,13 +9,14 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Dict, Optional, Set
 
 
 logger = logging.getLogger("router")
 
 import psycopg2
-from sqlalchemy import create_engine, text
+from sqlalchemy import bindparam, create_engine, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import OperationalError, InterfaceError
 
@@ -46,6 +47,8 @@ MANUAL_PRIORITY_MAX = 2.0
 # shares the host with a YB tserver). Raise it if the hit rate is too low.
 DOMAIN_CACHE_TTL_SEC = 3600.0
 DOMAIN_CACHE_MAX = 200_000
+HOST_ROUTE_CACHE_MAX = 65_536
+PARENT_SCORE_BATCH_SIZE = 256
 
 
 def _priority_fields(link: Dict[str, Any]) -> Dict[str, Any]:
@@ -92,6 +95,9 @@ class RouterService:
             domain_overrides=self.cfg.domain_overrides,
             split_subdomains=self.cfg.split_subdomains,
         )
+        # Sharding configuration is fixed for this service's lifetime. Keep
+        # this cache per instance; a new service loads a fresh configuration.
+        self._route_host = lru_cache(maxsize=HOST_ROUTE_CACHE_MAX)(self.sharder.route)
         self.engine = create_engine(
             self.cfg.postgres_dsn,
             pool_pre_ping=True,
@@ -159,8 +165,10 @@ class RouterService:
             "route.folder_start",
             extra={"event": "route.folder_start", "folder": str(folder)},
         )
+        started = time.monotonic()
         error = 0
         file_cnt = 0
+        record_cnt = 0
 
         domain_cache = self._domain_cache_for_folder()
 
@@ -177,15 +185,14 @@ class RouterService:
             else:
                 continue
 
-            for rec in recs:
+            for rec, parent_scores in self._records_with_parent_scores(recs):
+                record_cnt += 1
                 status = rec.get("status")  # "ok"/"fail"
                 content = rec.get("content")
                 outlinks = rec.get("outlinks", [])
 
                 host = host_of(rec.get("url"))
-                domain = self.sharder.domain_key(host)
-                shard_id = self.sharder.domain_to_shard(host)
-                ingestor_id = self.sharder.shard_to_ingestor(shard_id)
+                domain, shard_id, ingestor_id = self._route_host(host)
 
                 content_hash = None
                 if status == "ok" and isinstance(content, str):
@@ -208,7 +215,7 @@ class RouterService:
                                 # recorded as each link's parent_page_score. Skip
                                 # the lookup when there are no links to score.
                                 parent_page_score = (
-                                    self._parent_url_score(sess, shard_id, src_url)
+                                    self._parent_url_score(sess, shard_id, src_url, parent_scores)
                                     if outlinks else None
                                 )
                                 routed = self._route_links(outlinks)
@@ -296,11 +303,57 @@ class RouterService:
                 "event": "route.folder_done",
                 "folder": str(folder),
                 "file_cnt": file_cnt,
+                "record_cnt": record_cnt,
+                "duration_sec": time.monotonic() - started,
                 "errors": error,
             },
         )
 
-    def _parent_url_score(self, sess, shard_id: int, src_url: Optional[str]) -> Optional[float]:
+    def _records_with_parent_scores(self, records):
+        for offset in range(0, len(records), PARENT_SCORE_BATCH_SIZE):
+            batch = records[offset:offset + PARENT_SCORE_BATCH_SIZE]
+            scores = self._prefetch_parent_scores(batch)
+            for record in batch:
+                yield record, scores
+
+    def _prefetch_parent_scores(self, records) -> Dict[tuple[int, str], Optional[float]]:
+        """Read each shard once per batch, falling back to point reads on failure.
+
+        Scores belong only to this batch, including explicit misses. A score
+        may change between batches; it is never kept in the host routing cache.
+        Domain creation and output writes retain their per-record retry path.
+        """
+        groups = defaultdict(set)
+        scores = {}
+        try:
+            for record in records:
+                url = record.get("url")
+                if record.get("outlinks") and url:
+                    _, shard_id, _ = self._route_host(host_of(url))
+                    groups[shard_id].add(url)
+                    scores[(shard_id, url)] = None
+            if groups:
+                with self.Session() as sess:
+                    with sess.begin():
+                        for shard_id, urls in groups.items():
+                            query = text(
+                                f"SELECT url, url_score FROM url_state_current_{shard_id:03d} "
+                                "WHERE url IN :urls"
+                            ).bindparams(bindparam("urls", expanding=True))
+                            for url, score in sess.execute(query, {"urls": sorted(urls)}):
+                                scores[(shard_id, url)] = float(score) if score is not None else None
+            return scores
+        except Exception as error:
+            logger.warning(
+                "route.prefetch_fallback",
+                extra={"event": "route.prefetch_fallback", "error_type": type(error).__name__},
+            )
+            return {}
+
+    def _parent_url_score(
+        self, sess, shard_id: int, src_url: Optional[str],
+        prefetched: Optional[Dict[tuple[int, str], Optional[float]]] = None,
+    ) -> Optional[float]:
         """url_score of the parent page (the crawled page that emitted these
         outlinks). Stored as each link's parent_page_score so the ingestor keeps
         the highest-scoring parent. None when the page is not in
@@ -308,6 +361,8 @@ class RouterService:
         """
         if not src_url:
             return None
+        if prefetched is not None and (shard_id, src_url) in prefetched:
+            return prefetched[(shard_id, src_url)]
         row = sess.execute(
             text(f"SELECT url_score FROM url_state_current_{shard_id:03d} WHERE url = :url"),
             {"url": src_url},
@@ -322,12 +377,12 @@ class RouterService:
             if not url:
                 continue
             host = host_of(url)
-            shard_id = self.sharder.domain_to_shard(host)
+            domain, shard_id, ingestor_id = self._route_host(host)
             routed.append((
                 link,
-                self.sharder.domain_key(host),
+                domain,
                 shard_id,
-                self.sharder.shard_to_ingestor(shard_id),
+                ingestor_id,
             ))
         return routed
 
