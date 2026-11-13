@@ -1,0 +1,5 @@
+[
+  {"targets": ["172.16.191.3:5433"], "labels": {"host": "host3", "service": "crawler-db", "module": "tcp_connect"}},
+  {"targets": ["172.16.191.4:5433"], "labels": {"host": "host4", "service": "crawler-db", "module": "tcp_connect"}},
+  {"targets": ["http://172.16.191.2:3100/ready"], "labels": {"host": "host2", "service": "loki", "module": "http_ready"}}
+]

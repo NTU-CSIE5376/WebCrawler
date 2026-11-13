@@ -1,0 +1,26 @@
+{
+  "receiver": "webcrawler-discord",
+  "object_matchers": [["project", "=", "webcrawler"]],
+  "group_by": ["project", "severity", "service"],
+  "group_wait": "30s",
+  "group_interval": "5m",
+  "repeat_interval": "2h",
+  "routes": [
+    {
+      "receiver": "webcrawler-ingestor-discord",
+      "object_matchers": [["service", "=", "ingestor"], ["severity", "=", "critical"]],
+      "group_by": ["project", "severity", "service"],
+      "group_wait": "30s",
+      "group_interval": "30m",
+      "repeat_interval": "2h"
+    },
+    {
+      "receiver": "webcrawler-discord",
+      "object_matchers": [["severity", "=", "warning"]],
+      "group_by": ["project", "severity"],
+      "group_wait": "1h",
+      "group_interval": "1h",
+      "repeat_interval": "24h"
+    }
+  ]
+}

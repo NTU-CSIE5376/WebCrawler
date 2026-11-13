@@ -1,0 +1,137 @@
+name: Monitoring checks
+
+on:
+  pull_request:
+    paths: [ops/monitoring/**, .github/workflows/monitoring.yml]
+  push:
+    paths: [ops/monitoring/**, .github/workflows/monitoring.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  monitoring:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install test tools
+        run: python -m pip install pytest==8.4.2 PyYAML==6.0.2 ruff==0.17.0
+      - name: Unit and isolated Compose checks
+        run: |
+          python -m pytest -q ops/monitoring/tests
+          ruff check ops/monitoring
+          ruff format --check ops/monitoring
+      - name: Validate Prometheus config and exact alert queries
+        run: |
+          mkdir -p /tmp/crawler-monitoring-checks
+          python ops/monitoring/check_queries.py --config ops/monitoring/monitoring.example.json --output /tmp/crawler-monitoring-checks/queries.json
+          docker run --rm --entrypoint promtool -v "$PWD/ops/monitoring:/etc/prometheus:ro" prom/prometheus:v3.15.0 check config /etc/prometheus/prometheus.yml
+          docker run --rm --entrypoint promtool -v /tmp/crawler-monitoring-checks:/work:ro prom/prometheus:v3.15.0 check rules /work/queries.json
+      - name: Grafana 11 provisioning smoke test (paused, no webhook)
+        run: |
+          python ops/monitoring/render_alerting.py --config ops/monitoring/monitoring.example.json --output /tmp/crawler-monitoring-checks/alerting
+          chmod 755 /tmp/crawler-monitoring-checks/alerting
+          chmod 644 /tmp/crawler-monitoring-checks/alerting/*.json
+          docker run -d --name monitoring-grafana-check -p 127.0.0.1:13098:3000 -v /tmp/crawler-monitoring-checks/alerting:/etc/grafana/provisioning/alerting:ro grafana/grafana:11.0.0
+          for attempt in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:13098/api/health >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -fsS -u admin:admin http://127.0.0.1:13098/api/v1/provisioning/alert-rules > /tmp/crawler-monitoring-checks/loaded.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          base = Path('/tmp/crawler-monitoring-checks')
+          groups = json.loads((base/'alerting/webcrawler-rules.json').read_text())['groups']
+          expected = [r for g in groups for r in g['rules']]
+          loaded = json.loads((base/'loaded.json').read_text())
+          assert {r['uid'] for r in loaded} == {r['uid'] for r in expected}
+          assert all(r['isPaused'] for r in loaded)
+          assert {g['interval'] for g in groups} == {'60s','300s','600s'}
+          print(f'Grafana 11 loaded {len(loaded)} paused rules; no Discord contact point provisioned.')
+          PY
+      - name: Blackbox configuration and real local HTTP probe
+        run: |
+          docker run --rm --network none -v "$PWD/ops/monitoring/blackbox.yml:/etc/blackbox/config.yml:ro" prom/blackbox-exporter:v0.26.0 --config.file=/etc/blackbox/config.yml --config.check
+          docker run -d --name monitoring-probe-check --network host -v "$PWD/ops/monitoring/blackbox.yml:/etc/blackbox/config.yml:ro" prom/blackbox-exporter:v0.26.0 --config.file=/etc/blackbox/config.yml --web.listen-address=127.0.0.1:19198
+          for attempt in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:19198/metrics >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsSG http://127.0.0.1:19198/probe --data-urlencode target=http://127.0.0.1:19198/metrics --data-urlencode module=http_ready > /tmp/crawler-monitoring-checks/probe.txt
+          python - <<'PY'
+          from pathlib import Path
+          lines = Path('/tmp/crawler-monitoring-checks/probe.txt').read_text().splitlines()
+          assert 'probe_success 1' in lines
+          print('Blackbox 0.26 accepted the config and completed a local HTTP probe.')
+          PY
+      - name: Blackbox smoke cleanup
+        if: always()
+        run: |
+          docker logs monitoring-probe-check || true
+          docker rm -f monitoring-probe-check || true
+      - name: Validate quiet child routing on isolated Grafana only
+        run: |
+          python - <<'PY'
+          import base64, json
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          base = 'http://127.0.0.1:13098/api/v1/provisioning/'
+          def api(path, body=None, method='GET'):
+              req = Request(base + path, method=method,
+                  data=None if body is None else json.dumps(body).encode(),
+                  headers={'Authorization': 'Basic ' + base64.b64encode(b'admin:admin').decode(),
+                           'Content-Type': 'application/json'})
+              with urlopen(req, timeout=10) as response:
+                  return json.loads(response.read() or b'{}')
+          # Paused rules only; this receiver is a loopback sink, never Discord.
+          api('contact-points', {'uid':'wc-ci-sink','name':'webcrawler-discord',
+              'type':'webhook','settings':{'url':'http://127.0.0.1:1/not-a-notifier'},
+              'disableResolveMessage':True}, 'POST')
+          api('contact-points', {'uid':'wc-ci-ingest-sink','name':'webcrawler-ingestor-discord',
+              'type':'webhook','settings':{'url':'http://127.0.0.1:1/not-a-notifier'},
+              'disableResolveMessage':True}, 'POST')
+          original = api('policies')
+          route = json.loads(Path('ops/monitoring/notification-route.example.json').read_text())
+          policy = json.loads(json.dumps(original))
+          policy.setdefault('routes', []).append(route)
+          api('policies', policy, 'PUT')
+          actual = api('policies')
+          assert actual['receiver'] == original['receiver']
+          child = actual['routes'][-1]
+          assert child['group_by'] == ['project','severity','service']
+          assert child['repeat_interval'] == '2h'
+          ingest, warning = child['routes']
+          assert ingest['receiver'] == 'webcrawler-ingestor-discord'
+          assert ingest['object_matchers'] == [['service','=','ingestor'],['severity','=','critical']]
+          assert ingest['group_interval'] == '30m'
+          assert ingest['repeat_interval'] == '2h'
+          assert warning['group_by'] == ['project','severity']
+          assert warning['group_wait'] == warning['group_interval'] == '1h'
+          # Grafana normalizes a full-day duration to "1d" on readback.
+          assert warning['repeat_interval'] in ('24h', '1d')
+          print('Grafana 11 accepted scoped grouping and quiet warning timing; no sender tested.')
+          PY
+      - name: Grafana smoke logs and cleanup
+        if: always()
+        run: |
+          docker logs monitoring-grafana-check || true
+          docker rm -f monitoring-grafana-check || true
+      - name: Real Loki 3 alert query and signal checks
+        run: |
+          docker run -d --name monitoring-loki-check -p 127.0.0.1:13198:3100 grafana/loki:3.0.0
+          for attempt in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:13198/ready >/dev/null; then break; fi
+            sleep 2
+          done
+          MONITORING_TEST_LOKI_URL=http://127.0.0.1:13198 python -m pytest -q ops/monitoring/tests/test_logql_integration.py
+      - name: Loki smoke logs and cleanup
+        if: always()
+        run: |
+          docker logs monitoring-loki-check || true
+          docker rm -f monitoring-loki-check || true
