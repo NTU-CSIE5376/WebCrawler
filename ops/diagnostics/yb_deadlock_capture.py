@@ -1,4 +1,4 @@
-"""Bounded, read-only YB deadlock evidence capture; never log SQL text or keys."""
+"""Bounded, read-only YB deadlock evidence capture; never log raw SQL or keys."""
 from __future__ import annotations
 
 import argparse
