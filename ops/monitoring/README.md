@@ -4,7 +4,7 @@
 
 2026-11-13 已依操作人員授權接上既有 Grafana 與私人 Discord：四台主機的 node exporter、唯讀 IPC 採集、Loki readiness 探測均已啟用。正式啟用 `fast` 35 條及 `trends` 1 條，共 36 條；16 條逐 worker 的 `symptoms` 暫停，避免同時增加未試跑的日誌掃描。沒有部署 DB TCP 探測，不能把這次啟用說成完整 DB readiness 監控。
 
-`fast` 每分鐘評估；整體產量下降每十分鐘評估。嚴重通知合併後首次等待 30 秒、更新至少間隔 5 分鐘、未變化每 2 小時重送；warning 首次等待 1 小時、更新至少間隔 1 小時、未變化每 24 小時重送。這不是通知數的硬上限。操作備份與無秘密的驗證收據位於 Host2 `/home/r14922138/ops-backups/monitor-enable-20261113/`，其中 `activation-receipt.json`、`verification-receipt.json` 記錄範圍與驗證；同目錄其他備份可能有秘密，不可整份公開。
+`fast` 每分鐘評估；整體產量下降每十分鐘評估。嚴重通知合併後首次等待 30 秒、更新至少間隔 5 分鐘、未變化每 2 小時重送；Ingestor 入庫失敗例外，依下述專用路由降噪。warning 首次等待 1 小時、更新至少間隔 1 小時、未變化每 24 小時重送。這不是通知數的硬上限。操作備份與無秘密的驗證收據位於 Host2 `/home/r14922138/ops-backups/monitor-enable-20261113/`，其中 `activation-receipt.json`、`verification-receipt.json` 記錄範圍與驗證；同目錄其他備份可能有秘密，不可整份公開。
 
 沿用現有 **Grafana 11 + Loki 3**：新增獨立 Prometheus 收集主機、服務探測與管線狀態，讓 Grafana 評估告警並通知 Discord。這版不需要 Alertmanager，也不修改其他人的監控服務。
 
@@ -102,9 +102,12 @@ python ops/monitoring/shadow.py --report --output-dir ops/monitoring/runtime/sha
 
 - 只匹配 `project=webcrawler`，保留其他人的 root receiver／路由。
 - 嚴重告警依 `project,severity,service` 合併，不以 worker 或 alertname 拆組；等 30 秒合併、更新至少間隔 5 分鐘、未變化每 2 小時重送。
+- Ingestor 批次失敗使用專用 receiver：首次仍立即被規則偵測（沒有 pending 等待），通知等 30 秒合併；更新至少間隔 30 分鐘，持續未變化每 2 小時提醒。查詢回看一小時，避免每筆錯誤五分鐘後就解除、再觸發；只對這個 receiver 關閉 resolved 訊息，其他告警保留恢復通知。這不會修復入庫失敗，也不代表失敗批次已補回。
 - warning 全部依 `project,severity` 合併；首次等 1 小時、更新至少間隔 1 小時、未變化每 24 小時重送。若在 group wait 內恢復，可能不發通知。
-- Discord message 只列最多 6 項簡短摘要及 Grafana 入口，避免一次大量 worker 錯誤塞滿訊息。
+- Discord message 只列最多 6 項簡短摘要。入庫與管線錯誤另附 Grafana Explore 日誌連結，從該 alert 開始前一小時查至現在，可展開 worker、批次筆數與原始錯誤；仍需登入 Grafana。此入口不是自動根因分析，交易對手仍須診斷採集佐證。規則頁也有回看六小時的靜態 `logs_url`。
 - 已知事件用**有期限**的 silence；不是永久忽略容量不足。
+
+2026-11-14 已套用上述 Ingestor 降噪與日誌入口；沒有重啟應用服務，也沒有改其他規則的判斷或路由。兩種訊息模板均以 Grafana 11 無傳送的 preview API 驗證，日誌頁與 Loki 查詢皆回應 200；未額外發送 Discord 測試訊息。一次稀疏錯誤事件的一小時查詢約 43ms，僅是當次量測。Host2 `/home/r14922138/ops-backups/ingest-alert-ux-20261114/deployment-receipt.json` 記錄驗證結果；同目錄私有備份可能含秘密，不可整份公開。
 
 這是合併與節流，**不是每小時最多 N 則的硬上限**；多個 critical service group、恢復或反覆觸發仍可能產生多則。shadow 先用於辨識誤報與抖動，實際訊息數／傳送成功仍需接線測試。初次啟用建議只開容量、失聯、OOM、入庫批次失敗，其他規則等觀察結果合理再開。
 
@@ -163,7 +166,7 @@ python ops/monitoring/pipeline_exporter.py \
 - **DB 真正 readiness**：TCP 只測連線。後續要加入低成本 SQL、YB quorum／鎖等待與交易錯誤；不要每分鐘掃完整網址表。
 - **Offerer 補貨、API job／TTL、stats/bad、設定 drift**：這版提供 pipeline lag 與錯誤日誌，尚未提供這些專用告警。drift 應與「核准的已部署 manifest」比較，不能因 main 有尚未部署的 PR 就報錯。
 - **持久化成功量與排程狀態**：需要明確 commit/save counter、可執行工作及冷卻資訊，才能區分合理限速與故障。第一版的輸出下降只發 warning。
-- **通知傳遞本身**：仍需接上外部 watchdog 並定期實測 Discord；本 PR 尚未取得 webhook，也未做真實傳送測試。
+- **通知傳遞本身**：目前已接上私人 webhook 並完成首次真實傳送驗證；仍需接上外部 watchdog 並定期實測 Discord。11/14 的模板修改僅做無傳送 preview，沒有另發測試訊息。
 
 Grafana 11 的 NoData／Error 可能跳過 pending period。本版業務查詢錯誤使用 `KeepLast` 保留上次狀態，由獨立 Loki／Prometheus 基本查詢規則通知監控失明；基本查詢成功仍不能證明所有複雜查詢成功，應同時查看規則 health。真正缺資料仍不視為 OK。Worker absence 使用明確時間視窗；reducer 使用 Grafana 11 支援的預設嚴格模式（空 settings），不可傳入不支援的 `mode: strict`。
 

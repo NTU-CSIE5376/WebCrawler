@@ -93,6 +93,9 @@ jobs:
           api('contact-points', {'uid':'wc-ci-sink','name':'webcrawler-discord',
               'type':'webhook','settings':{'url':'http://127.0.0.1:1/not-a-notifier'},
               'disableResolveMessage':True}, 'POST')
+          api('contact-points', {'uid':'wc-ci-ingest-sink','name':'webcrawler-ingestor-discord',
+              'type':'webhook','settings':{'url':'http://127.0.0.1:1/not-a-notifier'},
+              'disableResolveMessage':True}, 'POST')
           original = api('policies')
           route = json.loads(Path('ops/monitoring/notification-route.example.json').read_text())
           policy = json.loads(json.dumps(original))
@@ -103,7 +106,11 @@ jobs:
           child = actual['routes'][-1]
           assert child['group_by'] == ['project','severity','service']
           assert child['repeat_interval'] == '2h'
-          warning = child['routes'][0]
+          ingest, warning = child['routes']
+          assert ingest['receiver'] == 'webcrawler-ingestor-discord'
+          assert ingest['object_matchers'] == [['service','=','ingestor'],['severity','=','critical']]
+          assert ingest['group_interval'] == '30m'
+          assert ingest['repeat_interval'] == '2h'
           assert warning['group_by'] == ['project','severity']
           assert warning['group_wait'] == warning['group_interval'] == '1h'
           # Grafana normalizes a full-day duration to "1d" on readback.

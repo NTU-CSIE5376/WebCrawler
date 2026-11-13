@@ -361,3 +361,46 @@ def test_global_volume_rule_uses_only_expected_workers():
 def test_invalid_config_is_rejected_before_output(config):
     with pytest.raises((ValueError, TypeError)):
         renderer.build_provisioning(config)
+
+
+def test_ingest_event_keeps_immediate_detection_with_separate_quiet_notifications():
+    from urllib.parse import parse_qs, urlparse
+
+    docs = renderer.build_provisioning(CONFIG, webhook=webhook())
+    ingest = rules(docs)["wc-ingest-error"]
+    assert "[1h]" in ingest["data"][0]["model"]["expr"] and ingest["for"] == "0s"
+    points = {
+        p["name"]: p["receivers"][0]
+        for p in docs["webcrawler-contactpoints.json"]["contactPoints"]
+    }
+    assert points["webcrawler-discord"]["disableResolveMessage"] is False
+    assert points["webcrawler-ingestor-discord"]["disableResolveMessage"] is True
+    query = parse_qs(urlparse(ingest["annotations"]["logs_url"]).query)
+    pane = json.loads(query["panes"][0])["logs"]
+    assert (
+        pane["datasource"] == "loki"
+        and pane["queries"][0]["expr"] == renderer.INGEST_ERROR_QUERY
+    )
+    assert (
+        "StartsAt.Add -3600000000000"
+        in points["webcrawler-ingestor-discord"]["settings"]["message"]
+    )
+    assert "annotations" not in points["webcrawler-ingestor-discord"]["settings"]
+
+
+def test_ingest_route_is_scoped_and_preserves_warning_delivery_policy():
+    route = json.loads(
+        (MODULE_PATH.parent / "notification-route.example.json").read_text()
+    )
+    assert route["object_matchers"] == [["project", "=", "webcrawler"]]
+    ingest, warning = route["routes"]
+    assert ingest["object_matchers"] == [
+        ["service", "=", "ingestor"],
+        ["severity", "=", "critical"],
+    ]
+    assert ingest["group_interval"] == "30m" and ingest["repeat_interval"] == "2h"
+    assert (
+        warning["receiver"] == "webcrawler-discord"
+        and warning["group_interval"] == "1h"
+    )
+    assert warning["repeat_interval"] == "24h"

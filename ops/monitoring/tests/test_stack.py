@@ -136,7 +136,11 @@ def test_route_fragment_groups_workers_and_keeps_warning_notifications_quiet():
     assert route["object_matchers"] == [["project", "=", "webcrawler"]]
     assert route["group_by"] == ["project", "severity", "service"]
     assert route["repeat_interval"] == "2h"
-    warning = route["routes"][0]
+    warning = next(
+        child
+        for child in route["routes"]
+        if child["object_matchers"] == [["severity", "=", "warning"]]
+    )
     assert warning["object_matchers"] == [["severity", "=", "warning"]]
     assert warning["group_by"] == ["project", "severity"]
     assert warning["group_wait"] == warning["group_interval"] == "1h"

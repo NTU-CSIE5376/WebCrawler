@@ -14,22 +14,90 @@ import os
 import re
 import sys
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 PROMETHEUS_UID = "crawler-prometheus"
 LOKI_UID = "loki"
 CONTACT_POINT = "webcrawler-discord"
+INGEST_CONTACT_POINT = "webcrawler-ingestor-discord"
+INGEST_ERROR_QUERY = '{service="ingestor",event="ingest.batch_error"}'
+PIPELINE_ERROR_QUERY = '{event=~"route.db_error|route.domain_error|extract.record_error|stats.process_error"}'
+GRAFANA_URL = "http://172.16.191.2:3000"
+
+
+def explore_logs_url(expression: str, start="now-6h") -> str:
+    panes = {
+        "logs": {
+            "datasource": LOKI_UID,
+            "queries": [
+                {
+                    "refId": "A",
+                    "expr": expression,
+                    "queryType": "range",
+                    "datasource": {"type": "loki", "uid": LOKI_UID},
+                }
+            ],
+            "range": {"from": start, "to": "now"},
+        }
+    }
+    return (
+        GRAFANA_URL
+        + "/explore?schemaVersion=1&panes="
+        + quote(json.dumps(panes, separators=(",", ":")), safe="")
+        + "&orgId=1"
+    )
+
+
+_PANES_FORMAT = (
+    json.dumps(
+        {
+            "logs": {
+                "datasource": LOKI_UID,
+                "queries": [
+                    {
+                        "refId": "A",
+                        "expr": "__QUERY__",
+                        "queryType": "range",
+                        "datasource": {"type": "loki", "uid": LOKI_UID},
+                    }
+                ],
+                "range": {"from": "__FROM__", "to": "now"},
+            }
+        },
+        separators=(",", ":"),
+    )
+    .replace('"__QUERY__"', "%q")
+    .replace("__FROM__", "%d")
+)
+_DISCORD_LOG_LINK = (
+    "{{ if and (not $linked) $alert.Annotations.logs_query }}"
+    "{{ $panes := printf "
+    + json.dumps(_PANES_FORMAT)
+    + " $alert.Annotations.logs_query (($alert.StartsAt.Add -3600000000000).UnixMilli) }}"
+    "[錯誤日誌（含 worker 與 DB 錯誤）]("
+    + GRAFANA_URL
+    + "/explore?schemaVersion=1&panes={{ $panes | urlquery }}&orgId=1)\n"
+    "{{ $linked = true }}{{ end }}"
+)
 DISCORD_MESSAGE = (
     "{{ .Status }} | {{ len .Alerts.Firing }} firing / "
     "{{ len .Alerts.Resolved }} resolved\n"
-    "{{ range $i, $alert := .Alerts }}{{ if lt $i 6 }}"
+    "{{ $linked := false }}{{ range $i, $alert := .Alerts }}{{ if lt $i 6 }}"
     "• {{ $alert.Annotations.summary }}"
     "{{ with $alert.Labels.host }} | {{ . }}{{ end }}"
     "{{ with $alert.Labels.mountpoint }} {{ . }}{{ end }}"
     "{{ with $alert.Labels.stage }} | {{ . }}{{ end }}"
     "{{ with $alert.Labels.worker }} (worker {{ . }}){{ end }}\n"
-    "{{ end }}{{ end }}"
+    + _DISCORD_LOG_LINK
+    + "{{ end }}{{ end }}"
+    '{{ if and $linked (eq .Status "resolved") }}近期未新增錯誤，不代表先前失敗資料已補回。\n{{ end }}'
     "最多列出 6 項；告警狀態：http://172.16.191.2:3000/alerting/list"
+)
+INGEST_DISCORD_MESSAGE = (
+    "🚨 Ingestor 批次入庫失敗（近一小時）\n"
+    + DISCORD_MESSAGE
+    + "\n沒有新錯誤不代表先前失敗批次已補回。\n"
+    "[Ingestor 告警規則](" + GRAFANA_URL + "/alerting/grafana/wc-ingest-error/view)"
 )
 
 
@@ -327,11 +395,14 @@ def build_provisioning(
     add(
         "ingest-error",
         "Ingestor 有批次入庫失敗，可能遺失資料",
-        'sum(count_over_time({service="ingestor",event="ingest.batch_error"}[5m])) or vector(0)',
+        'sum(count_over_time({service="ingestor",event="ingest.batch_error"}[1h])) or vector(0)',
         datasource=LOKI_UID,
         severity="critical",
         service="ingestor",
-        description="ingest.batch_error 可能被捕捉後繼續並推進 progress。立即保留失敗批次與錯誤證據；告警解除只代表近五分鐘沒新錯誤，不代表資料已補回。",
+        description="近一小時出現 ingest.batch_error；首次仍立即告警。失敗可能被捕捉後繼續推進 progress。沒有新錯誤不代表資料已補回，需核對失敗批次。",
+    )
+    rules[-1]["annotations"].update(
+        logs_query=INGEST_ERROR_QUERY, logs_url=explore_logs_url(INGEST_ERROR_QUERY)
     )
     add(
         "pipeline-errors",
@@ -340,6 +411,9 @@ def build_provisioning(
         datasource=LOKI_UID,
         service="pipeline",
         description="檢查 Router／Extractor／Stats 錯誤與 stats/bad；後續有 folder_done 也不能證明失敗資料已恢復。",
+    )
+    rules[-1]["annotations"].update(
+        logs_query=PIPELINE_ERROR_QUERY, logs_url=explore_logs_url(PIPELINE_ERROR_QUERY)
     )
 
     for worker in normalized:
@@ -489,7 +563,22 @@ def build_provisioning(
                             },
                         },
                     ],
-                }
+                },
+                {
+                    "orgId": org_id,
+                    "name": INGEST_CONTACT_POINT,
+                    "receivers": [
+                        {
+                            "uid": "wc-ingest-discord",
+                            "type": "discord",
+                            "disableResolveMessage": True,
+                            "settings": {
+                                "url": webhook,
+                                "message": INGEST_DISCORD_MESSAGE,
+                            },
+                        }
+                    ],
+                },
             ],
         }
     return documents
