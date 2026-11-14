@@ -69,6 +69,10 @@ SCHEDULER_RESTORE_POLICY_META = _env_bool("CRAWLER_SCHEDULER_RESTORE_POLICY_META
 
 
 CONCURRENT_REQUESTS = int(os.getenv("CRAWLER_CONCURRENT_REQUESTS", "256"))
+# Per crawler worker. Submit at most twice this many HTML responses at once;
+# Scrapy's scraper size limit also bounds responses waiting for a parser slot.
+# Zero retains inline parsing for comparison or rollback.
+PARSER_PROCESSES = int(os.getenv("CRAWLER_PARSER_PROCESSES", "4"))
 SCRAPER_SLOT_MAX_ACTIVE_SIZE = int(
     os.getenv("CRAWLER_SCRAPER_SLOT_MAX_ACTIVE_SIZE", "100000000")
 )
