@@ -17,6 +17,25 @@ _SENSITIVE_HEADERS = {b"Authorization", b"Proxy-Authorization", b"Cookie"}
 _POLICY_META = ("dont_merge_cookies", "download_slot", "autothrottle_dont_adjust_delay")
 
 
+def restore_scheduling_meta(request):
+    """Undo policy meta on a retry/redirect copy before it is queued again.
+
+    The downloader-aware scheduler queues requests by download slot. Without
+    this, a policy slot set on the way to the downloader follows a retry or
+    redirect back into the scheduler, where a shared slot kept busy by other
+    work (e.g. manual crawls on "wikipedia") is never the least-active queue.
+    The dispatcher applies the policy again when the copy is downloaded.
+    """
+    previous = request.meta.get(_STATE_KEY)
+    if previous is None:
+        return False
+    for name, (present, value) in previous["meta"].items():
+        request.meta.pop(name, None)
+        if present:
+            request.meta[name] = value
+    return True
+
+
 class SiteMiddlewareDispatcher:
     def __init__(self, policies, *, crawler=None):
         self.policies = policies

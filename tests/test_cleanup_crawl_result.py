@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import shlex
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 import yaml
@@ -9,6 +11,16 @@ import yaml
 from scripts import cleanup_crawl_result as cleanup
 
 NOW = datetime(2026, 11, 5, 20, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture
+def frozen_clock(monkeypatch):
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW if tz is not None else NOW.replace(tzinfo=None)
+
+    monkeypatch.setattr(cleanup, "datetime", FrozenDatetime)
 
 
 @pytest.fixture
@@ -50,7 +62,7 @@ def _progress(base, svc, worker, hours_ago):
     p.write_text(json.dumps({"date": t.strftime("%Y%m%d"), "time": t.strftime("%H%M")}))
 
 
-def _run(cfg, apply=True, min_h=8, max_h=48):
+def _run(cfg, apply=True, min_h=2, max_h=0):
     stages = cleanup.discover_stages(cfg)
     lines = []
     totals = cleanup.run(
@@ -74,7 +86,7 @@ def test_unconsumed_folder_survives_past_eight_hours(ipc):
 def test_consumed_but_young_folder_is_kept(ipc):
     base, cfg, _ = ipc
     _progress(base, "router", 0, hours_ago=0.5)
-    young = _folder(base, "crawler", 0, hours_ago=2)
+    young = _folder(base, "crawler", 0, hours_ago=1)
     old = _folder(base, "crawler", 0, hours_ago=9)
     _run(cfg)
     assert young.exists()
@@ -97,7 +109,7 @@ def test_missing_progress_keeps_everything_until_safety_net(ipc):
     _progress(base, "ingestor", 5, hours_ago=1)      # no extractor progress
     kept = _folder(base, "ingestor", 5, hours_ago=20)
     dropped = _folder(base, "ingestor", 5, hours_ago=50)
-    totals, lines = _run(cfg)
+    totals, lines = _run(cfg, max_h=48)
     assert kept.exists()
     assert not dropped.exists()
     assert totals["unconsumed"] == 1
@@ -139,6 +151,43 @@ def test_main_dry_run_by_default(ipc, capsys):
     assert cleanup.main(["--config", str(cfg_path)]) == 0
     assert f.exists()
     assert "DRY RUN" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("progress", ["missing", "behind"])
+def test_main_defaults_delete_consumed_at_two_hours_but_never_force_unread(ipc, frozen_clock, progress):
+    base, _, cfg_path = ipc
+    _progress(base, "router", 0, hours_ago=0)
+    young = _folder(base, "crawler", 0, hours_ago=1)
+    at_boundary = _folder(base, "crawler", 0, hours_ago=2)
+    unread = _folder(base, "crawler", 1, hours_ago=1000)
+    if progress == "behind":
+        _progress(base, "router", 1, hours_ago=1001)
+
+    assert cleanup.main(["--config", str(cfg_path), "--apply"]) == 0
+
+    assert young.exists()
+    assert not at_boundary.exists()
+    assert unread.exists()
+
+
+def test_production_cron_keeps_unread_data_and_uses_shared_ipc_service(ipc, frozen_clock):
+    base, _, cfg_path = ipc
+    cron = Path(__file__).resolve().parents[1] / "ops/production/cron.d/crawl-result-cleanup"
+    jobs = [line for line in cron.read_text().splitlines()
+            if line and not line.startswith("#") and "=" not in line]
+    assert len(jobs) == 1
+    fields = shlex.split(jobs[0])
+    assert fields[:6] == ["*/30", "*", "*", "*", "*", "root"]
+    assert fields[6:14] == ["/usr/bin/docker", "exec", "-w", "/app", "scheduler_ingest", "python", "-m",
+                           "scripts.cleanup_crawl_result"]
+    args = fields[14:fields.index(">>")]
+
+    _progress(base, "router", 0, hours_ago=0)
+    consumed = _folder(base, "crawler", 0, hours_ago=2)
+    unread = _folder(base, "crawler", 1, hours_ago=1000)
+    assert cleanup.main(["--config", str(cfg_path), *args]) == 0
+    assert not consumed.exists()
+    assert unread.exists()
 
 
 def test_max_age_must_cover_min_age(ipc):

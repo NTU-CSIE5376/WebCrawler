@@ -91,7 +91,7 @@ domains:
       download_slot: wikipedia
       target_concurrent_requests: 8
       max_qps: 15
-      max_concurrent_requests: 8
+      max_concurrent_requests: 7
   youtube.com:
     middleware: crawler.middlewares.youtube.YouTubeMiddleware
 hosts:
@@ -131,7 +131,7 @@ the old `domain_qps.json`, `CRAWLER_USE_AUTOTHROTTLE`, `CRAWLER_DOWNLOAD_DELAY`,
 #### Wikipedia
 
 Wikipedia uses AutoThrottle with `target_concurrent_requests: 8`, `max_qps: 15`
-(a minimum interval of about 0.0667 seconds), and `max_concurrent_requests: 8`. When explicitly configured
+(a minimum interval of about 0.0667 seconds), and `max_concurrent_requests: 7`. When explicitly configured
 under `domains`, `max_concurrent_requests` is enforced by the generic
 `SharedConcurrencyMiddleware` across all crawler processes and subdomains.
 This includes robots.txt, redirects, retries, and manual jobs, regardless of
@@ -141,9 +141,12 @@ per process. Domain rules without an explicit concurrency setting do not
 create a shared budget.
 
 The shared limit covers crawler requests. The unchanged synchronous sitemap
-discovery and patrol workers can each add one concurrent request; with a crawler
-cap of eight, the combined maximum is ten. Use a crawler cap of seven to keep
-the combined maximum at nine for the current one-instance-per-worker deployment.
+discovery and patrol workers can each add one concurrent request. The crawler
+cap of seven reserves two requests, keeping the combined maximum at nine for
+the current one-instance-per-worker deployment. These services do not share an
+aggregate QPS limiter; concurrency reservations do not establish a system-wide
+15 QPS guarantee. [Issue #145](https://github.com/NTU-CSIE5376/WebCrawler/issues/145)
+tracks shared request-rate enforcement and measurement.
 
 The middleware uses file locks under `/data/ipc/request_budgets`, on the IPC
 bind mount shared by the crawler containers. Workers wait asynchronously for a

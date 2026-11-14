@@ -101,7 +101,7 @@ Crawler worker behavior:
 
 ## 2.4 `scheduler_ingest` Container
 
-The container has an 8-CPU limit shared by 4 program families via `supervisord`:
+The container has a 32-CPU limit shared by 4 program families via `supervisord`:
 
 - `router` x16
 - `ingestor` x16
@@ -121,6 +121,20 @@ Responsibilities:
 - For each outlink, ensure destination domain exists and emit separate `status="new"` records.
 - Write transformed records to `ingestor_{id}` bucket JSONL files.
 
+Each router caches up to 65,536 hostname routing decisions using its startup
+sharding configuration. Parent-page scores are queried per shard in batches of
+at most 256 records and refreshed for each batch. A failed batch lookup falls
+back to the original per-record query/retry path; domain resolution and output
+writes remain per record. `route.folder_done` includes `record_cnt` and
+`duration_sec` to measure throughput and compare it with the ten-minute input
+interval.
+
+On TERM or INT, a router finishes its current folder and saves progress before
+exiting. Supervisor allows 20 minutes before forcing termination; Compose gives
+the scheduler-ingest container 21 minutes. Rebuild/recreate the container to
+apply these deployment settings. A crash or forced kill can still replay the
+last incomplete folder under the existing folder-level checkpoint scheme.
+
 ### Ingestor (x16)
 
 Input: router output folders `ingestor_{id}`.
@@ -128,7 +142,7 @@ Input: router output folders `ingestor_{id}`.
 Responsibilities:
 
 - `status="new"` records: insert new URL candidates into `url_state_current_{shard}` and history.
-  - Trap filter (`trap_filter` in `ingest.yaml`, `ingestor/trap_filter.py`), applied before any DB work: strip the approved params in `normalize_params` (default only `srsltid`, the same policy as `golden_inject.py`), merge links that collapse to the same URL, log what stripping every other tracking / session param would change without applying it (`would_normalize`), then drop links hitting a high-confidence trap rule (`libs/frontier/trap_rules.HIGH_CONFIDENCE`: path repeat, too many path segments, nested redirect, faceted navigation, calendar plugin). Every affected link is appended to `/data/ipc/trap_filter/ingestor_{id}/YYYY-MM-DD.jsonl.gz`; `scripts/trap_filter_golden_check.py` measures golden false kills from these logs. Crawl results are never filtered. Rule definitions: [10-frontier-trap-rules.md](10-frontier-trap-rules.md).
+  - Trap filter (`ingestor/trap_filter.py`; on by default, optional `trap_filter` block in `ingest.yaml` to override, see [10](10-frontier-trap-rules.md#configuration-and-rollout)), applied before any DB work: strip the approved params in `normalize_params` (default only `srsltid`, the same policy as `golden_inject.py`), merge links that collapse to the same URL, log what stripping every other tracking / session param would change without applying it (`would_normalize`), then drop links hitting a high-confidence trap rule (`libs/frontier/trap_rules.HIGH_CONFIDENCE`: path repeat, too many path segments, nested redirect, faceted navigation, calendar plugin). Every affected link is appended to `/data/ipc/trap_filter/ingestor_{id}/YYYY-MM-DD.jsonl.gz`; `scripts/trap_filter_golden_check.py` measures golden false kills from these logs. Crawl results are never filtered. Rule definitions: [10-frontier-trap-rules.md](10-frontier-trap-rules.md).
   - Links whose domain has `domain_state.discovery_frozen=TRUE` are skipped (frontier budget; see `frontier_gc` in 2.2), so frozen domains stop accumulating new frontier rows.
   - If `GOLDEN_DISCOVERY_RANKER_V1_INGEST_INLINE_ENABLED=true`, check which URLs are truly new, score those with the mounted ranker artifact before writing them to DB, and fall back to unscored insert when the inline scoring time budget is exhausted.
   - If inline scoring is disabled, new URLs keep `url_score_updated_at=NULL` and the background ranker can score them later.

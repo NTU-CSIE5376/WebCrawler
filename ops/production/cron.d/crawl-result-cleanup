@@ -1,0 +1,6 @@
+# Install as /etc/cron.d/crawl-result-cleanup on the IPC host.
+# Remove the old cleanup entry from root's crontab to avoid duplicate runs.
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+*/30 * * * * root /usr/bin/docker exec -w /app scheduler_ingest python -m scripts.cleanup_crawl_result --apply --min-age-hours 2 --max-age-hours 0 >> /var/log/crawl_result_cleanup.log 2>&1
