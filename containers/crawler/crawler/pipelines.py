@@ -72,4 +72,8 @@ class JsonPipeline:
         }
 
         append_jsonl(path, rec)
+        # Read and reset by the spider heartbeat (same reactor thread).
+        spider.items_written = getattr(spider, "items_written", 0) + 1
+        if rec["status"] == "ok":
+            spider.items_ok = getattr(spider, "items_ok", 0) + 1
         return item

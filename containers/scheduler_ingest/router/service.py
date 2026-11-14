@@ -168,7 +168,10 @@ class RouterService:
         started = time.monotonic()
         error = 0
         file_cnt = 0
+        # Keep input attempts separate from records successfully flushed.
         record_cnt = 0
+        records = 0
+        links = 0
 
         domain_cache = self._domain_cache_for_folder()
 
@@ -255,6 +258,8 @@ class RouterService:
 
                         pending[ingestor_id].append(out)
                         self._flush(pending)
+                        records += 1
+                        links += len(new_outlinks)
                         break # success
 
                     except (OperationalError, InterfaceError) as e:
@@ -297,6 +302,7 @@ class RouterService:
                     "route_error": error,
                 },
             )
+        duration = time.monotonic() - started
         logger.info(
             "route.folder_done",
             extra={
@@ -304,8 +310,11 @@ class RouterService:
                 "folder": str(folder),
                 "file_cnt": file_cnt,
                 "record_cnt": record_cnt,
-                "duration_sec": time.monotonic() - started,
+                "duration_sec": duration,
                 "errors": error,
+                "records": records,
+                "links": links,
+                "duration_s": duration,
             },
         )
 

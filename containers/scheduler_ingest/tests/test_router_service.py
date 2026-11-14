@@ -157,6 +157,19 @@ def test_failed_record_writes_nothing(router, monkeypatch):
     assert _output_lines(tmp_path) == []
 
 
+def test_folder_done_reports_records_links_and_duration(router, caplog):
+    svc, _, tmp_path = router
+    folder = _crawl_folder(tmp_path, "f1", [
+        _record("https://known.example/", ["https://known.example/a", "https://b.example/"]),
+        _record("https://known.example/2", ["https://known.example/c"]),
+    ])
+    with caplog.at_level("INFO", logger="router"):
+        svc.process_folder(folder)
+    (done,) = [r for r in caplog.records if getattr(r, "event", None) == "route.folder_done"]
+    assert (done.records, done.links, done.errors) == (2, 3, 0)
+    assert done.duration_s >= 0
+
+
 def test_batched_scores_match_point_reads_and_reduce_queries(router, monkeypatch):
     svc, statements, root = router
     records = [_record(f"https://known.example/page{i}", [
@@ -291,3 +304,44 @@ def test_folder_log_counts_input_records_and_duration(router, caplog):
     assert done.file_cnt == 1
     assert done.errors == 0
     assert done.duration_sec >= 0
+
+
+def test_folder_metrics_separate_input_attempts_from_flushed_results(router, monkeypatch, caplog):
+    svc, _, root = router
+    lookup = svc._parent_url_score
+
+    def reject_one_record(session, shard, url, prefetched=None):
+        if url.endswith('/rejected'):
+            raise RuntimeError('record rejected before output')
+        return lookup(session, shard, url, prefetched)
+
+    monkeypatch.setattr(svc, '_parent_url_score', reject_one_record)
+    folder = _crawl_folder(root, 'mixed-outcomes', [
+        _record('https://known.example/first', [
+            'https://known.example/a', 'https://known.example/b',
+        ]),
+        _record('https://known.example/rejected', ['https://known.example/skipped']),
+        _record('https://known.example/last', ['https://known.example/c']),
+    ])
+    with caplog.at_level('INFO', logger='router'):
+        svc.process_folder(folder)
+    done, = [rec for rec in caplog.records if getattr(rec, 'event', None) == 'route.folder_done']
+    assert (done.record_cnt, done.records, done.links, done.errors) == (3, 2, 3, 1)
+    assert len([rec for rec in _output_lines(root) if rec['status'] == 'ok']) == 2
+
+
+def test_folder_duration_log_names_share_one_measurement(router, monkeypatch, caplog):
+    svc, _, root = router
+    tick = svc._domain_cache_born
+
+    def monotonic():
+        nonlocal tick
+        tick += 0.125
+        return tick
+
+    monkeypatch.setattr(router_service.time, 'monotonic', monotonic)
+    with caplog.at_level('INFO', logger='router'):
+        svc.process_folder(_crawl_folder(root, 'duration-alias', []))
+    done, = [rec for rec in caplog.records if getattr(rec, 'event', None) == 'route.folder_done']
+    assert done.duration_sec > 0
+    assert done.duration_s == done.duration_sec
