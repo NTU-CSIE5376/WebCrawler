@@ -98,6 +98,5 @@ def test_bundled_limits_apply_domain_pacing_and_share_domain_budget(monkeypatch)
         request = Request(f"https://{host}/")
         dispatcher.process_request(request)
         assert request.meta["download_slot"] == "yahoo.com"
-    assert policies.resolve("example.com").request_limits.target_concurrent_requests is None
-    assert policies.resolve("example.com").request_limits.max_qps == 4
+    assert policies.resolve("example.com").request_limits == policies.config.default.request_limits
     assert policies.shared_budgets("example.com") == ()

@@ -63,6 +63,5 @@ def test_espn_limits_are_shared_without_changing_other_sites(dispatcher):
         assert limits.max_qps == 64
         assert limits.max_concurrent_requests == 16
         assert policies.shared_budgets(hostname) == (("domain:espn.com", 16),)
-    assert policies.resolve("example.com").request_limits.target_concurrent_requests is None
-    assert policies.resolve("example.com").request_limits.max_qps == 4
+    assert policies.resolve("example.com").request_limits == policies.config.default.request_limits
     assert policies.shared_budgets("example.com") == ()
