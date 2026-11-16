@@ -6,9 +6,11 @@
 # Exact host rules inherit the domain middleware; null disables it for that host.
 # Additional options: headers and download_timeout_sec (positive seconds).
 # crawler_mode and request_limits inherit default -> domain -> exact host.
+# allow inherits default -> domain -> exact host; false blocks before downloading.
 # request_limits.target_concurrent_requests overrides the global AutoThrottle target.
 # Scrapy delay is calculated as 1 / max_qps; AutoThrottle may slow down further.
 default:
+  allow: true
   crawler_mode: autothrottle
   request_limits:
     max_qps: 8
@@ -35,6 +37,38 @@ domains:
 
   youtube.com:
     middleware: crawler.middlewares.youtube.YouTubeMiddleware
+
+  x.com:
+    allow: false
+
+  imdb.com:
+    allow: false
+
+  instagram.com:
+    allow: false
+
+  facebook.com:
+    allow: false
+
+  reddit.com:
+    allow: false
+
+  sofascore.com:
+    allow: false
+
+  espn.com:
+    middleware: crawler.middlewares.espn.ESPNMiddleware
+    request_limits:
+      target_concurrent_requests: 32
+      max_concurrent_requests: 16
+      max_qps: 64
+
+  yahoo.com:
+    middleware: crawler.middlewares.yahoo.YahooMiddleware
+    request_limits:
+      target_concurrent_requests: 8
+      max_concurrent_requests: 16
+      max_qps: 16
 
 hosts:
   01282.com:

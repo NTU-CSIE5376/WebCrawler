@@ -40,6 +40,7 @@ class RequestLimits(BaseModel):
 class SitePolicyOptions(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
+    allow: bool = True
     crawler_mode: Literal["autothrottle", "fixed"] | None = None
     middleware: str | None = Field(default=None, min_length=1)
     headers: dict[str, str | None] = Field(default_factory=dict)
@@ -94,6 +95,7 @@ class SitePolicy:
     middleware: str | None = None
     request_limits: RequestLimits | None = None
     crawler_mode: str = "autothrottle"
+    allow: bool = True
 
 
 class SitePolicies:
@@ -161,6 +163,8 @@ class SitePolicies:
         headers = Headers({**default.headers, **base.headers, **host.headers})
         return SitePolicy(
             headers={key: tuple(values) for key, values in headers.items()},
+            allow=next((rule.allow for rule in (host, base)
+                        if "allow" in rule.model_fields_set), default.allow),
             download_timeout_sec=next((rule.download_timeout_sec for rule in (host, base, default)
                                        if rule.download_timeout_sec is not None), None),
             middleware=next((rule.middleware for rule in (host, base, default)
