@@ -2,6 +2,7 @@
 import json
 import os
 from concurrent.futures import Future
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 import subprocess
 import sys
@@ -22,7 +23,7 @@ from crawler.spiders.parser import HtmlParserPool  # noqa: E402
 def controlled_pool(monkeypatch):
     executor = Mock()
     monkeypatch.setattr(module, "ProcessPoolExecutor", Mock(return_value=executor))
-    pool = HtmlParserPool(2)
+    pool = HtmlParserPool(2, on_broken=Mock())
     futures, notifications = [], []
 
     def submit(*args):
@@ -98,6 +99,46 @@ def test_child_exception_reaches_callback_and_releases_slot(controlled_pool):
     notifications.pop(0)()
     assert str(errors[0]) == "bad HTML task"
     assert pool.inflight == 0
+    pool._on_broken.assert_not_called()
+
+
+def test_broken_pool_rejects_waiters_and_notifies_shutdown_once(controlled_pool):
+    pool, response, futures, notifications = controlled_pool
+    errors = []
+    for _ in range(7):
+        submit(pool, response).addErrback(lambda failure: errors.append(failure.type))
+    assert pool.waiting == 3
+    for future in futures:
+        future.set_exception(BrokenProcessPool("child died"))
+    while notifications:
+        notifications.pop(0)()
+    # Waiters and subsequent submissions never reach the broken executor.
+    submit(pool, response).addErrback(lambda failure: errors.append(failure.type))
+    assert errors == [BrokenProcessPool] * 8
+    assert len(futures) == 4
+    assert pool.inflight == pool.waiting == 0
+    pool._on_broken.assert_called_once_with()
+
+
+def test_broken_pool_submission_requests_shutdown(controlled_pool):
+    pool, response, _, _ = controlled_pool
+    pool._executor.submit.side_effect = BrokenProcessPool("already broken")
+    errors = []
+    submit(pool, response).addErrback(lambda failure: errors.append(failure.type))
+    assert errors == [BrokenProcessPool]
+    assert pool.inflight == 0
+    pool._on_broken.assert_called_once_with()
+
+
+def test_cancelled_task_still_reports_broken_pool(controlled_pool):
+    pool, response, futures, notifications = controlled_pool
+    result = submit(pool, response)
+    result.addErrback(lambda failure: None)
+    result.cancel()
+    futures[0].set_exception(BrokenProcessPool("child died after cancellation"))
+    notifications.pop(0)()
+    assert pool.inflight == 0
+    pool._on_broken.assert_called_once_with()
 
 
 def test_submit_failure_releases_slot(controlled_pool):
@@ -135,3 +176,39 @@ def test_two_real_processes_match_inline_and_close_cleanly(tmp_path):
     assert report["reactor_ticks"] > 0
     assert report["children_after_close"] == 0
     assert report["pending_after_failure"] == 0
+
+
+def test_killed_parser_child_stops_crawler_and_restart_produces_output(tmp_path):
+    root = Path(__file__).resolve().parents[3]
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).parent / "helpers/html_parser_failure_runner.py"),
+         str(tmp_path)],
+        cwd=root / "containers/crawler",
+        env={**os.environ, "PYTHONPATH": f"{root}:{root / 'containers/crawler'}"},
+        capture_output=True, text=True, timeout=45,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["failed_reason"] == "parser_pool_broken"
+    events = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+    interrupted = [event for event in events if event.get("event") == "parser.interrupted"]
+    assert len(interrupted) == 6
+    assert len({event["url"] for event in interrupted}) == 6
+    assert all(event["domain_id"] == 7 for event in interrupted)
+    assert len([event for event in events if event.get("event") == "parser.pool_broken"]) == 1
+    assert report["failure_count"] == 1
+    assert report["interrupted"] == 6
+    assert report["inflight"] == report["waiting"] == report["pending"] == 0
+    assert report["domain_pending"] == {}
+    assert report["children_after_close"] == 0
+    assert report["restarted_reason"] == "test_complete"
+    assert report["restarted_output"] == report["original_output"]
+
+
+def test_supervisor_restarts_crawlers_after_clean_failure_shutdown():
+    import configparser
+
+    config = configparser.ConfigParser(interpolation=None)
+    config.read(Path(__file__).resolve().parents[1] / "supervisord.conf")
+    for name in ("program:crawler_default", "program:crawler_canary"):
+        assert config[name].getboolean("autorestart")

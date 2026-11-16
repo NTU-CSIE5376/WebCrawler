@@ -5,7 +5,9 @@ import multiprocessing
 import os
 import signal
 import sys
+from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from urllib.parse import urlparse
 
 from scrapy.http import TextResponse
@@ -114,12 +116,14 @@ def _parse_html(url, body, encoding, response_class):
 class HtmlParserPool:
     """Run HtmlParser in bounded child processes, or locally when disabled."""
 
-    def __init__(self, processes: int = 4):
+    def __init__(self, processes: int = 4, *, on_broken: Callable[[], None] | None = None):
         if processes < 0:
             raise ValueError("PARSER_PROCESSES must be non-negative")
         self._parser = HtmlParser() if processes == 0 else None
         self._slots = DeferredSemaphore(processes * 2) if processes else None
         self._closing = False
+        self._broken: BrokenProcessPool | None = None
+        self._on_broken = on_broken
         self._shutdown: Deferred | None = None
         # Never fork a running reactor or inherit its sockets and threads.
         self._executor = (
@@ -140,6 +144,8 @@ class HtmlParserPool:
         return len(self._slots.waiting) if self._slots else 0
 
     async def parse(self, response: TextResponse) -> dict:
+        if self._broken is not None:
+            raise self._broken
         if self._closing:
             raise RuntimeError("HTML parser pool is closing")
         if self._executor is None:
@@ -152,11 +158,19 @@ class HtmlParserPool:
         from twisted.internet import reactor
 
         try:
+            if self._broken is not None:
+                raise self._broken
             if self._closing:
                 raise RuntimeError("HTML parser pool is closing")
             future = self._executor.submit(
                 _parse_html, response.url, response.body, response.encoding, type(response),
             )
+        except BrokenProcessPool as error:
+            try:
+                self._mark_broken(error)
+            finally:
+                self._slots.release()
+            raise
         except Exception:
             self._slots.release()
             raise
@@ -166,6 +180,10 @@ class HtmlParserPool:
         def completed():
             try:
                 fields = future.result()
+            except BrokenProcessPool as error:
+                self._mark_broken(error)
+                if not result.called:
+                    result.errback(Failure())
             except BaseException:
                 if not result.called:
                     result.errback(Failure())
@@ -178,6 +196,14 @@ class HtmlParserPool:
 
         future.add_done_callback(lambda _: reactor.callFromThread(completed))
         return result
+
+    def _mark_broken(self, error: BrokenProcessPool) -> None:
+        # All callbacks run on the reactor, including cancelled tasks. Notify
+        # once before releasing slots, so waiters cannot submit to a dead pool.
+        if self._broken is None:
+            self._broken = error
+            if self._on_broken is not None:
+                self._on_broken()
 
     def close(self) -> Deferred:
         if self._shutdown is None:

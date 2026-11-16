@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures.process import BrokenProcessPool
 
 from w3lib.url import canonicalize_url
 from datetime import datetime, timezone
@@ -47,6 +48,7 @@ class HtmlSpider(scrapy.Spider):
         # Results written to crawl_result since the last heartbeat (JsonPipeline).
         self.items_written = 0
         self.items_ok = 0
+        self._parser_failed = False
 
     @classmethod
     def from_crawler(cls, crawler, *args, **kwargs):
@@ -55,7 +57,10 @@ class HtmlSpider(scrapy.Spider):
         qtpl = crawler.settings["URL_QUEUE_TEMPLATE"]
         spider.queue = QueueConsumer(queue_dir=qtpl.format(id=spider.crawler_id))
         spider.manual_bulk_crawls = ManualBulkCrawlConsumer(spider)
-        spider.html_parser_pool = HtmlParserPool(crawler.settings.getint("PARSER_PROCESSES", 4))
+        spider.html_parser_pool = HtmlParserPool(
+            crawler.settings.getint("PARSER_PROCESSES", 4),
+            on_broken=spider._parser_pool_broken,
+        )
 
         spider.domain_low_watermark = max(
             0, crawler.settings.getint("IPC_DOMAIN_LOW_WATERMARK", 10)
@@ -228,6 +233,8 @@ class HtmlSpider(scrapy.Spider):
 
 
     def _reserve_urls(self, reason: str, force: bool = False) -> list[tuple[int, str]]:
+        if self._parser_failed:
+            return []
         needs_domains = len(self._domain_pending) < self.domain_low_watermark
         if not force and not needs_domains:
             return []
@@ -335,6 +342,27 @@ class HtmlSpider(scrapy.Spider):
         self._top_up_task = None
         return self.html_parser_pool.close()
 
+    def _parser_pool_broken(self) -> None:
+        if self._parser_failed:
+            return
+        self._parser_failed = True
+        # Stop refilling manual work while its already active callbacks drain.
+        # spider_closed still closes job files after those callbacks finish.
+        self.manual_bulk_crawls.closed = True
+        if self.manual_bulk_crawls.poller.running:
+            self.manual_bulk_crawls.poller.stop()
+        self.crawler.stats.inc_value("parser/pool_broken")
+        logger.critical(
+            "parser.pool_broken",
+            extra={"event": "parser.pool_broken", "reason": "parser_pool_broken"},
+        )
+        # Do not await closure inside a response callback: Scrapy must wait for
+        # that callback to finish before it can close the spider. Supervisor's
+        # autorestart=true restarts the worker even after a clean exit.
+        self.crawler.engine.close_spider(self, reason="parser_pool_broken").addErrback(
+            lambda failure: logger.error("Parser failure shutdown failed: %s", failure),
+        )
+
     def _emit_heartbeat(self):
         runtime = self._downloader_runtime()
         scraper_runtime = self._scraper_runtime()
@@ -406,6 +434,19 @@ class HtmlSpider(scrapy.Spider):
             else:
                 fields = await self.html_parser_pool.parse(response)
             return list(self._parse_response(response, fields))
+        except BrokenProcessPool:
+            reason = "parser_pool_broken"
+            self.crawler.stats.inc_value("parser/interrupted")
+            logger.error(
+                "parser.interrupted",
+                extra={
+                    "event": "parser.interrupted", "url": response.url,
+                    "source_url": response.meta.get("source_url", response.url),
+                    "domain_id": response.meta.get("_track_domain_id", 0),
+                    "reason": reason,
+                },
+            )
+            raise
         except BaseException:
             reason = "parse_error"
             raise
