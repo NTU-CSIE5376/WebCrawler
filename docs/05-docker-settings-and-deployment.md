@@ -76,6 +76,13 @@ extracted fields without sending the HTML back. Manual bulk crawls use their
 existing save path. Heartbeats expose `parser_inflight` (submitted responses)
 and `parser_waiting` (callbacks waiting for a slot). Restart workers after
 changing this setting; pools drain and join during normal shutdown.
+If a parser child dies and breaks the pool, the crawler rejects further parser
+work and closes with reason `parser_pool_broken`. Supervisor's `autorestart=true`
+restarts it even after a clean exit. Interrupted HTML responses are logged as
+`parser.interrupted` with their URL and domain ID before ownership is released;
+they produce no page result and are not automatically replayed. Scrapy stats
+record `parser/pool_broken` and `parser/interrupted`. Already active callbacks
+drain and parser children are joined during closure.
 Compose passes `CRAWLER_PARSER_PROCESSES` (default `4`) into the container, and
 both Supervisor programs inherit it. Supervisor sends TERM only to the crawler
 parent, allowing it to drain and join parser children. After 60 seconds it kills
