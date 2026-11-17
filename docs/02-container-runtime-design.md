@@ -121,13 +121,15 @@ Responsibilities:
 - For each outlink, ensure destination domain exists and emit separate `status="new"` records.
 - Write transformed records to `ingestor_{id}` bucket JSONL files.
 
-Each router caches up to 65,536 hostname routing decisions using its startup
-sharding configuration. Parent-page scores are queried per shard in batches of
-at most 256 records and refreshed for each batch. A failed batch lookup falls
-back to the original per-record query/retry path; domain resolution and output
-writes remain per record. `route.folder_done` includes `record_cnt` and
-`duration_sec` to measure throughput and compare it with the ten-minute input
-interval.
+During Host2 memory-incident recovery, routers use the original direct routing
+and per-record parent-score queries. The hostname routing cache and batched
+score prefetch are disabled. Domain resolution and output writes remain per
+record. `route.folder_done` retains its input/output counts and duration fields
+to measure throughput and compare it with the ten-minute input interval.
+
+This rollback does not bound the existing whole-file/whole-folder reads or
+shrink queued buckets. Do not restart the pipeline solely because the rollback
+tests pass: inspect queued bucket sizes and coordinate recovery with its owner.
 
 On TERM or INT, a router finishes its current folder and saves progress before
 exiting. Supervisor allows 20 minutes before forcing termination; Compose gives

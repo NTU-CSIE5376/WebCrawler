@@ -170,44 +170,37 @@ def test_folder_done_reports_records_links_and_duration(router, caplog):
     assert done.duration_s >= 0
 
 
-def test_batched_scores_match_point_reads_and_reduce_queries(router, monkeypatch):
+def test_parent_scores_are_point_read_for_each_record_and_propagated_to_outlinks(router):
     svc, statements, root = router
     records = [_record(f"https://known.example/page{i}", [
         "https://known.example/a", "https://new.example/b",
     ]) for i in range(300)]
     shard = svc.sharder.domain_to_shard("known.example")
+    scores = {record["url"]: i / 1000 for i, record in enumerate(records)}
     with svc.engine.begin() as conn:
         conn.execute(text(
             f"INSERT INTO url_state_current_{shard:03d} (url,url_score) VALUES (:url,:score)"
-        ), [{"url": r["url"], "score": i / 1000} for i, r in enumerate(records)])
-    folder = _crawl_folder(root, "sample", records)
-    prefetch = svc._prefetch_parent_scores
-    monkeypatch.setattr(svc, "_prefetch_parent_scores", lambda records: {})
+        ), [{"url": url, "score": score} for url, score in scores.items()])
     statements.clear()
-    svc.process_folder(folder)
-    expected = _output_lines(root)
-    assert sum(s.startswith("SELECT url_score FROM") for s in statements) == 300
+    svc.process_folder(_crawl_folder(root, "sample", records))
+    new_links = [row for row in _output_lines(root) if row["status"] == "new"]
+    assert len(new_links) == 600
+    assert all(row["parent_page_score"] == scores[row["discovered_from"]] for row in new_links)
+    assert sum(s.startswith("SELECT url_score FROM") for s in statements) == len(records)
+    assert not any("SELECT url, url_score FROM" in s for s in statements)
 
-    monkeypatch.setattr(svc, "_prefetch_parent_scores", prefetch)
-    svc.cfg = replace(svc.cfg, ingestor_dir_template=str(root / "fast/ingestor_{id:02d}"))
-    statements.clear()
-    svc.process_folder(folder)
-    assert _output_lines(root / "fast") == expected
-    assert sum(s.startswith("SELECT url, url_score FROM") for s in statements) == 2
-    assert not any(s.startswith("SELECT url_score FROM") for s in statements)
-
-
-def test_missing_scores_are_batched_and_records_without_links_skip_lookup(router):
+def test_missing_parent_scores_return_none_and_records_without_links_skip_lookup(router):
     svc, statements, root = router
     records = [_record("https://known.example/no-links", []),
                _record("https://known.example/missing", ["https://known.example/a"])]
     svc.process_folder(_crawl_folder(root, "missing", records))
-    assert sum(s.startswith("SELECT url, url_score FROM") for s in statements) == 1
-    assert not any(s.startswith("SELECT url_score FROM") for s in statements)
-    assert len([r for r in _output_lines(root) if r["status"] == "ok"]) == 2
+    assert sum(s.startswith("SELECT url_score FROM") for s in statements) == 1
+    output = _output_lines(root)
+    assert len([row for row in output if row["status"] == "ok"]) == 2
+    (link,) = [row for row in output if row["status"] == "new"]
+    assert link["parent_page_score"] is None
 
-
-def test_failed_prefetch_falls_back_to_normal_point_lookup(router, monkeypatch):
+def test_session_failure_does_not_skip_later_records_or_write_failed_record(router, monkeypatch):
     svc, statements, root = router
     factory = svc.Session
     calls = 0
@@ -216,48 +209,59 @@ def test_failed_prefetch_falls_back_to_normal_point_lookup(router, monkeypatch):
         nonlocal calls
         calls += 1
         if calls == 1:
-            raise RuntimeError("prefetch unavailable")
+            raise RuntimeError("session unavailable")
         return factory()
 
     monkeypatch.setattr(svc, "Session", sessions)
-    records = [_record("https://known.example/", ["https://known.example/a"])]
-    svc.process_folder(_crawl_folder(root, "fallback", records))
-    assert any(s.startswith("SELECT url_score FROM") for s in statements)
-    assert len([r for r in _output_lines(root) if r["status"] == "ok"]) == 1
+    records = [_record("https://known.example/failed", ["https://known.example/skipped"]),
+               _record("https://known.example/next", ["https://known.example/kept"])]
+    svc.process_folder(_crawl_folder(root, "failure", records))
+    output = _output_lines(root)
+    assert [row["url"] for row in output if row["status"] == "ok"] == [records[1]["url"]]
+    assert [row["url"] for row in output if row["status"] == "new"] == ["https://known.example/kept"]
+    assert sum(s.startswith("SELECT url_score FROM") for s in statements) == 1
 
-
-def test_scores_refresh_at_next_batch(router):
-    svc, _, _ = router
+def test_parent_score_refreshes_at_next_record_in_same_folder(router, monkeypatch):
+    svc, _, root = router
     record = _record("https://known.example/", ["https://known.example/a"])
     shard = svc.sharder.domain_to_shard("known.example")
     with svc.engine.begin() as conn:
         conn.execute(text(f"INSERT INTO url_state_current_{shard:03d} VALUES (:url,0.1)"),
                      {"url": record["url"]})
-    iterator = svc._records_with_parent_scores([record] * 257)
-    _, first = next(iterator)
-    with svc.engine.begin() as conn:
-        conn.execute(text(f"UPDATE url_state_current_{shard:03d} SET url_score=0.9"))
-    for _ in range(255):
-        assert next(iterator)[1][(shard, record["url"])] == 0.1
-    assert first[(shard, record["url"])] == 0.1
-    assert next(iterator)[1][(shard, record["url"])] == 0.9
+    lookup = svc._parent_url_score
+    seen = []
 
+    def read_then_update(sess, sid, url):
+        score = lookup(sess, sid, url)
+        seen.append(score)
+        if len(seen) == 1:
+            sess.execute(text(f"UPDATE url_state_current_{sid:03d} SET url_score=0.9"))
+        return score
 
-def test_route_cache_preserves_overrides_split_hosts_and_is_instance_local(router):
+    monkeypatch.setattr(svc, "_parent_url_score", read_then_update)
+    svc.process_folder(_crawl_folder(root, "changing-score", [record, record]))
+    assert seen == [0.1, 0.9]
+    assert [row["parent_page_score"] for row in _output_lines(root)
+            if row["status"] == "new"] == [0.1, 0.9]
+
+def test_direct_routing_preserves_overrides_split_hosts_and_instance_configuration(router):
     svc, _, _ = router
     cfg = replace(svc.cfg, domain_overrides={"example.com": 2},
                   split_subdomains={"en.wikipedia.org"})
     other = RouterService(cfg)
-    for host in ("example.com", "www.example.com", "en.wikipedia.org", "127.0.0.1", ""):
-        assert svc._route_host(host) == svc.sharder.route(host)
-        assert other._route_host(host) == other.sharder.route(host)
-    assert other._route_host("example.com")[1] == 2
-    assert svc._route_host.cache_info().maxsize == router_service.HOST_ROUTE_CACHE_MAX
-    svc._route_host.cache_clear()
-    assert other._route_host.cache_info().currsize > 0
+    hosts = ("example.com", "www.example.com", "en.wikipedia.org", "127.0.0.1")
+    try:
+        for instance in (svc, other):
+            links = [{"url": f"https://{host}/", "anchor": host} for host in hosts]
+            routed = instance._route_links(links + [{"anchor": "missing URL"}])
+            assert [row[0] for row in routed] == links
+            assert [row[1:] for row in routed] == [instance.sharder.route(host) for host in hosts]
+        assert other._route_links([{"url": "https://example.com/"}])[0][2] == 2
+        assert other._route_links([{"url": "https://en.wikipedia.org/"}])[0][1] == "en.wikipedia.org"
+    finally:
+        other.engine.dispose()
 
-
-def test_partial_prefetch_failure_discards_all_scores(router, monkeypatch):
+def test_point_reads_use_each_records_shard_and_keep_output_order(router):
     svc, statements, root = router
     hosts = ["known.example"]
     for i in range(20):
@@ -266,31 +270,24 @@ def test_partial_prefetch_failure_discards_all_scores(router, monkeypatch):
             hosts.append(host)
             break
     assert len(hosts) == 2
-    prefetch_queries = 0
-
-    @event.listens_for(svc.engine, "before_cursor_execute")
-    def fail_second_shard(conn, cursor, statement, parameters, context, executemany):
-        nonlocal prefetch_queries
-        if statement.startswith("SELECT url, url_score FROM"):
-            prefetch_queries += 1
-            if prefetch_queries == 2:
-                raise RuntimeError("second shard unavailable")
-
-    lookup = svc._parent_url_score
-    fallback_calls = []
-
-    def point_read(sess, shard, url, prefetched=None):
-        assert prefetched == {}
-        fallback_calls.append(url)
-        return lookup(sess, shard, url, prefetched)
-
-    monkeypatch.setattr(svc, "_parent_url_score", point_read)
     records = [_record(f"https://{host}/", ["https://known.example/a"]) for host in hosts]
-    svc.process_folder(_crawl_folder(root, "partial", records))
-    assert prefetch_queries == 2
-    assert fallback_calls == [r["url"] for r in records]
-    assert len([r for r in _output_lines(root) if r["status"] == "ok"]) == 2
-
+    expected = {}
+    with svc.engine.begin() as conn:
+        for i, record in enumerate(records):
+            sid = svc.sharder.domain_to_shard(hosts[i])
+            expected[record["url"]] = (sid, 0.2 + i / 10)
+            conn.execute(text(f"INSERT INTO url_state_current_{sid:03d} VALUES (:url,:score)"),
+                         {"url": record["url"], "score": expected[record["url"]][1]})
+    statements.clear()
+    svc.process_folder(_crawl_folder(root, "different-shards", records))
+    output = _output_lines(root)
+    links = [row for row in output if row["status"] == "new"]
+    assert [row["discovered_from"] for row in links] == [record["url"] for record in records]
+    assert [row["parent_page_score"] for row in links] == [expected[record["url"]][1] for record in records]
+    queries = [s for s in statements if s.startswith("SELECT url_score FROM")]
+    assert len(queries) == 2
+    assert all(f"url_state_current_{expected[record['url']][0]:03d}" in query
+               for record, query in zip(records, queries))
 
 def test_folder_log_counts_input_records_and_duration(router, caplog):
     svc, _, root = router
@@ -310,10 +307,10 @@ def test_folder_metrics_separate_input_attempts_from_flushed_results(router, mon
     svc, _, root = router
     lookup = svc._parent_url_score
 
-    def reject_one_record(session, shard, url, prefetched=None):
+    def reject_one_record(session, shard, url):
         if url.endswith('/rejected'):
             raise RuntimeError('record rejected before output')
-        return lookup(session, shard, url, prefetched)
+        return lookup(session, shard, url)
 
     monkeypatch.setattr(svc, '_parent_url_score', reject_one_record)
     folder = _crawl_folder(root, 'mixed-outcomes', [
