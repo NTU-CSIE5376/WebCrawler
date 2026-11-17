@@ -45,17 +45,6 @@ recreation to apply limits. A cap can cause container OOM kills; it contains
 memory exhaustion rather than fixing unbounded allocation. Configure database
 and JVM internal memory budgets below their container cap as well.
 
-For a reproducible ingestion memory comparison without database writes, run:
-
-```sh
-containers/scheduler_ingest/.venv/bin/python scripts/benchmark_ingestor_memory.py \
-  --baseline-ref 9f20bfd33211c7c727bccdb370f9216609866a0b --records 20000 200000 400000
-```
-
-This generates temporary JSONL input and measures each implementation's peak RSS
-in a fresh process. The database sink discards records, so it measures parsing,
-aggregation, and buffering rather than real database throughput or ranker memory.
-
 ## 5.2 Dockerfiles
 
 ### `containers/scheduler_control/Dockerfile`
