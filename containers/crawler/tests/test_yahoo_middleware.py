@@ -92,9 +92,9 @@ def test_bundled_limits_apply_domain_pacing_and_share_domain_budget(monkeypatch)
         assert policies.shared_budgets(host) == (("domain:yahoo.com", 16),)
         limits = policies.resolve(host).request_limits
         assert limits.download_slot == "yahoo.com"
-        assert limits.target_concurrent_requests == 8
+        assert limits.target_concurrent_requests == policies.config.default.request_limits.target_concurrent_requests
         assert limits.max_concurrent_requests == 16
-        assert limits.max_qps == 16
+        assert limits.max_qps == policies.config.default.request_limits.max_qps
         request = Request(f"https://{host}/")
         dispatcher.process_request(request)
         assert request.meta["download_slot"] == "yahoo.com"
