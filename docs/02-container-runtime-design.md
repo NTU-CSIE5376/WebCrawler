@@ -141,6 +141,21 @@ last incomplete folder under the existing folder-level checkpoint scheme.
 
 Input: router output folders `ingestor_{id}`.
 
+The ingestor snapshots input filenames and streams the folder twice: discoveries
+first, then crawl results. Each shard buffers at most 2,000 records, with a shared
+64 MiB estimated decoded-record budget per ingestor. Reaching either limit
+flushes a database batch; the byte limit flushes the largest shard buffer first.
+One oversized record can exceed the budget while it is decoded, but is flushed
+immediately. JSONL readers in the router and extractor also yield one record at
+a time. Ready input folders must remain unchanged during the two passes.
+
+Discovery deduplication and URL normalization run within each flushed batch.
+Duplicates in later batches use the existing database UPSERT, preserving additive
+inlink counts and parent/priority conflict handling. This can increase database
+work and audit-event counts compared with folder-wide deduplication. Statistics
+still accumulate per domain until the folder finishes, so the byte budget bounds
+record buffers rather than the entire process RSS.
+
 Responsibilities:
 
 - `status="new"` records: insert new URL candidates into `url_state_current_{shard}` and history.

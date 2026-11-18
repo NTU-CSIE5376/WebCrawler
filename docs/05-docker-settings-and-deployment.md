@@ -23,6 +23,28 @@ Crawler-specific networking:
 
 - DNS explicitly set to `8.8.8.8` and `1.1.1.1`.
 
+All Compose services have hard memory caps. `memswap_limit` equals `mem_limit`,
+so these containers do not use host swap. Defaults target the 755 GiB production
+host; set the corresponding environment variables for smaller machines.
+
+| Service | Default cap | Override |
+| --- | --- | --- |
+| postgres | 128 GiB | `POSTGRES_MEMORY_LIMIT` |
+| scheduler_control | 48 GiB | `SCHEDULER_CONTROL_MEMORY_LIMIT` |
+| api | 8 GiB | `API_MEMORY_LIMIT` |
+| scheduler_ingest | 64 GiB | `SCHEDULER_INGEST_MEMORY_LIMIT` |
+| crawler | 64 GiB | `CRAWLER_MEMORY_LIMIT` |
+| sitemap_patroller | 8 GiB | `SITEMAP_PATROLLER_MEMORY_LIMIT` |
+| loki | 8 GiB | `LOKI_MEMORY_LIMIT` |
+| grafana | 2 GiB | `GRAFANA_MEMORY_LIMIT` |
+
+The defaults total 330 GiB. Include databases and other Compose projects on the
+same host when budgeting memory; container caps must leave room for the host.
+Running containers need `docker update --memory ... --memory-swap ...` or
+recreation to apply limits. A cap can cause container OOM kills; it contains
+memory exhaustion rather than fixing unbounded allocation. Configure database
+and JVM internal memory budgets below their container cap as well.
+
 ## 5.2 Dockerfiles
 
 ### `containers/scheduler_control/Dockerfile`
