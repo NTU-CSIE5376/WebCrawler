@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 import time
 from dataclasses import dataclass
 
@@ -17,6 +18,9 @@ logger = logging.getLogger("golden_discovery_ranker_v1")
 # ranker must not overwrite. Both inject scripts stamp url_score_updated_at, so
 # without this the steering TTL refresh would rescore them after a few days.
 MANUAL_PRIORITY_EXCLUDED = "(url_score IS NULL OR url_score <= 1.0)"
+
+# Bound URL exclusions retained while refilling a batch under contention.
+CLAIM_SCAN_BUFFER_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -89,81 +93,99 @@ class GoldenDiscoveryRankerService:
             for i in range(self.cfg.total_shards)
         ]
 
+    def _claim_steering_batch(self, cur, shard_id: int) -> list:
+        """Find candidates without locks, then claim only this batch's rows.
+
+        Keep the indexed per-domain candidate search. Its global Sort may read
+        many candidates, so FOR UPDATE must run in a separate, bounded query.
+        Refill past skipped/changed candidates, including beyond a domain's
+        first page. Scoring and the update remain in the claiming transaction.
+        """
+        table = self._table(shard_id)
+        gates = f"""
+            u.should_crawl = TRUE
+            AND u.first_seen < NOW() - make_interval(days => %s)
+            AND {MANUAL_PRIORITY_EXCLUDED}
+        """
+        gate_params = [self.cfg.min_age_days]
+        if self.cfg.rescore_ttl_days > 0:
+            gates += """ AND (u.url_score_updated_at IS NULL
+                OR u.url_score_updated_at < NOW() - make_interval(days => %s))"""
+            gate_params.append(self.cfg.rescore_ttl_days)
+        else:
+            gates += " AND u.url_score_updated_at IS NULL"
+
+        fetched = []
+        examined = set()
+        examined_url_bytes = 0
+        while len(fetched) < self.cfg.batch_size:
+            remaining = self.cfg.batch_size - len(fetched)
+            cur.execute(
+                f"""
+                SELECT u.url
+                FROM domain_state d
+                CROSS JOIN LATERAL (
+                    SELECT u.url, u.url_score_updated_at
+                    FROM {table} u
+                    WHERE u.domain_id = d.domain_id AND {gates}
+                      AND NOT (u.url = ANY(%s::text[]))
+                    ORDER BY u.url_score_updated_at ASC NULLS FIRST
+                    LIMIT %s
+                ) u
+                WHERE d.shard_id = %s AND d.domain_score > 0
+                ORDER BY d.domain_score DESC,
+                         u.url_score_updated_at ASC NULLS FIRST
+                LIMIT %s
+                """,
+                tuple(gate_params + [list(examined), remaining, shard_id, remaining]),
+            )
+            candidates = [row[0] for row in cur.fetchall() if row[0] not in examined]
+            if not candidates:
+                break
+            for url in candidates:
+                examined.add(url)
+                examined_url_bytes += sys.getsizeof(url)
+
+            # Recheck all gates on the live base rows, and return their current
+            # feature values. Concurrent workers skip each other's claims;
+            # rows changed between discovery and locking are not blindly scored.
+            cur.execute(
+                f"""
+                SELECT u.url, u.inlink_count_approx, u.inlink_count_external, u.anchor_text
+                FROM {table} u
+                JOIN domain_state d ON d.domain_id = u.domain_id
+                WHERE {gates}
+                  AND u.url = ANY(%s::text[])
+                  AND d.shard_id = %s AND d.domain_score > 0
+                ORDER BY d.domain_score DESC,
+                         u.url_score_updated_at ASC NULLS FIRST
+                LIMIT %s
+                FOR UPDATE OF u SKIP LOCKED
+                """,
+                tuple(gate_params + [candidates, shard_id, remaining]),
+            )
+            fetched.extend(cur.fetchall())
+            if (
+                len(fetched) < self.cfg.batch_size
+                and examined_url_bytes + sys.getsizeof(examined) >= CLAIM_SCAN_BUFFER_BYTES
+            ):
+                logger.warning(
+                    "golden_discovery_ranker_v1.claim_scan_budget",
+                    extra={"event": "golden_discovery_ranker_v1.claim_scan_budget",
+                           "shard_id": shard_id, "examined_urls": len(examined),
+                           "claimed_urls": len(fetched)},
+                )
+                break
+        return fetched
+
     def _score_batch(self, shard_id: int) -> int:
+        started = time.monotonic()
         table = self._table(shard_id)
 
         with self.Session.begin() as sess:
             with sess.connection().connection.cursor() as cur:
                 if self.cfg.domain_priority_steering_enabled:
-                    # Pick due URLs from golden-tier domains, as a LATERAL
-                    # top-N-per-domain.  WHY this shape and not a flat
-                    # `JOIN domain_state ... ORDER BY d.domain_score DESC,
-                    # u.url_score_updated_at`: the flat form forces a blocking
-                    # Sort, because the lead ORDER BY key (domain_score) lives
-                    # on domain_state and has only ~3 distinct values, so within
-                    # a tier url_score_updated_at must be merged ACROSS all
-                    # domains — no index can produce that.  The Sort blocks the
-                    # LIMIT, so the planner materialises every matching row (in
-                    # the backlog regime ~all rows) via a Seq Scan.  Measured on
-                    # a 64M-row shard the flat plan cost ~11.5M and ignored the
-                    # rescore index entirely.
-                    #
-                    # The LATERAL drives from domain_state (golden domains for
-                    # this shard, via idx_domain_state_shard_score, ordered
-                    # domain_score DESC) and for each domain does a plain ordered
-                    # index scan on idx_..._golden_discovery_v2_rescore
-                    # (domain_id, url_score_updated_at) to take its stalest due
-                    # URLs.  No big scan; the only Sort is a top-N heapsort over
-                    # the few-thousand rows actually pulled.
-                    #
-                    # `d.shard_id = %s` is required AND correct: every domain in
-                    # url_state_current_{shard} has domain_state.shard_id=shard,
-                    # and the equality lets the shard_score index yield
-                    # domain_score DESC order (its lead column is shard_id).
-                    #
-                    # Gates (unchanged): min_age skips URLs younger than
-                    # min_age_days (they keep the v1 inline score; 0 = no-op);
-                    # TTL re-picks never-scored OR rows older than
-                    # rescore_ttl_days. rescore_ttl_days<=0 = write-once (drop
-                    # the OR branch, not `< NOW() - interval '0'` which would
-                    # match every already-scored row).
-                    params: list = [self.cfg.min_age_days]
-                    if self.cfg.rescore_ttl_days > 0:
-                        ttl_clause = (
-                            "(u.url_score_updated_at IS NULL "
-                            "OR u.url_score_updated_at < NOW() - make_interval(days => %s))"
-                        )
-                        params.append(self.cfg.rescore_ttl_days)
-                    else:
-                        ttl_clause = "u.url_score_updated_at IS NULL"
-                    # %s order matches text order: min_age, [ttl], inner LIMIT,
-                    # shard_id, outer LIMIT.
-                    params.extend([self.cfg.batch_size, shard_id, self.cfg.batch_size])
-                    cur.execute(
-                        f"""
-                        SELECT u.url, u.inlink_count_approx, u.inlink_count_external, u.anchor_text
-                        FROM domain_state d
-                        CROSS JOIN LATERAL (
-                            SELECT url, inlink_count_approx, inlink_count_external,
-                                   anchor_text, url_score_updated_at
-                            FROM {table} u
-                            WHERE u.domain_id = d.domain_id
-                              AND u.should_crawl = TRUE
-                              AND u.first_seen < NOW() - make_interval(days => %s)
-                              AND {ttl_clause}
-                              AND {MANUAL_PRIORITY_EXCLUDED}
-                            ORDER BY u.url_score_updated_at ASC NULLS FIRST
-                            LIMIT %s
-                            FOR UPDATE OF u SKIP LOCKED
-                        ) u
-                        WHERE d.shard_id = %s
-                          AND d.domain_score > 0
-                        ORDER BY d.domain_score DESC,
-                                 u.url_score_updated_at ASC NULLS FIRST
-                        LIMIT %s
-                        """,
-                        tuple(params),
-                    )
+                    fetched = self._claim_steering_batch(cur, shard_id)
                 else:
                     cur.execute(
                         f"""
@@ -178,7 +200,7 @@ class GoldenDiscoveryRankerService:
                         """,
                         (self.cfg.batch_size,),
                     )
-                fetched = cur.fetchall()
+                    fetched = cur.fetchall()
                 if not fetched:
                     return 0
                 urls = [row[0] for row in fetched]
@@ -226,6 +248,8 @@ class GoldenDiscoveryRankerService:
                 "worker_id": self.cfg.worker_id,
                 "shard_id": shard_id,
                 "scored_urls": scored,
+                "duration_s": round(time.monotonic() - started, 3),
+                "query_variant": "bounded_claim_v1",
             },
         )
         return scored

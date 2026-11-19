@@ -74,6 +74,16 @@ Runtime behavior of `golden_discovery_ranker_v1`:
 3. Scores those URLs with the artifact heads and writes the combined ranker score into the existing `url_score`.
 4. Sets `url_score_updated_at=NOW()` as the only completion marker; it does not append experiment logs or score-history rows.
 
+With domain-priority steering enabled, the ranker discovers candidate URLs
+without locking the per-domain candidates consumed by the global sort. It then
+claims at most the remaining batch size with `FOR UPDATE OF u SKIP LOCKED`,
+rechecks eligibility, and reads current feature values. Locked or changed URLs
+are excluded from subsequent candidate pages so concurrent workers can refill
+their batches. Age, TTL, manual-priority, and domain-tier gates apply to both
+discovery and claiming. Claims remain held through scoring and the score update.
+The retained exclusion URLs have a 64 MiB estimated memory budget; reaching it
+returns the partial batch and logs `golden_discovery_ranker_v1.claim_scan_budget`.
+
 ## 2.3 `crawler` Container
 
 Runs `supervisord` with:
