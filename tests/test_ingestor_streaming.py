@@ -146,6 +146,46 @@ def test_single_oversized_record_is_processed_immediately(tmp_path):
     assert len(db.process_batch.call_args.args[0]) == 1
 
 
+def test_larger_discovery_batches_preserve_result_batch_size_and_order(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(service, "BATCH_SIZE", 2)
+    results = [{"url": f"https://example.test/result/{i}", "status": "ok", "shard_id": 1} for i in range(5)]
+    links = [link(f"https://example.test/link/{i}") for i in range(13)]
+    write_records(tmp_path / "records.jsonl", [*results, *links])
+    db = MagicMock()
+    db.aggregate_links.side_effect = IngestDB.aggregate_links
+    batches = []
+    db.process_batch.side_effect = lambda batch: batches.append(batch) or []
+    with caplog.at_level("INFO", logger="ingestor"):
+        service.IngestService(0, db, MagicMock(), discovery_batch_size=4).process_folder(tmp_path)
+    assert [len(b) for b in batches if b[0]["status"] == "new"] == [4, 4, 4, 1]
+    assert [len(b) for b in batches if b[0]["status"] != "new"] == [2, 2, 1]
+    assert [r for b in batches[4:] for r in b] == results
+    logged = [r for r in caplog.records if r.msg == "ingest.batch_done"]
+    assert [(r.batch_kind, r.input_records, r.records) for r in logged] == [
+        ("discovery", 4, 4), ("discovery", 4, 4), ("discovery", 4, 4), ("discovery", 1, 1),
+        ("result", 2, 2), ("result", 2, 2), ("result", 1, 1),
+    ]
+    assert all(r.duration_s >= 0 for r in logged)
+
+
+def test_byte_budget_still_flushes_before_larger_discovery_limit(tmp_path):
+    write_records(tmp_path / "records.jsonl", [
+        link(f"https://example.test/{i}", anchor_text="x" * 10000) for i in range(5)
+    ])
+    db = MagicMock()
+    db.aggregate_links.side_effect = IngestDB.aggregate_links
+    batches = []
+    db.process_batch.side_effect = lambda batch: batches.append(batch) or []
+    service.IngestService(0, db, MagicMock(), max_buffer_bytes=25000, discovery_batch_size=4000).process_folder(tmp_path)
+    assert [len(b) for b in batches] == [3, 2]
+
+
+@pytest.mark.parametrize("size", [0, -1])
+def test_invalid_discovery_batch_size_is_rejected(size):
+    with pytest.raises(ValueError, match="discovery_batch_size must be positive"):
+        service.IngestService(0, MagicMock(), MagicMock(), discovery_batch_size=size)
+
+
 @pytest.mark.parametrize("records", [[], [link("https://example.test/x/x/x/")]])
 def test_empty_or_entirely_filtered_input_never_writes_empty_batch(tmp_path, records):
     write_records(tmp_path / "records.jsonl", records)
