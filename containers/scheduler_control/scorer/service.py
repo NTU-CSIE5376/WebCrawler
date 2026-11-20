@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import logging
-import sys
 import time
 from dataclasses import dataclass
 
+from psycopg2.errors import QueryCanceled
 from psycopg2.extras import execute_values
 from sqlalchemy.orm import sessionmaker
 
@@ -18,9 +18,6 @@ logger = logging.getLogger("golden_discovery_ranker_v1")
 # ranker must not overwrite. Both inject scripts stamp url_score_updated_at, so
 # without this the steering TTL refresh would rescore them after a few days.
 MANUAL_PRIORITY_EXCLUDED = "(url_score IS NULL OR url_score <= 1.0)"
-
-# Bound URL exclusions retained while refilling a batch under contention.
-CLAIM_SCAN_BUFFER_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -49,6 +46,8 @@ class GoldenDiscoveryRankerConfig:
     #     inline score until they age in. 0 disables the gate.
     rescore_ttl_days: int = 5
     min_age_days: int = 3
+    # Per SQL statement, local to the scoring transaction.
+    statement_timeout_sec: int = 30
 
 
 class GoldenDiscoveryRankerService:
@@ -58,6 +57,8 @@ class GoldenDiscoveryRankerService:
         Session: sessionmaker,
         scorer: GoldenDiscoveryRuntimeScorer,
     ):
+        if cfg.statement_timeout_sec <= 0:
+            raise ValueError("statement_timeout_sec must be positive")
         self.cfg = cfg
         self.Session = Session
         self.scorer = scorer
@@ -98,8 +99,9 @@ class GoldenDiscoveryRankerService:
 
         Keep the indexed per-domain candidate search. Its global Sort may read
         many candidates, so FOR UPDATE must run in a separate, bounded query.
-        Refill past skipped/changed candidates, including beyond a domain's
-        first page. Scoring and the update remain in the claiming transaction.
+        Claim once and score even a partial batch: never run another candidate
+        search while retaining row locks. Scoring and the update remain in the
+        claiming transaction.
         """
         table = self._table(shard_id)
         gates = f"""
@@ -115,68 +117,47 @@ class GoldenDiscoveryRankerService:
         else:
             gates += " AND u.url_score_updated_at IS NULL"
 
-        fetched = []
-        examined = set()
-        examined_url_bytes = 0
-        while len(fetched) < self.cfg.batch_size:
-            remaining = self.cfg.batch_size - len(fetched)
-            cur.execute(
-                f"""
-                SELECT u.url
-                FROM domain_state d
-                CROSS JOIN LATERAL (
-                    SELECT u.url, u.url_score_updated_at
-                    FROM {table} u
-                    WHERE u.domain_id = d.domain_id AND {gates}
-                      AND NOT (u.url = ANY(%s::text[]))
-                    ORDER BY u.url_score_updated_at ASC NULLS FIRST
-                    LIMIT %s
-                ) u
-                WHERE d.shard_id = %s AND d.domain_score > 0
-                ORDER BY d.domain_score DESC,
-                         u.url_score_updated_at ASC NULLS FIRST
-                LIMIT %s
-                """,
-                tuple(gate_params + [list(examined), remaining, shard_id, remaining]),
-            )
-            candidates = [row[0] for row in cur.fetchall() if row[0] not in examined]
-            if not candidates:
-                break
-            for url in candidates:
-                examined.add(url)
-                examined_url_bytes += sys.getsizeof(url)
-
-            # Recheck all gates on the live base rows, and return their current
-            # feature values. Concurrent workers skip each other's claims;
-            # rows changed between discovery and locking are not blindly scored.
-            cur.execute(
-                f"""
-                SELECT u.url, u.inlink_count_approx, u.inlink_count_external, u.anchor_text
+        cur.execute(
+            f"""
+            SELECT u.url
+            FROM domain_state d
+            CROSS JOIN LATERAL (
+                SELECT u.url, u.url_score_updated_at
                 FROM {table} u
-                JOIN domain_state d ON d.domain_id = u.domain_id
-                WHERE {gates}
-                  AND u.url = ANY(%s::text[])
-                  AND d.shard_id = %s AND d.domain_score > 0
-                ORDER BY d.domain_score DESC,
-                         u.url_score_updated_at ASC NULLS FIRST
+                WHERE u.domain_id = d.domain_id AND {gates}
+                ORDER BY u.url_score_updated_at ASC NULLS FIRST
                 LIMIT %s
-                FOR UPDATE OF u SKIP LOCKED
-                """,
-                tuple(gate_params + [candidates, shard_id, remaining]),
-            )
-            fetched.extend(cur.fetchall())
-            if (
-                len(fetched) < self.cfg.batch_size
-                and examined_url_bytes + sys.getsizeof(examined) >= CLAIM_SCAN_BUFFER_BYTES
-            ):
-                logger.warning(
-                    "golden_discovery_ranker_v1.claim_scan_budget",
-                    extra={"event": "golden_discovery_ranker_v1.claim_scan_budget",
-                           "shard_id": shard_id, "examined_urls": len(examined),
-                           "claimed_urls": len(fetched)},
-                )
-                break
-        return fetched
+            ) u
+            WHERE d.shard_id = %s AND d.domain_score > 0
+            ORDER BY d.domain_score DESC,
+                     u.url_score_updated_at ASC NULLS FIRST
+            LIMIT %s
+            """,
+            tuple(gate_params + [self.cfg.batch_size, shard_id, self.cfg.batch_size]),
+        )
+        candidates = [row[0] for row in cur.fetchall()]
+        if not candidates:
+            return []
+
+        # Recheck all gates on the live base rows, and return their current
+        # feature values. Concurrent workers skip each other's claims;
+        # rows changed between discovery and locking are not blindly scored.
+        cur.execute(
+            f"""
+            SELECT u.url, u.inlink_count_approx, u.inlink_count_external, u.anchor_text
+            FROM {table} u
+            JOIN domain_state d ON d.domain_id = u.domain_id
+            WHERE {gates}
+              AND u.url = ANY(%s::text[])
+              AND d.shard_id = %s AND d.domain_score > 0
+            ORDER BY d.domain_score DESC,
+                     u.url_score_updated_at ASC NULLS FIRST
+            LIMIT %s
+            FOR UPDATE OF u SKIP LOCKED
+            """,
+            tuple(gate_params + [candidates, shard_id, self.cfg.batch_size]),
+        )
+        return cur.fetchall()
 
     def _score_batch(self, shard_id: int) -> int:
         started = time.monotonic()
@@ -184,6 +165,10 @@ class GoldenDiscoveryRankerService:
 
         with self.Session.begin() as sess:
             with sess.connection().connection.cursor() as cur:
+                cur.execute(
+                    "SELECT set_config('statement_timeout', %s, true)",
+                    (f"{self.cfg.statement_timeout_sec}s",),
+                )
                 if self.cfg.domain_priority_steering_enabled:
                     fetched = self._claim_steering_batch(cur, shard_id)
                 else:
@@ -249,7 +234,7 @@ class GoldenDiscoveryRankerService:
                 "shard_id": shard_id,
                 "scored_urls": scored,
                 "duration_s": round(time.monotonic() - started, 3),
-                "query_variant": "bounded_claim_v1",
+                "query_variant": "bounded_claim_once_v2",
             },
         )
         return scored
@@ -260,7 +245,17 @@ class GoldenDiscoveryRankerService:
         for shard_id in self._shard_ids():
             batches = 0
             while batches < self.cfg.max_batches_per_shard:
-                count = self._score_batch(shard_id)
+                try:
+                    count = self._score_batch(shard_id)
+                except QueryCanceled:
+                    # _score_batch has rolled back before visiting another shard.
+                    logger.warning(
+                        "golden_discovery_ranker_v1.statement_timeout",
+                        extra={"event": "golden_discovery_ranker_v1.statement_timeout",
+                               "worker_id": self.cfg.worker_id, "shard_id": shard_id,
+                               "statement_timeout_sec": self.cfg.statement_timeout_sec},
+                    )
+                    break
                 if count == 0:
                     break
                 batches += 1

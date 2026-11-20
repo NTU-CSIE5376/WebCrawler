@@ -92,6 +92,8 @@ golden_discovery_ranker_v1:
   batch_size: 1000
   scan_interval_sec: 60
   max_batches_per_shard: 4
+  # Per SQL statement; a timeout rolls back the batch and advances to the next shard.
+  statement_timeout_sec: 30
   # Domain-priority steering: when on, the scorer only picks unscored URLs
   # whose domain has `domain_state.domain_score > 0` (i.e. golden-tagged),
   # ordered domain_score DESC then first_seen ASC. When off, the scorer

@@ -7,6 +7,7 @@ import threading
 import time
 import unittest
 import uuid
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 
 import psycopg2
@@ -145,18 +146,22 @@ class RankerClaimDatabaseTest(unittest.TestCase):
             cur.execute("SELECT url FROM url_state_current_000 WHERE url=%s FOR UPDATE NOWAIT", (self.url(2,0),))
             self.assertEqual(cur.fetchone()[0],self.url(2,0))
 
-    def test_workers_fill_disjoint_batches_beyond_the_same_domain_first_page(self):
+    def test_workers_return_disjoint_partial_batches_without_refilling(self):
         a,b = self.connection(),self.connection()
-        first,second = self.claim(a),self.claim(b)
-        self.assertEqual([r[0] for r in first],[self.url(1,i) for i in range(3)])
-        self.assertEqual([r[0] for r in second],[self.url(1,i) for i in range(3,6)])
+        first,second = self.claim(a,1),self.claim(b)
+        self.assertEqual([r[0] for r in first],[self.url(1,0)])
+        self.assertEqual([r[0] for r in second],[self.url(1,i) for i in range(1,3)])
         self.assertFalse({r[0] for r in first}&{r[0] for r in second})
 
-    def test_refills_past_multiple_fully_locked_pages(self):
+    def test_fully_locked_candidates_return_empty_and_can_be_revisited(self):
         blocker,worker = self.connection(),self.connection()
         with blocker.cursor() as cur:
             cur.execute("SELECT url FROM url_state_current_000 WHERE url=ANY(%s) FOR UPDATE", ([self.url(1,i) for i in range(6)],))
-        self.assertEqual([r[0] for r in self.claim(worker)],[self.url(1,i) for i in range(6,9)])
+        self.assertEqual(self.claim(worker),[])
+        if self.yugabyte:
+            self.assertEqual(self.explicit_lock_count(worker),0)
+        blocker.rollback()
+        self.assertEqual([r[0] for r in self.claim(worker)],[self.url(1,i) for i in range(3)])
 
     def test_age_ttl_pending_and_manual_priority_guards(self):
         with self.admin.cursor() as cur:
@@ -192,7 +197,7 @@ class RankerClaimDatabaseTest(unittest.TestCase):
                             cursor.execute(query,params)
                         def fetchall(self): return cursor.fetchall()
                     rows=self.ranker()._claim_steering_batch(RaceCursor(),0)
-                self.assertEqual([r[0] for r in rows],[self.url(1,i) for i in range(1,4)])
+                self.assertEqual([r[0] for r in rows],[self.url(1,i) for i in range(1,3)])
                 conn.rollback()
 
     def test_changes_during_claim_do_not_retain_discarded_row_locks(self):
@@ -226,9 +231,9 @@ class RankerClaimDatabaseTest(unittest.TestCase):
                 def fetchall(self): return cursor.fetchall()
             rows=self.ranker()._claim_steering_batch(RaceCursor(),0)
         self.assertEqual(errors,[])
-        self.assertEqual([r[0] for r in rows],[self.url(1,i) for i in range(1,4)])
+        self.assertEqual([r[0] for r in rows],[self.url(1,i) for i in range(1,3)])
         if self.yugabyte:
-            self.assertEqual(self.explicit_lock_count(conn),3)
+            self.assertEqual(self.explicit_lock_count(conn),2)
         with self.connection().cursor() as probe:
             probe.execute("SELECT url FROM url_state_current_000 WHERE url=%s FOR UPDATE NOWAIT",(self.url(1,0),))
             self.assertEqual(probe.fetchone()[0],self.url(1,0))
@@ -246,6 +251,62 @@ class RankerClaimDatabaseTest(unittest.TestCase):
             with self.admin.cursor() as cur:
                 cur.execute("SELECT count(*) FROM url_state_current_000 WHERE url_score=.4")
                 self.assertEqual(cur.fetchone()[0],3)
+        finally:
+            engine.dispose()
+
+    def test_partial_scoring_batch_commits_and_releases_its_locks(self):
+        owner=self
+        scored=[]
+        class Scorer:
+            def score_many_rows(self,rows):
+                scored.append([r["url"] for r in rows])
+                return [.4]*len(rows)
+        blocker=self.connection()
+        with blocker.cursor() as cur:
+            cur.execute("SELECT url FROM url_state_current_000 WHERE url=%s FOR UPDATE",(self.url(1,0),))
+        engine=create_engine(self.dsn.replace("postgresql://","postgresql+psycopg2://",1),
+            connect_args={"options":f"-c search_path={self.schema} -c statement_timeout=30000"})
+        try:
+            svc=self.ranker();svc.Session=sessionmaker(bind=engine);svc.scorer=Scorer()
+            self.assertEqual(svc._score_batch(0),2)
+            self.assertEqual(scored,[[owner.url(1,i) for i in (1,2)]])
+            with self.admin.cursor() as cur:
+                cur.execute("SELECT url FROM url_state_current_000 WHERE url_score=.4 ORDER BY url")
+                self.assertEqual([r[0] for r in cur.fetchall()],scored[0])
+            probe=self.connection()
+            with probe.cursor() as cur:
+                cur.execute("SELECT url FROM url_state_current_000 WHERE url=ANY(%s) FOR UPDATE NOWAIT",(scored[0],))
+                self.assertEqual(len(cur.fetchall()),2)
+            probe.rollback();blocker.rollback()
+            self.assertEqual(svc._score_batch(0),3)
+            self.assertEqual(scored[1],[owner.url(1,i) for i in (0,3,4)])
+        finally:
+            engine.dispose()
+
+    def test_statement_timeout_rolls_back_and_releases_claims(self):
+        class Scorer:
+            def score_many(self,urls): return [.4]*len(urls)
+        engine=create_engine(self.dsn.replace("postgresql://","postgresql+psycopg2://",1),
+            connect_args={"options":f"-c search_path={self.schema} -c statement_timeout=30000"},
+            pool_size=1,max_overflow=0)
+        try:
+            svc=self.ranker(statement_timeout_sec=1);svc.Session=sessionmaker(bind=engine);svc.scorer=Scorer()
+            def stalled_update(cur,*args,**kwargs):
+                cur.execute("SHOW statement_timeout")
+                self.assertEqual(cur.fetchone()[0],"1s")
+                cur.execute("SELECT pg_sleep(2)")
+            with patch("containers.scheduler_control.scorer.service.execute_values",stalled_update):
+                with self.assertRaises(psycopg2.errors.QueryCanceled):
+                    svc._score_batch(0)
+            with self.admin.cursor() as cur:
+                cur.execute("SELECT count(*) FROM url_state_current_000 WHERE url_score=.4")
+                self.assertEqual(cur.fetchone()[0],0)
+            with self.connection().cursor() as cur:
+                cur.execute("SELECT url FROM url_state_current_000 WHERE url=ANY(%s) FOR UPDATE NOWAIT",([self.url(1,i) for i in range(3)],))
+                self.assertEqual(len(cur.fetchall()),3)
+            # SET LOCAL must not leak into another transaction on the pooled connection.
+            with engine.connect() as conn:
+                self.assertEqual(conn.exec_driver_sql("SHOW statement_timeout").scalar(),"30s")
         finally:
             engine.dispose()
 

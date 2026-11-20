@@ -27,38 +27,32 @@ class Cursor:
         return self.responses.popleft()
 
 
-def test_refills_past_locked_candidates_with_bounded_claims():
-    a, b, c = ("a", 1, 0, "anchor-a"), ("b", 2, 1, "anchor-b"), ("c", 3, 0, None)
-    cur = Cursor([
-        [("locked",), ("a",), ("b",)], [a, b],
-        [("c",)], [c],
-    ])
-    assert ranker()._claim_steering_batch(cur, 7) == [a, b, c]
-    assert len(cur.executed) == 4
-    first, claim, refill, second_claim = cur.executed
-    assert "FOR UPDATE" not in first[0]
+def test_partial_claim_returns_without_searching_again_while_holding_locks():
+    a, b = ("a", 1, 0, "anchor-a"), ("b", 2, 1, "anchor-b")
+    cur = Cursor([[("locked",), ("a",), ("b",)], [a, b]])
+    assert ranker()._claim_steering_batch(cur, 7) == [a, b]
+    assert len(cur.executed) == 2
+    discovery, claim = cur.executed
+    assert "FOR UPDATE" not in discovery[0]
     assert "FOR UPDATE OF u SKIP LOCKED" in claim[0]
-    assert claim[1][-1] == 3
-    assert set(refill[1][2]) == {"locked", "a", "b"}
-    assert refill[1][-1] == second_claim[1][-1] == 1
+    assert discovery[1] == (3, 5, 3, 7, 3)
+    assert claim[1] == (3, 5, ["locked", "a", "b"], 7, 3)
 
 
-def test_refills_even_when_whole_first_page_is_locked():
-    rows = [("c", 1, 0, None), ("d", 1, 0, None)]
-    cur = Cursor([[("a",), ("b",)], [], [("c",), ("d",)], rows])
-    assert ranker(2)._claim_steering_batch(cur, 0) == rows
-    assert set(cur.executed[2][1][2]) == {"a", "b"}
+def test_fully_locked_page_returns_empty_without_refilling():
+    cur = Cursor([[("a",), ("b",)], []])
+    assert ranker(2)._claim_steering_batch(cur, 0) == []
+    assert len(cur.executed) == 2
 
 
-def test_empty_and_exhausted_pools_return_only_claimed_rows():
+def test_empty_candidate_pool_does_not_issue_a_claim():
     cur = Cursor([[]])
     assert ranker()._claim_steering_batch(cur, 0) == []
-    cur = Cursor([[("a",)], [("a", 2, 0, None)], []])
-    assert ranker()._claim_steering_batch(cur, 0) == [("a", 2, 0, None)]
+    assert len(cur.executed) == 1
 
 
 def test_rechecks_all_eligibility_rules_when_claiming():
-    cur = Cursor([[("changed",)], [], []])
+    cur = Cursor([[("changed",)], []])
     assert ranker(min_age_days=7, rescore_ttl_days=30)._claim_steering_batch(cur, 5) == []
     query, params = cur.executed[1]
     for rule in ("u.should_crawl = TRUE", "u.first_seen < NOW()", "u.url_score_updated_at IS NULL", "u.url_score_updated_at < NOW()", "url_score <= 1.0", "d.domain_score > 0", "d.shard_id = %s"):
@@ -67,7 +61,7 @@ def test_rechecks_all_eligibility_rules_when_claiming():
 
 
 def test_write_once_rule_applies_to_claim_as_well_as_discovery():
-    cur = Cursor([[("a",)], [], []])
+    cur = Cursor([[("a",)], []])
     ranker(rescore_ttl_days=0)._claim_steering_batch(cur, 0)
     query, params = cur.executed[1]
     assert "u.url_score_updated_at IS NULL" in query
@@ -75,9 +69,40 @@ def test_write_once_rule_applies_to_claim_as_well_as_discovery():
     assert params == (3, ["a"], 0, 3)
 
 
-def test_contention_scan_memory_is_bounded(monkeypatch, caplog):
-    monkeypatch.setattr(service, "CLAIM_SCAN_BUFFER_BYTES", 1)
-    cur = Cursor([[("locked",)], []])
-    assert ranker()._claim_steering_batch(cur, 0) == []
-    assert len(cur.executed) == 2
-    assert "claim_scan_budget" in caplog.text
+def test_sql_timeout_skips_shard_instead_of_restarting_the_same_pass(monkeypatch, caplog):
+    svc = ranker()
+    monkeypatch.setattr(svc, "_shard_ids", lambda: [7, 8])
+    visited = []
+
+    def score(shard):
+        visited.append(shard)
+        if shard == 7:
+            raise service.QueryCanceled("statement timeout")
+        return 2
+
+    monkeypatch.setattr(svc, "_score_batch", score)
+    assert svc.run_once() == {"scored_urls": 2, "scored_batches": 1}
+    assert visited == [7, 8]
+    assert "statement_timeout" in caplog.text
+
+
+def test_empty_claim_advances_to_next_shard(monkeypatch):
+    svc = ranker()
+    monkeypatch.setattr(svc, "_shard_ids", lambda: [7, 8])
+    visited = []
+
+    def score(shard):
+        visited.append(shard)
+        return 0 if shard == 7 else 2
+
+    monkeypatch.setattr(svc, "_score_batch", score)
+    assert svc.run_once() == {"scored_urls": 2, "scored_batches": 1}
+    assert visited == [7, 8]
+
+
+def test_statement_timeout_cannot_be_disabled():
+    import pytest
+
+    for value in (0, -1):
+        with pytest.raises(ValueError, match="statement_timeout_sec"):
+            ranker(statement_timeout_sec=value)

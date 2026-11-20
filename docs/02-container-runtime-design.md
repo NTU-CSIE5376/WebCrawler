@@ -76,13 +76,18 @@ Runtime behavior of `golden_discovery_ranker_v1`:
 
 With domain-priority steering enabled, the ranker discovers candidate URLs
 without locking the per-domain candidates consumed by the global sort. It then
-claims at most the remaining batch size with `FOR UPDATE OF u SKIP LOCKED`,
-rechecks eligibility, and reads current feature values. Locked or changed URLs
-are excluded from subsequent candidate pages so concurrent workers can refill
-their batches. Age, TTL, manual-priority, and domain-tier gates apply to both
-discovery and claiming. Claims remain held through scoring and the score update.
-The retained exclusion URLs have a 64 MiB estimated memory budget; reaching it
-returns the partial batch and logs `golden_discovery_ranker_v1.claim_scan_budget`.
+claims at most `batch_size` rows once with `FOR UPDATE OF u SKIP LOCKED`,
+rechecks eligibility, and reads current feature values. A partial batch is scored,
+updated, and committed immediately; the ranker never refills it by searching again
+while retaining row locks. An empty claim advances to the next shard. Age, TTL,
+manual-priority, and domain-tier gates apply to both discovery and claiming.
+Claims remain held through scoring and the score update. Each SQL statement in
+the scoring transaction has a 30-second timeout, configured by
+`golden_discovery_ranker_v1.statement_timeout_sec` or
+`GOLDEN_DISCOVERY_RANKER_V1_STATEMENT_TIMEOUT_SEC`. This is a per-statement limit,
+not a deadline for Python model inference or the whole transaction. A canceled
+statement rolls back the batch, releases its locks, logs
+`golden_discovery_ranker_v1.statement_timeout`, and advances to the next shard.
 
 ## 2.3 `crawler` Container
 

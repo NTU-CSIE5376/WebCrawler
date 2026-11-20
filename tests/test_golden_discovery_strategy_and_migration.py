@@ -432,7 +432,7 @@ class GoldenDiscoveryRankerServiceTest(unittest.TestCase):
             ["https://example.com/a", "https://example.com/b"],
         )
 
-        select_sql, select_params = cursor.executed[0]
+        select_sql, select_params = cursor.executed[1]
         self.assertIn("FROM url_state_current_005", select_sql)
         self.assertIn("url_score_updated_at IS NULL", select_sql)
         self.assertIn("ORDER BY first_seen ASC NULLS LAST", select_sql)
@@ -475,7 +475,7 @@ class GoldenDiscoveryRankerSteeringTest(unittest.TestCase):
         with patch.object(scorer_service, "execute_values", lambda *a, **kw: None):
             service._score_batch(7)
 
-        select_sql, select_params = cursor.executed[0]
+        select_sql, select_params = cursor.executed[1]
         self.assertIn("FROM url_state_current_007", select_sql)
         self.assertIn("ORDER BY first_seen ASC NULLS LAST", select_sql)
         self.assertNotIn("domain_state", select_sql)
@@ -490,7 +490,7 @@ class GoldenDiscoveryRankerSteeringTest(unittest.TestCase):
         with patch.object(scorer_service, "execute_values", lambda *a, **kw: None):
             service._score_batch(7)
 
-        select_sql, select_params = cursor.executed[0]
+        select_sql, select_params = cursor.executed[1]
         # LATERAL top-N per golden domain: drive from domain_state, scan each
         # domain's due URLs via the per-domain rescore index. A flat
         # `JOIN domain_state ... ORDER BY d.domain_score, u.url_score_updated_at`
@@ -505,7 +505,7 @@ class GoldenDiscoveryRankerSteeringTest(unittest.TestCase):
         self.assertIn("d.shard_id = %s", select_sql)
         # Candidate discovery does not lock the rows consumed by the global Sort.
         self.assertNotIn("FOR UPDATE", select_sql)
-        claim_sql, claim_params = cursor.executed[1]
+        claim_sql, claim_params = cursor.executed[2]
         self.assertIn("FOR UPDATE OF u SKIP LOCKED", claim_sql)
         self.assertNotIn("LATERAL", claim_sql)
         self.assertIn("u.url = ANY(%s::text[])", claim_sql)
@@ -524,8 +524,8 @@ class GoldenDiscoveryRankerSteeringTest(unittest.TestCase):
         # Per-domain oldest-first inner order; tier-priority outer order.
         self.assertIn("ORDER BY u.url_score_updated_at ASC NULLS FIRST", select_sql)
         self.assertIn("ORDER BY d.domain_score DESC", select_sql)
-        # Also exclude candidates already examined during a concurrent claim.
-        self.assertEqual(select_params, (3, 5, [], 1000, 7, 1000))
+        # Candidate discovery uses only gates and the per-domain/global limits.
+        self.assertEqual(select_params, (3, 5, 1000, 7, 1000))
 
     def test_steering_query_uses_no_write_once_only_filter(self):
         # Guard against regressing to the v1 write-once behavior: the steering
@@ -537,7 +537,7 @@ class GoldenDiscoveryRankerSteeringTest(unittest.TestCase):
         with patch.object(scorer_service, "execute_values", lambda *a, **kw: None):
             service._score_batch(3)
 
-        select_sql, _ = cursor.executed[0]
+        select_sql, _ = cursor.executed[1]
         self.assertIn("OR u.url_score_updated_at <", select_sql)
 
     def test_steering_gate_days_are_configurable(self):
@@ -561,8 +561,8 @@ class GoldenDiscoveryRankerSteeringTest(unittest.TestCase):
         with patch.object(scorer_service, "execute_values", lambda *a, **kw: None):
             service._score_batch(1)
 
-        _, select_params = cursor.executed[0]
-        self.assertEqual(select_params, (7, 30, [], 250, 1, 250))
+        _, select_params = cursor.executed[1]
+        self.assertEqual(select_params, (7, 30, 250, 1, 250))
 
     def test_steering_ttl_zero_is_write_once(self):
         # rescore_ttl_days<=0 must be true write-once: only never-scored rows,
@@ -589,11 +589,11 @@ class GoldenDiscoveryRankerSteeringTest(unittest.TestCase):
         with patch.object(scorer_service, "execute_values", lambda *a, **kw: None):
             service._score_batch(2)
 
-        select_sql, select_params = cursor.executed[0]
+        select_sql, select_params = cursor.executed[1]
         self.assertIn("u.url_score_updated_at IS NULL", select_sql)
         self.assertNotIn("OR u.url_score_updated_at <", select_sql)
-        # TTL param dropped; excluded URLs remain before the two limits.
-        self.assertEqual(select_params, (3, [], 100, 2, 100))
+        # TTL param dropped; retain the two limits and shard gate.
+        self.assertEqual(select_params, (3, 100, 2, 100))
 
 
 class _FakeInlineRanker:
