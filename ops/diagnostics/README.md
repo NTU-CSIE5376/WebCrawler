@@ -1,0 +1,201 @@
+# Bounded Yugabyte deadlock evidence capture
+
+This opt-in operator tool records enough metadata to correlate transaction UUIDs,
+backend PIDs and query IDs when another ingestor deadlock occurs. It does not fix
+or retry application transactions. It neither restarts application/DB services
+nor changes their configuration. No production deployment is triggered by merge.
+
+The initial incident involved an ingestor crawl-result UPSERT and a concurrent
+transaction, with waits observed on a current-state table and its re-scoring
+index. Existing logs did not identify the second SQL. Do not attribute it to a
+scorer merely because the index is named `golden_discovery_v2_rescore`.
+
+## What is collected
+
+- Three persistent read-only connections, one per configured YSQL node; the
+  existing project's `psycopg2-binary==2.9.11` is sufficient.
+- Activity metadata about once per second: transaction UUID, PID, query ID,
+  client address/port, state, wait event and a server-side SQL-category hint.
+  A server-clipped SQL structure prefix stops before the first quoted value;
+  numeric literals are replaced and unsafe prefixes are omitted before the
+  RAM ring. The category is a heuristic, not proof of worker identity.
+- Conflict/lock waits from the existing ASH ring's last 12 seconds every 10
+  seconds, using its native time-window function; its sampling interval is not
+  changed. Filtering avoids filling the evidence cap with unrelated RPC work.
+- A 60-second RAM ring. Only incidents persist that ring and approximately ten
+  seconds of following samples. Normal operation writes a small status file.
+- On a new deadlock, up to four exact transaction-UUID lock lookups, at most
+  one detailed incident per minute. No periodic all-cluster `pg_locks` query.
+  Raw lock keys, URL values, SQL literals and raw SQL are not persisted.
+  UUID-specific lock snapshots retain a server-computed MD5 key fingerprint,
+  relation/tablet, lock mode and subtransaction so samples can be compared
+  without writing key values. Fingerprints are identifiers, not proof of a
+  complete lock graph; the exact-UUID session allows at most 32 locks/tablet.
+
+`yb_deadlock_log_reader.py` follows the existing PostgreSQL log directory and
+reconstructs only ERROR/DETAIL timestamps, PIDs and UUIDs. It follows newer
+PostgreSQL filenames and stops on stdin EOF or its own duration limit. It does
+not enable additional database logging. The initial operator run watches node 3,
+the current application write endpoint; changing endpoints requires updating the
+reader command. Other nodes still contribute activity/ASH snapshots.
+
+## Verified version and observation cost
+
+The interfaces were checked against the deployed **Yugabyte 2026.1.2.0**:
+`yb_backend_xid` is a UUID and `yb_lock_status` accepts `(oid, uuid)`.
+
+An ordinary `pg_stat_activity` read incurred roughly 500–680 ms locally even when
+memory columns were not selected: this version takes per-backend smaps snapshots.
+Each **diagnostic connection only** sets `yb_enable_memory_tracking=off` to omit
+that optional work, while retaining `yb_enable_pg_locks=on` for transaction UUIDs.
+No role defaults or other application sessions are modified. A five-sample
+node-3 activity probe had a 4.38 ms median (first sample 97.8 ms). These are point
+measurements, not a guarantee of zero production overhead. The bounded collector
+uses a 250 ms statement timeout and backs off on errors or samples over 100 ms.
+Its status exposes the actual sample age, latency, errors and truncation/capping.
+
+Session memory tracking must remain off for these diagnostic queries: selecting
+fewer columns or adding an outer LIMIT does not avoid that version's hidden
+snapshot cost. UUID-specific lock calls still contact TServers and are therefore
+rare, time-bounded probes on a separate connection.
+
+## Execution and limits
+
+Run under a private operator account with a 0700 output directory; JSON files
+are 0600. Configuration or webhook/password files are not inputs to this tool.
+An exclusive output-directory lock prevents accidental duplicate ownership.
+
+```sh
+python ops/diagnostics/yb_deadlock_capture.py \
+  --nodes 172.16.191.3 172.16.191.2 172.16.191.4 \
+  --output /private/deadlock-run \
+  --interval 1 --duration-seconds 21600 --max-bytes 134217728 \
+  --log-command-json '<exact argv JSON for the sanitized log reader>'
+```
+
+For a Docker-hosted DB, the reader argv can be assembled without changing its
+container image or files:
+
+```python
+reader_argv = [
+    "docker", "exec", "-i", "yugabyte", "python3", "-u", "-c",
+    Path("ops/diagnostics/yb_deadlock_log_reader.py").read_text(),
+    "/data/data/yb-data/tserver/logs", "--duration-seconds", "21660",
+]
+```
+
+Check the current real log directory first. stdin must remain open: the collector
+owns that pipe and closes it at exit, allowing the reader to terminate. The
+initial operator deployment also uses a separate `timeout --kill-after` wrapper
+and a low CPU scheduling priority. Stop only this diagnostic process group;
+never restart a crawler or database as a way to stop observation.
+
+Default collection lasts **six hours**, with a hard **128 MiB** output budget.
+It stops rather than deleting previous evidence when that budget is exhausted.
+A timestamped PID/start-identity receipt and actual command/source hashes belong
+in the private operator directory, alongside status and event files.
+
+## How to interpret evidence
+
+Match node + transaction UUID + PID + query ID at the relevant time. A client
+port may help map the backend to a worker; NAT, port reuse and PID reuse require
+checking the timestamp and process identity. A SQL-category hint alone is not
+sufficient attribution.
+
+Very short transactions can fall between samples. Post-deadlock lock probes may
+return no rows because the victim has already been aborted; ASH does not itself
+contain transaction UUIDs. Empty evidence does not exonerate a writer, and a
+`blocked_by` list may be capped. Always inspect sample errors, age, capping,
+incident cooldown drops and the time window before claiming a complete cycle.
+
+For the exact incident transaction UUIDs only, the sampler archives up to eight
+matching safe statement prefixes per node. This avoids statistics eviction and
+does not add a `pg_stat_statements` text-file scan: a production probe took about
+691 ms and several active query IDs were not yet available there. The prefix
+gate rejects literals, comments, dollar quoting, URL/sensitive markers and
+unrelated commands. Prefixes are always marked partial; the deployed activity
+text limit is 1024 bytes, and a complete statement is not promised. No runtime
+bind values are retained. A complete real-world counterparty capture is still
+needed before blaming a component or declaring a Yugabyte implementation bug.
+
+## Local verification
+
+```sh
+python -m pytest -q ops/diagnostics/tests
+```
+
+Tests use fake database adapters, real disposable log-reader subprocesses and
+local temporary files. They do not connect to a production database. The
+scheduler-ingest CI job runs these tests using its existing dependencies.
+
+## Initial operator profile (2026-11-13)
+
+The initial live observation overrides the default to **24 hours**, covering the
+next historical overnight failure window, with the same 128 MiB cap. Node 3 is
+the current write endpoint and retains full transaction UUID collection; node 2
+also retains it. Node 4 uses `--metadata-only-node 172.16.191.4`: its optional
+activity-UUID RPC was too slow for the 250 ms sampling budget. It still supplies
+PID/query ID/wait/ASH metadata, and event-triggered UUID lock lookups still contact
+all live TServers. This coverage distinction is explicit in `status.json`; do not
+claim full continuous transaction-UUID coverage on node 4.
+
+A canceled autocommit sampling statement only retains its connection after the
+driver confirms transaction status IDLE. This allows warm catalog state to be
+reused after a cold-query timeout; connection failures and other failures still
+close the connection. Timeout/error/backoff counters remain visible. A subsequent
+30-second pilot obtained 28/28/24 successful samples on nodes 3/2/4, zero ASH caps,
+and final sample ages below 1.1 seconds; node 4 had one recovered startup timeout.
+These short pilots do not establish long-term absence of performance impact.
+
+Query IDs are serialized as strings to preserve 64-bit identifiers when JSON is
+later opened by JavaScript-based tools. The private observer environment reuses
+the exact psycopg2 2.9.11 binary already installed in scheduler_ingest; no existing
+application environment, image or global Python installation is changed.
+
+## Optional pre-error wait capture (2026-11-14)
+
+Two incidents have now identified the same Ingestor result UPSERT versus Offerer
+claim CTE. This identifies the writers, not the complete lock-acquisition cycle.
+The optional `--waitqueue-tablet-map /private/tablet-map.json` adds live waiting
+evidence rather than repeatedly querying locks after their transaction aborted:
+
+1. Load a private, one-time metadata map of `{node, tablet_id, relation_name}`
+   from the three nodes' `yb_local_tablets()` rows. Never read partition keys or
+   crawl URLs. The map covers current-state tables, their indexes and daily
+   event tables. It is not refreshed automatically; an unknown or ambiguous
+   tablet prefix remains explicitly unknown.
+2. Once per sampler interval, query only the latest two seconds of TServer
+   conflict/lock ASH samples, at most 65 rows/node. ASH carries only 15 tablet-ID
+   characters, so require a unique same-node match to the cached full ID.
+   Reuse the existing three read-only connections. Query failure/slow-round
+   backoff remains visible; DB-wide logging and the underlying ASH sampling
+   frequency are unchanged.
+3. One background job can read at most three candidate `/waitqueue?id=...`
+   pages, with a 150 ms deadline each and 64 KiB response cap. Only fixed
+   internal nodes are allowed; no proxy or redirect. Parse the exact tablet
+   heading and known table headers, retaining only safe transaction edges and
+   request IDs. Unknown, truncated or shutting-down pages are not healthy empty
+   queues. HTTP errors have independent exponential backoff up to 30 seconds.
+4. If an actual edge is present, at most once a minute query locks for two exact
+   UUIDs, with 250 ms statement timeouts. This occasionally adds one connection;
+   a concurrent error-triggered probe may add another. Per-tablet lock limits
+   and row caps mean these remain samples, not a complete transaction history.
+5. Keep a 60-second bounded RAM ring, append late-arriving pre-error snapshots
+   to the correct incident, and retain at most one small `last-live-wait.json`
+   update per minute. Actual deadlocks save the preceding and following samples
+   under the existing private 128 MiB evidence budget. No raw HTML, key, URL or
+   SQL payload is written. `--stop-after-incidents 1` stops only after the next
+   complete incident has been persisted; the duration limit remains a fallback.
+
+The 35-second pilot captured real waiting edges and one pair of live lock
+samples (256/96 rows). Total observer Python CPU was about 0.39 seconds and peak
+RSS 36 MiB. Warm ASH-peek point measurements were 0.7–1.9 ms/node; the one-time
+tablet-map reads took 0.5–0.84 seconds/node. Some bounded queries timed out and
+recovered during the pilot, so these measurements are not a zero-impact or
+complete-coverage guarantee. The exact-UUID pair took about 295 ms; it is not a
+per-second operation. Millisecond-lived deadlocks can still evade sampling.
+
+The authorized deployment replaces only the diagnostic observer, preserving its
+old evidence and all application/DB configuration. No application service is
+restarted. It runs for at most 24 hours or the next saved incident. The observer
+does not retry failed application transactions or restore failed batches.
