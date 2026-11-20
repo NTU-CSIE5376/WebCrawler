@@ -200,7 +200,7 @@ class RankerClaimDatabaseTest(unittest.TestCase):
                 self.assertEqual([r[0] for r in rows],[self.url(1,i) for i in range(1,3)])
                 conn.rollback()
 
-    def test_changes_during_claim_do_not_retain_discarded_row_locks(self):
+    def test_changes_during_claim_recheck_eligibility_and_release_locks_on_rollback(self):
         owner=self
         conn=self.connection()
         errors=[]
@@ -232,11 +232,24 @@ class RankerClaimDatabaseTest(unittest.TestCase):
             rows=self.ranker()._claim_steering_batch(RaceCursor(),0)
         self.assertEqual(errors,[])
         self.assertEqual([r[0] for r in rows],[self.url(1,i) for i in range(1,3)])
+        probe=self.connection()
         if self.yugabyte:
             self.assertEqual(self.explicit_lock_count(conn),2)
-        with self.connection().cursor() as probe:
-            probe.execute("SELECT url FROM url_state_current_000 WHERE url=%s FOR UPDATE NOWAIT",(self.url(1,0),))
-            self.assertEqual(probe.fetchone()[0],self.url(1,0))
+            with probe.cursor() as cur:
+                cur.execute("SELECT url FROM url_state_current_000 WHERE url=%s FOR UPDATE NOWAIT",(self.url(1,0),))
+                self.assertEqual(cur.fetchone()[0],self.url(1,0))
+        else:
+            # PostgreSQL retains the lock on a row that matched its snapshot,
+            # even if a concurrent update makes it fail the eligibility recheck.
+            # https://www.postgresql.org/docs/16/sql-select.html#SQL-FOR-UPDATE-SHARE
+            with probe.cursor() as cur:
+                with self.assertRaises(psycopg2.errors.LockNotAvailable):
+                    cur.execute("SELECT url FROM url_state_current_000 WHERE url=%s FOR UPDATE NOWAIT",(self.url(1,0),))
+        probe.rollback();conn.rollback()
+        # Both engines release all candidate locks when the transaction ends.
+        with probe.cursor() as cur:
+            cur.execute("SELECT url FROM url_state_current_000 WHERE url=ANY(%s) FOR UPDATE NOWAIT",([self.url(1,i) for i in range(3)],))
+            self.assertEqual(len(cur.fetchall()),3)
 
     def test_full_scoring_transaction_updates_only_claimed_rows(self):
         class Scorer:
