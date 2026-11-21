@@ -74,6 +74,21 @@ Runtime behavior of `golden_discovery_ranker_v1`:
 3. Scores those URLs with the artifact heads and writes the combined ranker score into the existing `url_score`.
 4. Sets `url_score_updated_at=NOW()` as the only completion marker; it does not append experiment logs or score-history rows.
 
+With domain-priority steering enabled, the ranker discovers candidate URLs
+without locking the per-domain candidates consumed by the global sort. It then
+claims at most `batch_size` rows once with `FOR UPDATE OF u SKIP LOCKED`,
+rechecks eligibility, and reads current feature values. A partial batch is scored,
+updated, and committed immediately; the ranker never refills it by searching again
+while retaining row locks. An empty claim advances to the next shard. Age, TTL,
+manual-priority, and domain-tier gates apply to both discovery and claiming.
+Claims remain held through scoring and the score update. Each SQL statement in
+the scoring transaction has a 30-second timeout, configured by
+`golden_discovery_ranker_v1.statement_timeout_sec` or
+`GOLDEN_DISCOVERY_RANKER_V1_STATEMENT_TIMEOUT_SEC`. This is a per-statement limit,
+not a deadline for Python model inference or the whole transaction. A canceled
+statement rolls back the batch, releases its locks, logs
+`golden_discovery_ranker_v1.statement_timeout`, and advances to the next shard.
+
 ## 2.3 `crawler` Container
 
 Runs `supervisord` with:

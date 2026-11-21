@@ -69,6 +69,7 @@ def test_scorer_starts_approved_model_without_private_model_overrides(monkeypatc
     assert loaded["fallback"] is v1.score_many
     assert loaded["scorer"] is v2
     assert loaded["config"].num_workers == 16
+    assert loaded["config"].statement_timeout_sec == 30
     assert loaded["config"].domain_priority_steering_enabled is True
     assert loaded["ran"] is True
 
