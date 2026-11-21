@@ -188,9 +188,27 @@ def main():
         inline_score_batch_size=_inline_score_batch_size(raw),
     )
     stats_dir=require(ingestor, "stats_dir")
+    discovery_batch_size = _env_int(
+        "INGESTOR_DISCOVERY_BATCH_SIZE",
+        int(ingestor.get("discovery_batch_size", 4000)),
+    )
+    max_buffer_mib = _env_int(
+        "INGESTOR_MAX_BUFFER_MIB",
+        int(ingestor.get("max_buffer_mib", 64)),
+    )
     svc = IngestService(
         ingestor_id, db, StatsDeltaWriter(stats_dir),
         trap_filter=_load_trap_filter(raw, ingestor_id),
+        discovery_batch_size=discovery_batch_size,
+        max_buffer_bytes=max_buffer_mib * 1024 * 1024,
+    )
+    LOGGER.info(
+        "ingest.batching_config",
+        extra={"event": "ingest.batching_config",
+               "discovery_batch_size": discovery_batch_size,
+               "max_buffer_bytes": svc.max_buffer_bytes,
+               "inline_score_timeout_sec": db.inline_score_timeout_sec,
+               "inline_score_batch_size": db.inline_score_batch_size},
     )
 
     while True:
