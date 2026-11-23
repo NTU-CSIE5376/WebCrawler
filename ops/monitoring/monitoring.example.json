@@ -1,0 +1,18 @@
+{
+  "ipc_root": "/data/ipc",
+  "refresh_seconds": 60,
+  "max_scan_entries": 10000,
+  "expected_crawlers": ["00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15"],
+  "golden_inject": {
+    "enabled": true,
+    "state_dir": "maintenance/golden_inject",
+    "deadline_grace_seconds": 1800,
+    "stall_seconds": 900,
+    "baseline_skipped_count": 179
+  },
+  "stages": [
+    {"name": "router", "workers": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], "input_dir_template": "crawl_result/crawler_{worker:02d}", "progress_template": "progress/router/{worker:02d}.json", "interval_minutes": 10},
+    {"name": "ingestor", "workers": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], "input_dir_template": "crawl_result/ingestor_{worker:02d}", "progress_template": "progress/ingestor/{worker:02d}.json", "interval_minutes": 10},
+    {"name": "extractor", "workers": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], "input_dir_template": "crawl_result/ingestor_{worker:02d}", "progress_template": "progress/extractor/{worker:02d}.json", "interval_minutes": 10}
+  ]
+}
