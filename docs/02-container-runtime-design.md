@@ -157,12 +157,29 @@ last incomplete folder under the existing folder-level checkpoint scheme.
 Input: router output folders `ingestor_{id}`.
 
 The ingestor snapshots input filenames and streams the folder twice: discoveries
-first, then crawl results. Each shard buffers at most 2,000 records, with a shared
-64 MiB estimated decoded-record budget per ingestor. Reaching either limit
+first, then crawl results. Each shard buffers at most 128,000 discovery records or
+2,000 crawl results, with a shared
+2 GiB estimated decoded-record budget per ingestor. Reaching either limit
 flushes a database batch; the byte limit flushes the largest shard buffer first.
 One oversized record can exceed the budget while it is decoded, but is flushed
 immediately. JSONL readers in the router and extractor also yield one record at
 a time. Ready input folders must remain unchanged during the two passes.
+
+`ingestor.discovery_batch_size` configures discovery batches; the
+`INGESTOR_DISCOVERY_BATCH_SIZE` environment variable overrides it.
+`ingestor.max_buffer_mib` configures the shared buffer budget in MiB; the
+`INGESTOR_MAX_BUFFER_MIB` environment variable overrides it. Both settings must
+be positive. For example, `max_buffer_mib: 2048` allows 2 GiB of estimated input
+buffers per worker, or 32 GiB across 16 workers, in addition to model and database
+working memory. Changes apply when the ingestor worker starts.
+The configured inline-scoring budget is 30 seconds per discovery batch, controlled
+by `golden_discovery_ranker_v1.ingest_inline_score_timeout_sec` or the
+`GOLDEN_DISCOVERY_RANKER_V1_INGEST_INLINE_SCORE_TIMEOUT_SEC` environment override.
+Scoring still runs in 5,000-URL chunks. Startup logs include the effective scoring
+budget and chunk size alongside the record and memory limits.
+`ingest.batch_done` records input count, count
+after deduplication/filtering, kind, and batch processing duration (including
+inline scoring and database work) for tuning.
 
 Discovery deduplication and URL normalization run within each flushed batch.
 Duplicates in later batches use the existing database UPSERT, preserving additive

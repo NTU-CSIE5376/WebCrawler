@@ -32,7 +32,7 @@ host; set the corresponding environment variables for smaller machines.
 | postgres | 128 GiB | `POSTGRES_MEMORY_LIMIT` |
 | scheduler_control | 48 GiB | `SCHEDULER_CONTROL_MEMORY_LIMIT` |
 | api | 8 GiB | `API_MEMORY_LIMIT` |
-| scheduler_ingest | 64 GiB | `SCHEDULER_INGEST_MEMORY_LIMIT` |
+| scheduler_ingest | 128 GiB | `SCHEDULER_INGEST_MEMORY_LIMIT` |
 | crawler | 64 GiB | `CRAWLER_MEMORY_LIMIT` |
 | sitemap_patroller | 8 GiB | `SITEMAP_PATROLLER_MEMORY_LIMIT` |
 | loki | 8 GiB | `LOKI_MEMORY_LIMIT` |

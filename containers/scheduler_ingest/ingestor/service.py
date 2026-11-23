@@ -38,6 +38,7 @@ class IngestService:
         stats: StatsDeltaWriter,
         trap_filter: TrapFilter | None = None,
         max_buffer_bytes: int = MAX_BUFFER_BYTES,
+        discovery_batch_size: int | None = None,
     ):
         if max_buffer_bytes <= 0:
             raise ValueError("max_buffer_bytes must be positive")
@@ -46,6 +47,9 @@ class IngestService:
         self.stats = stats
         self.trap_filter = trap_filter
         self.max_buffer_bytes = max_buffer_bytes
+        self.discovery_batch_size = BATCH_SIZE if discovery_batch_size is None else discovery_batch_size
+        if self.discovery_batch_size <= 0:
+            raise ValueError("discovery_batch_size must be positive")
 
     def _accumulate_result(self, result, counters, domains):
         if isinstance(result, bool):
@@ -87,6 +91,7 @@ class IngestService:
 
         def flush(batch, discovery):
             nonlocal trap_dropped, url_normalized, url_would_normalize
+            input_records = len(batch)
             if discovery:
                 # Dedup only within the bounded batch. Repeated URLs in later
                 # batches are handled by the database's existing UPSERT.
@@ -100,9 +105,17 @@ class IngestService:
                         batch = self.db.aggregate_links(batch)
             if not batch:
                 return
+            batch_started = time.monotonic()
             try:
                 for result in self.db.process_batch(batch):
                     self._accumulate_result(result, counters, domains)
+                logger.info(
+                    "ingest.batch_done",
+                    extra={"event": "ingest.batch_done",
+                           "batch_kind": "discovery" if discovery else "result",
+                           "input_records": input_records, "records": len(batch),
+                           "duration_s": round(time.monotonic() - batch_started, 3)},
+                )
             except Exception as e:
                 logger.error(
                     "ingest.batch_error",
@@ -116,11 +129,12 @@ class IngestService:
                 counters["ingest_error"] += len(batch)
 
         # Stream twice to finish all discoveries before any crawl results,
-        # without retaining results during discovery. Keep at most BATCH_SIZE
-        # records per shard and a shared byte budget across all shards. A
+        # without retaining results during discovery. Enforce the record limit
+        # for each kind per shard and a shared byte budget across all shards. A
         # single oversized record is processed immediately. Flush tails before
         # the next pass/folder.
         for discovery in (True, False):
+            batch_limit = self.discovery_batch_size if discovery else BATCH_SIZE
             recs_by_shard = defaultdict(list)
             bytes_by_shard = defaultdict(int)
             buffered_bytes = 0
@@ -134,7 +148,7 @@ class IngestService:
                     size = _record_size(rec)
                     bytes_by_shard[shard_id] += size
                     buffered_bytes += size
-                    if len(recs_by_shard[shard_id]) >= BATCH_SIZE:
+                    if len(recs_by_shard[shard_id]) >= batch_limit:
                         buffered_bytes -= bytes_by_shard.pop(shard_id)
                         flush(recs_by_shard.pop(shard_id), discovery)
                     while buffered_bytes >= self.max_buffer_bytes:
@@ -164,6 +178,7 @@ class IngestService:
                 "url_normalized": url_normalized,
                 "url_would_normalize": url_would_normalize,
                 "duration_s": round(time.monotonic() - started, 1),
+                "discovery_batch_size": self.discovery_batch_size,
             },
         )
 
