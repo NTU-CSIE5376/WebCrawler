@@ -59,8 +59,8 @@ def test_espn_limits_are_shared_without_changing_other_sites(dispatcher):
         dispatcher.process_request(request)
         assert request.meta["download_slot"] == "espn.com"
         limits = policies.resolve(hostname).request_limits
-        assert limits.target_concurrent_requests == policies.config.default.request_limits.target_concurrent_requests
-        assert limits.max_qps == policies.config.default.request_limits.max_qps
+        assert limits.target_concurrent_requests == 32
+        assert limits.max_qps == 64
         assert limits.max_concurrent_requests == 16
         assert policies.shared_budgets(hostname) == (("domain:espn.com", 16),)
     assert policies.resolve("example.com").request_limits == policies.config.default.request_limits
