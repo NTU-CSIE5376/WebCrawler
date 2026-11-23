@@ -260,13 +260,12 @@ and query parameters, identifies as `WebCrawlerBot/1.0`, requests gzip, and disa
 cookies. Configured site headers can override the identity. Robots checks,
 bounded retries, and the common 429 cooldown remain enabled.
 
-During Host2 memory-incident recovery, `espn.com` inherits the global AutoThrottle
-target and nominal QPS (currently four and eight). Its shared domain concurrency
-cap remains 16, with one `espn.com` download slot across subdomains. Global
-defaults remain unchanged.
+The `espn.com` domain policy uses an AutoThrottle target of 32, nominal 64 QPS,
+a shared domain concurrency cap of 16, and one `espn.com` download slot. The target
+controls pacing; the hard cap remains 16 across crawler processes and subdomains.
+Global defaults remain unchanged.
 
-A historical 10,000-URL benchmark at target 32 and nominal 64 QPS on
-`www.espn.com` completed in 377.75 seconds with
+A fresh 10,000-URL benchmark on `www.espn.com` completed in 377.75 seconds with
 9,826 successful HTTP-200 pages (26.01 pages/sec), no HTTP 429s, and no cooldowns.
 First-half and second-half rates were 26.05 and 25.98 pages/sec. The run used one
 crawler with a two-CPU quota and 4 GiB RAM, retaining the production middleware,
@@ -281,12 +280,12 @@ hosts. Other hosts share the domain slot, so their cooldowns also affect it.
 It preserves requested URLs and lets Scrapy negotiate supported compression.
 Robots checks, bounded retries, and the shared 429 cooldown remain enabled.
 
-The `yahoo.com` policy retains a shared concurrency budget of 16 across crawler
-processes and subdomains. During recovery, all Yahoo hosts inherit the global
-AutoThrottle target and nominal QPS (currently four and eight), using the
-`yahoo.com` downloader slot and sharing its AutoThrottle delay and 429 cooldown.
+The `yahoo.com` policy enforces a shared concurrency budget of 16 across crawler
+processes and subdomains. All Yahoo hosts inherit an AutoThrottle target of eight
+and nominal 16 QPS, using the `yahoo.com` downloader slot and sharing its
+AutoThrottle delay and 429 cooldown.
 
-A historical 10,000-URL main-site validation using the accelerated domain policy
+A fresh 10,000-URL main-site validation using the current domain policy
 (target eight, shared cap 16, nominal 16 QPS) completed in 1,109.36 seconds with
 9,964 rendered articles (8.98 articles/sec; 9.10 HTTP QPS), no HTTP 429s, no
 cooldowns, and no spider errors. First-half and second-half article rates were
@@ -296,7 +295,7 @@ article criterion. All 10,000 inputs completed.
 
 The earlier 3,000-URL run with cap eight recorded 9.30 articles/sec; a separate
 10,000-URL run at nominal 24 QPS recorded 8.07 articles/sec after 29 recovered
-429s. That validation used previously unrequested, robots-permitted
+429s. The current validation used previously unrequested, robots-permitted
 `www.yahoo.com` article URLs with normal retries, cooldowns, parsing, and output
 writes enabled. It validates one crawler's main-site throughput; mixed-host and
 multi-process throughput were not measured. Yahoo provided no cache-hit
