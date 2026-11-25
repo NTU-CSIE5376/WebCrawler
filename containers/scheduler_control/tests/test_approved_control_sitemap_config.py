@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import yaml
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 CONTROL = ROOT / "containers/scheduler_control/config/control.yaml"
 SITEMAP = ROOT / "containers/sitemap_patroller/config/sitemap.yaml"
 

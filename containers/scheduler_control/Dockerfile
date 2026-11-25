@@ -14,16 +14,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir \
-    sqlalchemy==2.0.36 \
-    psycopg2-binary==2.9.9 \
-    pyyaml==6.0.2 \
-    python-json-logger==2.0.7 \
-    joblib==1.5.3 \
-    numpy==2.1.2 \
-    scipy==1.17.0 \
-    scikit-learn==1.8.0 \
-    lightgbm==4.6.0
+COPY containers/scheduler_control/requirements.txt /tmp/scheduler-control-requirements.txt
+RUN pip install --no-cache-dir -r /tmp/scheduler-control-requirements.txt
 
 COPY containers/scheduler_control/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
