@@ -96,17 +96,6 @@ AUTOTHROTTLE_TARGET_CONCURRENCY = float(os.getenv("CRAWLER_AUTOTHROTTLE_TARGET_C
 AUTOTHROTTLE_DEBUG = _env_bool("CRAWLER_AUTOTHROTTLE_DEBUG", False)
 DOWNLOAD_SLOTS = _SITE_POLICIES.download_slots(start_delay=AUTOTHROTTLE_START_DELAY)
 
-# Keep a local request backlog so one slow domain does not block the next IPC batch.
-IPC_PREFETCH_LOW_WATERMARK_REQUESTS = CONCURRENT_REQUESTS * 2
-IPC_PREFETCH_TARGET_REQUESTS = CONCURRENT_REQUESTS * 8
-
-# Reload domain files when active in-flight domains drop below this threshold.
-IPC_DOMAIN_LOW_WATERMARK = 144
-# Also check the watermark on a timer: completions of owned requests and
-# spider_idle are not enough once owned work has drained while manual bulk
-# crawls keep the engine busy.
-IPC_TOP_UP_INTERVAL_SEC = 5.0
-
 DNS_TIMEOUT = 15
 DOWNLOAD_TIMEOUT = 15
 DOWNLOAD_MAXSIZE = 10 * 1024 * 1024
@@ -132,8 +121,6 @@ ITEM_PIPELINES = {
     "crawler.pipelines.JsonPipeline": 500,
 }
 
-IPC_JOB_INGEST_ENABLED = os.getenv("IPC_JOB_INGEST_ENABLED", "false").lower() == "true"
-URL_QUEUE_TEMPLATE = "/data/ipc/url_queue/crawler_{id:02d}"
 RESULT_DIR_TEMPLATE = "/data/ipc/crawl_result/crawler_{id:02d}"
 # Transport location and resource limits belong to the crawler. Per-job output
 # destinations arrive in the queue payload, without reading API configuration.

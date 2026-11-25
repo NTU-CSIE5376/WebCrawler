@@ -25,8 +25,7 @@ class JobSpider(HtmlSpider):
         return spider
 
     def watch(self):
-        # Ingest jobs must not decrement ordinary crawl inventory.
-        self._pending_requests = 7
+        assert not hasattr(self, "queue")
         self.timer = LoopingCall(self.check_done)
         self.timer.start(0.05, now=False)
 
@@ -45,15 +44,14 @@ def main():
     settings = Settings()
     settings.setmodule("crawler.settings")
     settings.update({
-        "URL_QUEUE_TEMPLATE": str(root / "queue_{id:02d}"),
+        # Old configuration must not reactivate the retired file reader.
+        "URL_QUEUE_TEMPLATE": str(root / "legacy_queue_{id:02d}"),
         "MANUAL_BULK_CRAWL_QUEUE_DIR": str(root / "pending"),
         "RESULT_DIR_TEMPLATE": str(root / "output_{id:02d}"),
         "SHARED_REQUEST_BUDGET_DIR": str(root / "budgets"),
         "PARSER_PROCESSES": 0, "JSON_WRITER_PROCESSES": 1,
-        "IPC_JOB_INGEST_ENABLED": True,
         "ROBOTSTXT_OBEY": False, "HTTPPROXY_ENABLED": False,
         "AUTOTHROTTLE_ENABLED": False, "DOWNLOAD_DELAY": 0,
-        "OBSLOG_HEARTBEAT_SEC": 0, "IPC_TOP_UP_INTERVAL_SEC": 0,
         "CLOSESPIDER_TIMEOUT": 15,
     })
     process = CrawlerProcess(settings)
@@ -62,7 +60,7 @@ def main():
     process.start()
     (root / "observation.json").write_text(json.dumps({
         "finish_reason": crawler.stats.get_value("finish_reason"),
-        "normal_pending": crawler.spider._pending_requests,
+        "legacy_input_absent": not hasattr(crawler.spider, "queue"),
         "item_count": crawler.stats.get_value("item_scraped_count", 0),
     }))
 

@@ -91,11 +91,9 @@ def test_spider_preserves_canonical_urls_youtube_dedup_and_metadata(tmp_path, mo
         suffix_list_urls=(), cache_dir=None))
     crawler = get_crawler(HtmlSpider, {
         "PARSER_PROCESSES": 0,
-        "URL_QUEUE_TEMPLATE": str(tmp_path / "queue_{id:02d}"),
         "MANUAL_BULK_CRAWL_QUEUE_DIR": str(tmp_path / "manual"),
     })
     spider = HtmlSpider.from_crawler(crawler, crawler_id=0)
-    monkeypatch.setattr(spider, "_finish_owned_request", Mock())
     response = page('''<html><head><title> A title </title>
         <link rel="alternate" hreflang="en" href="/en">
         <script type="application/ld+json">{}</script></head><body>

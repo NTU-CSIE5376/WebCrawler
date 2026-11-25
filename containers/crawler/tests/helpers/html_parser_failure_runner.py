@@ -14,7 +14,7 @@ from html_parser_runner import offline_suffix_list
 async def run(root):
     from concurrent.futures import ProcessPoolExecutor
 
-    from scrapy import signals
+    from scrapy import signals, Request
     from scrapy.crawler import CrawlerRunner
     from scrapy.settings import Settings
     from scrapy.utils.defer import maybe_deferred_to_future
@@ -49,8 +49,8 @@ async def run(root):
             self.checks = 0
 
         async def start(self):
-            self._pending_requests += 1
-            yield self._build_request(base_url + "/warm", 7)
+            yield Request(base_url + "/warm", callback=self.parse,
+                          meta={"_track_domain_id": 7})
 
         async def parse(self, response):
             items = await super().parse(response)
@@ -59,12 +59,9 @@ async def run(root):
                 # admission-waiting work exist at the moment it is killed.
                 self.child, = self.html_parser_pool._executor._processes.values()
                 os.kill(self.child.pid, signal.SIGSTOP)
-                self.queue.pop_domain_batches = Mock(
-                    side_effect=AssertionError("Reserved work after parser failure"),
-                )
-                self._pending_requests += 6
                 for index in range(6):
-                    self.crawler.engine.crawl(self._build_request(base_url + f"/{index}", 7))
+                    self.crawler.engine.crawl(Request(base_url + f"/{index}", callback=self.parse,
+                                                      meta={"_track_domain_id": 7}))
                 self.check = reactor.callLater(.01, self.kill_when_admitted)
             return items
 
@@ -84,10 +81,8 @@ async def run(root):
     settings.setmodule("crawler.settings")
     settings.setdict({
         "PARSER_PROCESSES": 1,
-        "URL_QUEUE_TEMPLATE": str(root / "queue_{id:02d}"),
         "MANUAL_BULK_CRAWL_QUEUE_DIR": str(root / "manual"),
         "OBSLOG_HEARTBEAT_SEC": 0,
-        "IPC_TOP_UP_INTERVAL_SEC": 0,
         "ROBOTSTXT_OBEY": False,
         "DOWNLOADER_MIDDLEWARES": {},
         "SPIDER_MIDDLEWARES": {},
@@ -122,13 +117,13 @@ async def run(root):
             records[0].pop("fetched_at")
             report[f"{name}_reason"] = crawler.stats.get_value("finish_reason")
             if fail:
-                crawler.spider.queue.pop_domain_batches.assert_not_called()
+                assert crawler.spider.manual_bulk_crawls.closed
                 report.update(
                     failure_count=crawler.stats.get_value("parser/pool_broken"),
                     interrupted=crawler.stats.get_value("parser/interrupted"),
                     inflight=pool.inflight, waiting=pool.waiting,
-                    pending=crawler.spider._pending_requests,
-                    domain_pending=crawler.spider._domain_pending,
+                    pending=len(crawler.spider.manual_bulk_crawls.inflight),
+                    domain_pending=dict(crawler.spider.manual_bulk_crawls.domains),
                     children_after_close=len(multiprocessing.active_children()),
                     original_output=records,
                 )

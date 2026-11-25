@@ -175,7 +175,6 @@ def test_two_real_processes_match_inline_and_close_cleanly(tmp_path):
     assert report["pages"] == 12
     assert report["reactor_ticks"] > 0
     assert report["children_after_close"] == 0
-    assert report["pending_after_failure"] == 0
 
 
 def test_killed_parser_child_stops_crawler_and_restart_produces_output(tmp_path):

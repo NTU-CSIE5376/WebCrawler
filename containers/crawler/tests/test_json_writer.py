@@ -119,7 +119,7 @@ def test_writer_failure_stops_refilling_and_closes_spider():
     spider._writer_pool_broken()
     spider._writer_pool_broken()
     assert spider.manual_bulk_crawls.closed
-    assert spider._reserve_urls("after_failure") == []
+    assert spider._parser_failed
     spider.manual_bulk_crawls.poller.stop.assert_called_once()
     spider.crawler.engine.close_spider.assert_called_once_with(spider, reason="json_writer_pool_broken")
 

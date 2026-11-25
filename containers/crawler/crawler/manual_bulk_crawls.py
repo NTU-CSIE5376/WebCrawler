@@ -124,16 +124,14 @@ class ManualBulkCrawlConsumer:
         self._refresh_ready()
         self.next_job_scan = 0.0
         self.refill()
-        if (self.processing_feedback.domains
-                or self.spider.crawler.settings.getbool("IPC_JOB_INGEST_ENABLED", False)):
-            try:
-                feedback = self.pending_dir / "feedback"
-                feedback.mkdir(parents=True, exist_ok=True)
-                write_json(feedback / f"crawler_{self.spider.crawler_id:02d}.json",
-                           self.processing_feedback.snapshot())
-            except OSError:
-                logger.exception("crawler.processing_feedback_error",
-                                 extra={"event":"crawler.processing_feedback_error"})
+        try:
+            feedback = self.pending_dir / "feedback"
+            feedback.mkdir(parents=True, exist_ok=True)
+            write_json(feedback / f"crawler_{self.spider.crawler_id:02d}.json",
+                       self.processing_feedback.snapshot())
+        except OSError:
+            logger.exception("crawler.processing_feedback_error",
+                             extra={"event":"crawler.processing_feedback_error"})
 
     def _domain_limits(self, slot_key, domain):
         settings = self.spider.crawler.settings

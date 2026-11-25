@@ -36,6 +36,11 @@ def test_real_job_processing_modes(tmp_path, mode):
                "crawler_ids": [0, 0], "result_dir": str(tmp_path / "results")}
     manifest.write_text(json.dumps(payload))
     prepare_job(manifest, payload)
+    legacy = tmp_path / "legacy_queue_00"
+    legacy.mkdir()
+    legacy_file = legacy / "domain_1.json"
+    legacy_payload = json.dumps({"urls": [f"http://127.0.0.1:{server.server_port}/legacy-should-not-run"]})
+    legacy_file.write_text(legacy_payload)
     root = Path(__file__).resolve().parents[3]
     try:
         result = subprocess.run([sys.executable, str(Path(__file__).parent / "helpers/job_ingest_runner.py"), str(tmp_path)],
@@ -45,7 +50,8 @@ def test_real_job_processing_modes(tmp_path, mode):
         assert result.returncode == 0, result.stdout + result.stderr
         observed = json.loads((tmp_path / "observation.json").read_text())
         assert observed["finish_reason"] == "jobs_completed", result.stdout + result.stderr
-        assert observed["normal_pending"] == 7
+        assert observed["legacy_input_absent"]
+        assert legacy_file.read_text() == legacy_payload
         status = job_status("job", payload, tmp_path / "results/job")
         assert status["completed_urls"] == 2 and status["failed_urls"] == 1
         records = [json.loads(line) for p in (tmp_path / "output_00").rglob("*.jsonl")

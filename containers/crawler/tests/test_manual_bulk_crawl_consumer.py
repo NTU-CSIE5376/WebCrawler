@@ -372,8 +372,8 @@ def test_manual_and_normal_requests_share_the_hostname_slot(queue, monkeypatch):
                                    "CONCURRENT_REQUESTS_PER_DOMAIN": 16})
     crawler.spider = Spider(name="slot-test")
     downloader = Downloader(crawler)
-    spider = SimpleNamespace(_domain_pending={}, parse=None, errback=None, demand_tracker=None)
-    normal = HtmlSpider._build_request(spider, "https://www.espn.com/nba/2", 7)
+    from scrapy import Request
+    normal = Request("https://www.espn.com/nba/2", meta={"crawl_job_mode": "ingest"})
     try:
         consumer.poll()
         manual_key, manual_slot = downloader._get_slot(requests[0])

@@ -266,15 +266,15 @@ settings.set("DOWNLOAD_SLOTS", {}, priority="cmdline")
 settings.set("HTTPPROXY_ENABLED", False)
 settings.set("DNS_RESOLVER", "scrapy.resolver.CachingThreadedResolver")
 settings.set("MANUAL_BULK_CRAWL_QUEUE_DIR", sys.argv[1] + "/pending")
-settings.set("URL_QUEUE_TEMPLATE", sys.argv[1] + "/normal_queue/crawler_{id:02d}")
 settings.set("RESULT_DIR_TEMPLATE", sys.argv[1] + "/normal_results/crawler_{id:02d}")
 process = CrawlerProcess(settings)
 process.crawl(HtmlSpider, crawler_id=0)
 process.start()
 '''
-    normal = tmp_path / "normal_queue/crawler_00"
-    normal.mkdir(parents=True)
-    (normal / "domain_99.json").write_text(json.dumps({"urls": [base + f"/wiki/regular/{i}?utm_source=test" for i in range(20)]}))
+    regular = enqueue(tmp_path, name="regular", urls=[base + f"/wiki/regular/{i}?utm_source=test" for i in range(20)])
+    regular_payload = json.loads(regular.read_text())
+    regular_payload.update(version=2, processing_mode="ingest")
+    regular.write_text(json.dumps(regular_payload))
     try:
         result = subprocess.run([sys.executable, "-c", script, str(tmp_path)],
                                 cwd=root / "containers/crawler",
@@ -429,7 +429,6 @@ settings.setdict({
     "OBSLOG_HEARTBEAT_SEC": 0,
     "CLOSESPIDER_TIMEOUT": 60,
     "MANUAL_BULK_CRAWL_QUEUE_DIR": sys.argv[1] + "/pending",
-    "URL_QUEUE_TEMPLATE": sys.argv[1] + "/normal_queue/crawler_{id:02d}",
     "RESULT_DIR_TEMPLATE": sys.argv[1] + "/normal_results/crawler_{id:02d}",
 }, priority="cmdline")
 process = CrawlerProcess(settings)

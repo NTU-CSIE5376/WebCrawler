@@ -35,17 +35,15 @@ async def run(root):
 
     parser_module.ProcessPoolExecutor = create_pool
     crawler = get_crawler(module.HtmlSpider, {
-        "URL_QUEUE_TEMPLATE": str(root / "queue_{id:02d}"),
         "MANUAL_BULK_CRAWL_QUEUE_DIR": str(root / "manual"),
         "PARSER_PROCESSES": 2,
         "OBSLOG_HEARTBEAT_SEC": 0,
-        "IPC_TOP_UP_INTERVAL_SEC": 0,
     })
     spider = module.HtmlSpider.from_crawler(crawler)
     crawler.engine = Mock()
     crawler.engine.downloader.slots = {}
-    spider._finish_owned_request = Mock()
-    spider.manual_bulk_crawls = Mock()
+    spider.manual_bulk_crawls = Mock(pending_by_mode={"ingest": 0},
+                                      outstanding_by_mode={"ingest": 0}, domains={})
     responses = []
     for index in range(12):
         url = f"https://example.com/page?b={index}&a=1"
@@ -74,15 +72,12 @@ async def run(root):
         ))
     # Inline rollback path uses the same public callback as the pool path.
     inline_crawler = get_crawler(module.HtmlSpider, {
-        "URL_QUEUE_TEMPLATE": str(root / "queue_{id:02d}"),
         "MANUAL_BULK_CRAWL_QUEUE_DIR": str(root / "manual"),
         "PARSER_PROCESSES": 0,
     })
     inline_spider = module.HtmlSpider.from_crawler(inline_crawler)
-    inline_spider._finish_owned_request = Mock()
     expected = [list(map(dict, await inline_spider.parse(response))) for response in responses]
     await maybe_deferred_to_future(inline_spider.html_parser_pool.close())
-    spider._finish_owned_request.reset_mock()
     spider.spider_opened()
     pool = spider.html_parser_pool
     ticks = 0
@@ -98,7 +93,6 @@ async def run(root):
     try:
         actual = await asyncio.gather(*(spider.parse(response) for response in responses))
         actual = [list(map(dict, items)) for items in actual]
-        assert spider._finish_owned_request.call_count == len(responses)
         assert pool.inflight == 0
         processes = len(pool._executor._processes)
 
@@ -119,14 +113,8 @@ async def run(root):
         pool._executor.submit.assert_not_called()
         pool._executor.submit = before
 
-        # A submission failure must release domain ownership exactly once.
-        spider._finish_owned_request = Mock()
-        spider._pending_requests = 1
-        spider._domain_pending = {7: 1}
-        original_finish = module.HtmlSpider._finish_owned_request.__get__(spider)
-        spider._finish_owned_request.side_effect = original_finish
+        # A submission failure must release the parser admission permit.
         spider._set_inflight_stats = Mock()
-        spider._maybe_top_up = Mock()
         pool._executor.submit = Mock(side_effect=RuntimeError("test pool failure"))
         try:
             await spider.parse(responses[0])
@@ -134,8 +122,6 @@ async def run(root):
             assert str(exc) == "test pool failure"
         else:
             raise AssertionError("Submission failure was swallowed")
-        assert spider._finish_owned_request.call_count == 1
-        assert not spider._domain_pending
         assert pool.inflight == 0
     finally:
         running = False
@@ -146,7 +132,6 @@ async def run(root):
         "same_output": actual == expected,
         "pages": len(actual), "processes": processes, "reactor_ticks": ticks,
         "children_after_close": len(multiprocessing.active_children()),
-        "pending_after_failure": spider._pending_requests,
     }))
 
 
