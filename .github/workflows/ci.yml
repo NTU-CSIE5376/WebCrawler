@@ -72,7 +72,7 @@ jobs:
         run: >-
           python -m pip install pytest==8.4.2 psycopg2-binary==2.9.11
           PyYAML==6.0.2 tldextract==5.1.1 sqlalchemy==2.0.44
-          joblib==1.5.3 numpy==2.1.2 scipy==1.17.0
+          joblib==1.5.3 numpy==2.1.2 scipy==1.17.0 tenacity==9.2.1
       - name: Test injection, retries and real database recovery
         run: >-
           python -m pytest -q -p no:cacheprovider
@@ -86,3 +86,8 @@ jobs:
           RANKER_CLAIM_TEST_DSN: postgresql://golden_test:golden_test@127.0.0.1:5432/golden_test
           RANKER_CLAIM_TEST_LARGE: '1'
         run: python -m pytest -q -p no:cacheprovider tests/test_scorer_claims_db.py
+
+      - name: Test split ingestion arrival orders against PostgreSQL
+        env:
+          INGESTOR_TEST_DSN: postgresql://golden_test:golden_test@127.0.0.1:5432/golden_test
+        run: python -m pytest -q -p no:cacheprovider containers/scheduler_ingest/tests/test_split_ingestors_db.py
