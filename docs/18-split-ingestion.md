@@ -39,7 +39,7 @@ on the same shared filesystem/lock directory. This is not a distributed lock
 for separate hosts with independent filesystems. Offerers, scorers, injectors,
 and other database writers continue to use database concurrency control.
 `ingest.shard_write` records lock wait and statement wall times for lookups,
-UPSERT, history, other SQL and commit, without logging SQL values.
+UPSERT, history, other SQL, optional inline scoring and commit, without logging SQL values.
 
 ## Checkpoints and failure behavior
 

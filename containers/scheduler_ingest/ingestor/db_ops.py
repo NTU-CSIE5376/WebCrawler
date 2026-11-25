@@ -663,7 +663,12 @@ class IngestDB:
                 score_urls = [url for url in unique_urls if url not in existing_before]
             else:
                 score_urls = unique_urls
-            score_by_url, score_updated_at = self._score_new_links(score_urls)
+            scoring_started = time.monotonic()
+            try:
+                score_by_url, score_updated_at = self._score_new_links(score_urls)
+            finally:
+                if self.timing_observer is not None:
+                    self.timing_observer("inline_scoring", time.monotonic()-scoring_started)
 
         priority_at = datetime.now(timezone.utc)
         link_rows = []
