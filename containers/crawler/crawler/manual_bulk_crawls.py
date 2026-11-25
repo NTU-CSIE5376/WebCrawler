@@ -1,6 +1,7 @@
 """Feed bounded API work into the existing downloader and domain slots."""
 import logging
 import math
+import re
 from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -16,6 +17,8 @@ from twisted.internet.task import LoopingCall
 from libs.ipc.manual_bulk_crawl import (
     JobUnavailable, ManualBulkCrawlBatch, iter_batches, is_expired,
 )
+from libs.ipc.processing_feedback import ProcessingFeedback
+from libs.ipc.manual_bulk_crawl import write_json
 from libs.urls import host_of
 from .site_policies import SitePolicies
 
@@ -28,6 +31,7 @@ class _ActiveJob:
     pending: set[int]
     inflight: set[int] = field(default_factory=set)
     failed: bool = False
+    domain_id: int | None = None
 
 
 @dataclass
@@ -55,6 +59,8 @@ class ManualBulkCrawlConsumer:
         self.max_active_jobs = _int_setting(settings, "MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS", 64, 1)
         self.host_headroom = _int_setting(settings, "MANUAL_BULK_CRAWL_HOST_HEADROOM", 1, 0)
         self.jobs: dict[str, _ActiveJob] = {}
+        self.processing_feedback = ProcessingFeedback()
+        self.admitted_at = {}
         self.inflight: set[tuple[str, int]] = set()
         self.saves = 0
         self.save_seconds = 0.0
@@ -78,6 +84,7 @@ class ManualBulkCrawlConsumer:
         for job in self.jobs.values():
             job.batch.close()
         self.jobs.clear()
+        self.admitted_at.clear()
         self.inflight.clear()
         self.inflight_domains.clear()
         self.domains.clear()
@@ -100,6 +107,14 @@ class ManualBulkCrawlConsumer:
         self._refresh_priorities()
         self.next_job_scan = 0.0
         self.refill()
+        try:
+            feedback = self.pending_dir / "feedback"
+            feedback.mkdir(parents=True, exist_ok=True)
+            write_json(feedback / f"crawler_{self.spider.crawler_id:02d}.json",
+                       self.processing_feedback.snapshot())
+        except OSError:
+            logger.exception("crawler.processing_feedback_error",
+                             extra={"event": "crawler.processing_feedback_error"})
 
     def _domain_limits(self, slot_key, domain):
         settings = self.spider.crawler.settings
@@ -163,7 +178,9 @@ class ManualBulkCrawlConsumer:
             )
             for batch in islice(batches, self.max_active_jobs - len(self.jobs)):
                 job_id = batch.path.stem
-                self.jobs[job_id] = _ActiveJob(batch=batch, pending=set(batch.remaining))
+                match = re.fullmatch(r"offerer/\d+/domain/(\d+)(?:/[^/]+)?", batch.payload.get("client_reference") or "")
+                domain_id = int(match[1]) if match else None
+                self.jobs[job_id] = _ActiveJob(batch=batch, pending=set(batch.remaining), domain_id=domain_id)
                 for index in sorted(batch.remaining):
                     host = host_of(batch.urls[index])
                     slot_key = self.policies.resolve(host).request_limits.download_slot or host
@@ -201,6 +218,10 @@ class ManualBulkCrawlConsumer:
                 self.inflight_domains[job_id, index] = slot_key
                 job.inflight.add(index)
                 self.inflight.add((job_id, index))
+                if job.domain_id is not None:
+                    self.admitted_at[job_id, index] = monotonic()
+                    active = sum(len(j.inflight) for j in self.jobs.values() if j.domain_id == job.domain_id)
+                    self.processing_feedback.admitted(job.domain_id, active)
                 self._refresh_priorities([slot_key])
                 try:
                     self.spider.crawler.engine.crawl(scrapy.Request(
@@ -244,6 +265,7 @@ class ManualBulkCrawlConsumer:
                   final_url=failure.request.url, status_code=None, error=failure.type.__name__)
 
     def _release_domain(self, job_id, index, latency=None):
+        self.admitted_at.pop((job_id, index), None)
         slot_key = self.inflight_domains.pop((job_id, index))
         domain = self.domains[slot_key]
         domain.outstanding -= 1
@@ -259,6 +281,9 @@ class ManualBulkCrawlConsumer:
             if not job.failed:
                 started = monotonic()
                 job.batch.save(index, **result)
+                admitted = self.admitted_at.get((job_id, index))
+                if admitted is not None and job.domain_id is not None:
+                    self.processing_feedback.completed(job.domain_id, monotonic() - admitted)
                 # Saves run on the reactor thread; the heartbeat reports their total time.
                 self.saves += 1
                 self.save_seconds += monotonic() - started
