@@ -68,13 +68,28 @@ overwrite patrol writes because it only scored rows where
 re-scorer landed (LATERAL query with `url_score_updated_at < NOW() -
 rescore_ttl_days`), patrol writes are no longer durable — v2 will pick the
 row back up after `rescore_ttl_days` (currently 5 d) and overwrite
-`url_score` with its own [0,1] score. Mitigation options:
-- (a) add `AND u.source <> 3` to the v2 steering query so v2 skips patrol-
-  written rows; cleanest but couples v2 to patrol.
-- (b) accept v2 will eventually overwrite; patrol re-asserts on next cron
-  tick (≤ 6 h), so the score only stays "wrong" for up to one cadence.
-Decision deferred to the cron-service PR review; current MVP behaviour is
-(b).
+`url_score` with its own [0,1] score.
+
+**Current decision**: cap the `cold` bucket at 4 d (< v2's 5 d TTL) so that
+for non-retired parents the cron always re-asserts `url_score = 1.0`
+before v2's TTL fires. Patrol's signal stays durable across every cadence
+bucket. Cost: `cold` runs ~1.75× more often than the original 7 d
+intention; at ~5k parents this is < 1k extra fetches/day, well inside the
+10 M/day budget.
+
+**Residual coupling**: if v2's `rescore_ttl_days` is ever lowered below 4
+d, this guarantee breaks. The longer-term fix is option (a): add
+`AND u.source <> 3` to the v2 steering query so patrol-managed rows are
+fully out-of-pool. Tracked as a follow-up to the v2 scorer PR.
+
+**Edge cases still uncovered**:
+- Retired parents (status = retired): cron stops re-marking, so v2 will
+  eventually overwrite. Acceptable — retired parents are no longer
+  patrol's concern.
+- Grace path (crawler hasn't caught up since last mark): patrol does not
+  re-write `url_score`, just re-asserts `should_crawl = TRUE`. If grace
+  persists beyond 5 d, v2 will overwrite. Long retire timer (`~28 d`)
+  catches these.
 
 **Implication**: `url_score` becomes shared between the ranker and patrol;
 to attribute by writer, filter on `source = 3`.
@@ -126,7 +141,7 @@ cadence.
 | `medium` | 6 h      |
 | `slow`   | 1 d      |
 | `trial`  | 2 d      |
-| `cold`   | 7 d      |
+| `cold`   | 4 d      |
 
 Initial bucket is set per `lifetime_golden_child_count` in config; all
 parents start in `trial` and earn faster cadence by producing.
