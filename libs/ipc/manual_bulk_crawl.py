@@ -3,12 +3,21 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
 DEFAULT_TTL_DAYS = 14
 MAX_TTL_DAYS = 60
+PROCESSING_MODES = ("fetch", "ingest")
+
+
+def validate_processing_mode(value):
+    if value not in PROCESSING_MODES:
+        raise ValueError('"processing_mode" must be "fetch" or "ingest"')
+    return value
 
 
 class JobUnavailable(Exception):
@@ -78,6 +87,8 @@ def job_status(job_id, payload, directory):
     return {
         "job_id": job_id, "status": "completed" if completed else ("running" if progress else "pending"),
         "total_urls": len(payload["urls"]),
+        "processing_mode": payload.get("processing_mode", "fetch"),
+        "client_reference": payload.get("client_reference"),
         **{key: sum(item[key] for item in progress) for key in
            ("completed_urls", "succeeded_urls", "failed_urls", "html_files")},
         "created_at": payload.get("created_at"),
@@ -100,6 +111,7 @@ class ManualBulkCrawlBatch:
         self.closed = False
         self.path = path
         self.payload = payload
+        self.processing_mode = validate_processing_mode(payload.get("processing_mode", "fetch"))
         self.urls = payload["urls"]
         self.manifest = path.parent.parent / path.name
         self.directory = worker_directory(payload["result_dir"], path.stem, crawler_id)
@@ -194,11 +206,14 @@ def iter_batches(pending_dir: Path, crawler_id: int = 0, *,
             continue
         queued.append((submitted_at, path, payload))
     for _, path, payload in sorted(queued, key=lambda item: (item[0], item[1])):
-        if (payload.get("version") != 1 or not isinstance(payload.get("urls"), list)
+        if (payload.get("version") not in (1, 2) or not isinstance(payload.get("urls"), list)
                 or len(payload.get("crawler_ids", [])) != len(payload["urls"])
                 or not isinstance(payload.get("result_dir"), str)
                 or not Path(payload["result_dir"]).is_absolute()):
             raise ValueError("Invalid crawl request batch")
+        mode = validate_processing_mode(payload.get("processing_mode", "fetch"))
+        if mode == "ingest" and payload["version"] != 2:
+            raise ValueError("Ingest jobs require protocol version 2")
         if is_expired(payload):
             continue
         if crawler_id not in payload["crawler_ids"]:
@@ -211,3 +226,50 @@ def iter_batches(pending_dir: Path, crawler_id: int = 0, *,
             yield batch
         else:
             batch.close()
+
+
+def publish_job(pending_dir, result_dir, urls, crawler_ids, *, processing_mode="fetch",
+                ttl_days=DEFAULT_TTL_DAYS, client_reference=None):
+    """Publish the same atomic job contract for API clients and offerers."""
+    pending_dir, result_dir = Path(pending_dir), Path(result_dir)
+    if client_reference is not None and (not isinstance(client_reference, str) or len(client_reference) > 128):
+        raise ValueError("Invalid client_reference")
+    validate_ttl_days(ttl_days)
+    validate_processing_mode(processing_mode)
+    created = datetime.now(timezone.utc)
+    file_tag = uuid4().hex
+    records = {"version": 2 if processing_mode == "ingest" else 1, "urls": urls,
+               "processing_mode": processing_mode,
+               "crawler_ids": crawler_ids,
+               "result_dir": str(result_dir.resolve()),
+               "created_at": created.isoformat(), "ttl_days": ttl_days,
+               "expires_at": (created + timedelta(days=ttl_days)).isoformat()}
+
+    if client_reference is not None:
+        records["client_reference"] = client_reference
+
+    # One rename is the acceptance boundary, regardless of shard count.
+    # No fallible work follows it: a returned storage error means no batch
+    # was published. Existing crawlers handle the accepted job separately.
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    target = pending_dir / f"{file_tag}.json"
+    temporary = target.with_suffix(".json.tmp")
+    try:
+        prepare_job(target, records)
+        with temporary.open("x", encoding="utf-8") as handle:
+            json.dump(records, handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # Partition entries are ignored until this immutable manifest exists.
+        os.replace(temporary, target)
+    except OSError:
+        # A leftover .tmp is never accepted or read by crawlers.
+        try:
+            temporary.unlink(missing_ok=True)
+            for crawler_id in set(records["crawler_ids"]):
+                (pending_dir / f"crawler_{crawler_id:02d}" / target.name).unlink(missing_ok=True)
+            shutil.rmtree(result_dir / file_tag, ignore_errors=True)
+        except OSError:
+            pass
+        raise
+    return file_tag

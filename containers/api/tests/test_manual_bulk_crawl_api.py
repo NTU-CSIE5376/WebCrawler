@@ -60,6 +60,37 @@ def test_default_app_uses_read_only_routing(setup_api, monkeypatch):
         assert client.post("/v1/manual-bulk-crawls", json={"urls": ["https://example.com"]}).status_code == 200
 
 
+def test_url_validation_defaults_on_and_can_be_disabled_per_request(setup_api):
+    client, _, _, root = setup_api
+    urls = ["https://example.com/a#one", "https://example.com/a#two", "not a URL"]
+    assert client.post("/v1/manual-bulk-crawls", json={"urls": urls}).status_code == 400
+    assert not list((root / "pending").glob("*.json"))
+    response = client.post("/v1/manual-bulk-crawls", json={"urls": urls, "validate_urls": False})
+    assert response.status_code == 200
+    manifest = json.loads((root / "pending" / (response.json()["job_id"] + ".json")).read_text())
+    assert manifest["urls"] == urls
+    # The opt-out applies to this submission only.
+    assert client.post("/v1/manual-bulk-crawls", json={"urls": ["not a URL"]}).status_code == 400
+
+
+@pytest.mark.parametrize("flag", [None, 0, 1, "false", "true"])
+def test_url_validation_flag_requires_boolean(setup_api, flag):
+    client, _, _, root = setup_api
+    assert client.post("/v1/manual-bulk-crawls", json={
+        "urls": ["https://example.com"], "validate_urls": flag,
+    }).status_code == 400
+    assert not list((root / "pending").glob("*.json"))
+
+
+@pytest.mark.parametrize("urls", [[], [""], [42], ["x" * 2501], ["a", "b", "c", "d"]])
+def test_validation_opt_out_retains_request_bounds(setup_api, urls):
+    client, _, _, root = setup_api
+    assert client.post("/v1/manual-bulk-crawls", json={
+        "urls": urls, "validate_urls": False,
+    }).status_code == 400
+    assert not list((root / "pending").glob("*.json"))
+
+
 def test_job_status_tracks_pending_running_and_completed_results(setup_api):
     client, svc, _, root = setup_api
     response = client.post("/v1/manual-bulk-crawls", json={"urls": [
@@ -476,6 +507,60 @@ def test_api_does_not_publish_crawler_dispatch_policy(setup_api, monkeypatch):
     assert response.status_code == 200
     payload = json.loads((root / "pending" / f'{response.json()["job_id"]}.json').read_text())
     assert "scheduling_policy" not in payload
+
+
+@pytest.mark.parametrize("mode,version", [("fetch", 1), ("ingest", 2)])
+def test_processing_mode_is_published_and_reported(setup_api, mode, version):
+    client, svc, _, _ = setup_api
+    result = client.post("/v1/manual-bulk-crawls", json={
+        "urls": ["https://example.com/a", "https://example.com/a#duplicate"],
+        "processing_mode": mode,
+    })
+    assert result.status_code == 200
+    job_id = result.json()["job_id"]
+    payload = json.loads((svc.pending_dir / f"{job_id}.json").read_text())
+    assert payload["processing_mode"] == mode and payload["version"] == version
+    assert payload["urls"] == ["https://example.com/a"]
+    assert client.get(f"/v1/manual-bulk-crawls/{job_id}").json()["processing_mode"] == mode
+
+
+@pytest.mark.parametrize("mode", [None, True, "crawl", "download_only", "unknown", 1])
+def test_invalid_processing_mode_is_rejected_before_publication(setup_api, mode):
+    client, svc, *_ = setup_api
+    result = client.post("/v1/manual-bulk-crawls", json={
+        "urls": ["https://example.com"], "processing_mode": mode,
+    })
+    assert result.status_code == 400
+    assert not list(svc.pending_dir.glob("*.json"))
+
+
+def test_active_job_listing_filters_and_paginates_without_finished_history(setup_api):
+    client, svc, *_ = setup_api
+    ids = []
+    for domain in (1, 2, 3):
+        response = client.post("/v1/manual-bulk-crawls", json={
+            "urls": [f"https://example.com/{domain}"], "processing_mode": "ingest",
+            "client_reference": f"offerer/0/domain/{domain}",
+        })
+        ids.append(response.json()["job_id"])
+    svc.submit(["https://example.org/unrelated"])
+    batch = next_batch(svc.pending_dir)
+    batch.save(0, final_url=batch.urls[0], status_code=200)
+    completed = batch.path.stem
+    observed, cursor = [], ""
+    while True:
+        page = client.get("/v1/manual-bulk-crawls", params={
+            "crawler_id": 0, "client_prefix": "offerer/0/", "limit": 1, "after": cursor,
+        }).json()
+        observed.extend(job["job_id"] for job in page["jobs"])
+        assert all("result_dir" not in job for job in page["jobs"])
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+    assert set(observed) == set(ids) - {completed}
+    assert client.get("/v1/manual-bulk-crawls", params={"crawler_id": 1}).json()["jobs"] == []
+
+
 
 
 def test_performance_endpoint_uses_fresh_feedback_and_rejects_stale_samples(setup_api):
