@@ -18,9 +18,8 @@ offerer:
   low_watermark_domains: 120
   per_domain_url_cap: 100
 
-  # Set to http://api:8080 to publish ingest jobs over HTTP instead of domain files.
-  # First drain legacy offers and enable IPC_JOB_INGEST_ENABLED on matching crawlers.
-  job_api_url: ""
+  # API jobs are the crawler input. Drain legacy work before deploying this layer.
+  job_api_url: "http://api:8080"
   max_outstanding_job_urls: 16384
   job_allocation_method: mip
   job_planning_horizon_sec: 60  # A soft target, not a measured-capacity ceiling.

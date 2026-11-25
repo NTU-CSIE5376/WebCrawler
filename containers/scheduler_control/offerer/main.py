@@ -55,7 +55,7 @@ def main() -> None:
         selector = ReadOnlyStrategy(Session=Session)
     elif strategy_name == "golden_discovery_ranker_v1":
         selector = GoldenDiscoveryRankerV1Strategy(
-            Session=Session, use_url_priority=bool(offerer.get("job_api_url")))
+            Session=Session, use_url_priority=bool(offerer.get("job_api_url", "http://api:8080")))
     else:
         selector = ExampleStrategy(Session=Session)
 
@@ -72,7 +72,7 @@ def main() -> None:
         low_watermark_domains=int(offerer.get("low_watermark_domains", 16)),
         per_domain_url_cap=int(offerer.get("per_domain_url_cap", 100)),
         stats_dir=str(offerer.get("stats_dir", "/data/ipc/stats")),
-        job_api_url=str(offerer.get("job_api_url", "")),
+        job_api_url=str(offerer.get("job_api_url", "http://api:8080")),
         max_outstanding_job_urls=int(offerer.get("max_outstanding_job_urls", 16384)),
         job_allocation_method=str(offerer.get("job_allocation_method", "mip")),
         job_planning_horizon_sec=float(offerer.get("job_planning_horizon_sec", 60)),
