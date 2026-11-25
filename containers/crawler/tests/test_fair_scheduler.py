@@ -413,3 +413,11 @@ def test_startup_logs_whether_policy_meta_restore_is_enabled(scheduler_factory, 
     with caplog.at_level("INFO", logger="crawler"):
         scheduler_factory(restore=restore)
     assert [record.event for record in caplog.records if hasattr(record, "event")] == [event]
+
+def test_ingest_jobs_use_normal_source_instead_of_api_fetch_share(scheduler_factory):
+    scheduler = scheduler_factory()
+    item = request("manual", 0, meta={"crawl_job_mode": "ingest"})
+    assert scheduler.enqueue_request(item)
+    assert len(scheduler.normal) == 1
+    assert len(scheduler.manual) == 0
+    assert scheduler.next_request() is item
