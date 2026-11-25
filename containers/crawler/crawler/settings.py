@@ -132,6 +132,7 @@ ITEM_PIPELINES = {
     "crawler.pipelines.JsonPipeline": 500,
 }
 
+IPC_JOB_INGEST_ENABLED = os.getenv("IPC_JOB_INGEST_ENABLED", "false").lower() == "true"
 URL_QUEUE_TEMPLATE = "/data/ipc/url_queue/crawler_{id:02d}"
 RESULT_DIR_TEMPLATE = "/data/ipc/crawl_result/crawler_{id:02d}"
 # Transport location and resource limits belong to the crawler. Per-job output

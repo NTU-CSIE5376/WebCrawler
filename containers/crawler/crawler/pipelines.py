@@ -94,11 +94,15 @@ class JsonPipeline:
         }
 
         if not self.writer_processes:
-            append_jsonl(path, rec)
+            if item.get("ingest_job"):
+                append_jsonl(path, rec, sync=True)
+            else:
+                append_jsonl(path, rec)
             self._record_written(spider, rec)
             return item
 
-        work = self._pool.write(path, rec)
+        work = (self._pool.write(path, rec, sync=True) if item.get("ingest_job")
+                else self._pool.write(path, rec))
         self._pending += 1
         if self.stats is not None:
             self.stats.set_value("json_writer/pending", self._pending)

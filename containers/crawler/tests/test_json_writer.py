@@ -246,3 +246,20 @@ def test_completed_future_does_not_retain_record_batch_in_a_cycle(controlled_wri
     reference = weakref.ref(jobs.pop())
     assert reference() is None
     assert writer.close_spider(spider).called
+
+
+def test_ingest_output_requires_fsync_and_hides_job_metadata(controlled_writer, monkeypatch):
+    writer, spider, jobs, notifications, _ = controlled_writer
+    item = {"url": "https://example.test/page", "content": "html",
+            "ingest_job": {"job_id": "job", "index": 0}}
+    result = writer.process_item(item, spider)
+    assert not result.called
+    path, record, sync = pickle.loads(jobs[0].payloads[0])
+    assert sync is True and "ingest_job" not in record
+    write = Mock()
+    monkeypatch.setattr(json_writer, "append_jsonl", write)
+    assert json_writer.append_records(jobs[0].payloads) == [None]
+    write.assert_called_once_with(path, record, sync=True)
+    finish(jobs, notifications, 0)
+    assert result.called
+    assert writer.close_spider(spider).called

@@ -14,6 +14,7 @@ from scrapy.spidermiddlewares.httperror import HttpError
 from twisted.internet import task as twisted_task
 
 from crawler.items import PageItem
+from crawler.dispatch_defaults import is_api_request
 from crawler.queue_consumer import QueueConsumer
 from crawler.manual_bulk_crawls import ManualBulkCrawlConsumer
 from crawler.spiders.parser import HtmlParserPool
@@ -28,7 +29,7 @@ MAX_HEADER_VALUE_LEN = 500
 
 
 def _source(request) -> str:
-    return "manual" if "manual_bulk_crawl_job_id" in request.meta else "normal"
+    return "manual" if is_api_request(request) else "normal"
 
 class HtmlSpider(scrapy.Spider):
     name = "html_spider"
@@ -55,7 +56,8 @@ class HtmlSpider(scrapy.Spider):
         spider = super().from_crawler(crawler, *args, **kwargs)
 
         qtpl = crawler.settings["URL_QUEUE_TEMPLATE"]
-        spider.queue = QueueConsumer(queue_dir=qtpl.format(id=spider.crawler_id))
+        job_input = spider._job_input = crawler.settings.getbool("IPC_JOB_INGEST_ENABLED", False)
+        spider.queue = None if job_input else QueueConsumer(queue_dir=qtpl.format(id=spider.crawler_id))
         spider.manual_bulk_crawls = ManualBulkCrawlConsumer(spider)
         spider.html_parser_pool = HtmlParserPool(
             crawler.settings.getint("PARSER_PROCESSES", 4),
@@ -233,7 +235,7 @@ class HtmlSpider(scrapy.Spider):
 
 
     def _reserve_urls(self, reason: str, force: bool = False) -> list[tuple[int, str]]:
-        if self._parser_failed:
+        if self._parser_failed or getattr(self, "_job_input", False):
             return []
         needs_domains = len(self._domain_pending) < self.domain_low_watermark
         if not force and not needs_domains:
@@ -377,7 +379,7 @@ class HtmlSpider(scrapy.Spider):
         domains_at_limit = self._count_domains_at_limit()
         downloader = getattr(getattr(self.crawler, "engine", None), "downloader", None)
         manual_active = sum(
-            "manual_bulk_crawl_job_id" in r.meta for r in getattr(downloader, "active", ()) or ()
+            is_api_request(r) for r in getattr(downloader, "active", ()) or ()
         )
         stats = self.crawler.stats
         consumer = self.manual_bulk_crawls
@@ -429,6 +431,8 @@ class HtmlSpider(scrapy.Spider):
             yield self._build_request(url, domain_id)
 
     def _periodic_top_up(self):
+        if getattr(self, "_job_input", False):
+            return
         if len(self._domain_pending) < self.domain_low_watermark:
             self._maybe_top_up(reason="periodic")
 
@@ -463,9 +467,10 @@ class HtmlSpider(scrapy.Spider):
             reason = "parse_error"
             raise
         finally:
-            self._finish_owned_request(
-                reason=reason, domain_id=response.meta.get("_track_domain_id", 0),
-            )
+            if "manual_bulk_crawl_job_id" not in response.meta:
+                self._finish_owned_request(
+                    reason=reason, domain_id=response.meta.get("_track_domain_id", 0),
+                )
 
     def _parse_response(self, response, fields=None):
         url = canonicalize_url(response.url)
@@ -540,7 +545,8 @@ class HtmlSpider(scrapy.Spider):
                 "source": "normal",
             },
         )
-        self._finish_owned_request(reason="errback", domain_id=track_domain_id)
+        if "manual_bulk_crawl_job_id" not in failure.request.meta:
+            self._finish_owned_request(reason="errback", domain_id=track_domain_id)
         yield item
 
     def req_scheduled(self, request):
