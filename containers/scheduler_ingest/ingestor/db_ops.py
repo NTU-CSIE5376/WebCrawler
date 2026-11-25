@@ -109,6 +109,9 @@ _CUR_INSERT_COLS = (
     "is_redirect",
     "redirect_hop_count",
     "robots_bits",
+    "domain_score",
+    "url_score",
+    "source",
 )
 
 # snapshot_id / snapshot_at have DB defaults so they're omitted here.
@@ -174,6 +177,36 @@ def _prefer_higher_priority(dst: dict, src: dict) -> None:
         dst["source"] = src.get("source", SOURCE_NATURAL)
 
 
+class _TimedCursor:
+    """Record statement wall time without logging SQL or URL values."""
+    def __init__(self, cursor, observer):
+        self.cursor, self.observer = cursor, observer
+
+    def __getattr__(self, name):
+        return getattr(self.cursor, name)
+
+    def execute(self, query, *args, **kwargs):
+        prefix = query[:1024].decode(errors="replace") if isinstance(query, bytes) else str(query)[:1024]
+        prefix = prefix.lstrip().lower()
+        if prefix.startswith("select url, content_hash from"):
+            stage = "result_hash_lookup"
+        elif prefix.startswith("select url from"):
+            stage = "discovery_lookup"
+        elif prefix.startswith("insert into url_state_current_"):
+            stage = "discovery_upsert" if "(url, domain_id, domain_score" in prefix else "content_upsert"
+        elif prefix.startswith("insert into url_state_history_"):
+            stage = "history_insert"
+        elif prefix.startswith("insert into url_event_counter_"):
+            stage = "event_counter"
+        else:
+            stage = "other_sql"
+        started = time.monotonic()
+        try:
+            return self.cursor.execute(query, *args, **kwargs)
+        finally:
+            self.observer(stage, time.monotonic()-started)
+
+
 class IngestDB:
     def __init__(
         self,
@@ -183,6 +216,7 @@ class IngestDB:
         inline_score_batch_size: int = 5000,
     ):
         self.Session = Session
+        self.timing_observer = None
         self.inline_ranker = inline_ranker
         self.inline_score_timeout_sec = inline_score_timeout_sec
         self.inline_score_batch_size = max(1, inline_score_batch_size)
@@ -366,6 +400,7 @@ class IngestDB:
                 "idx": idx,
                 "url": url,
                 "domain_id": int(rec["domain_id"]),
+                "domain_score": float(rec.get("domain_score") or 0.0),
                 "fetched_at": (
                     datetime.fromisoformat(rec["fetched_at"])
                     if rec.get("fetched_at")
@@ -427,6 +462,12 @@ class IngestDB:
                 d["is_redirect"],
                 d["redirect_hop_count"],
                 d["robots_bits"],
+                # Content may now arrive before discovery. Seed a usable
+                # natural frontier row; the conflict branch preserves existing
+                # scores and source ownership.
+                d["domain_score"],
+                0.0,
+                SOURCE_NATURAL,
             )
             for d in decoded
         ]
@@ -793,7 +834,10 @@ class IngestDB:
         try:
             # Keep COMMIT outside Tenacity: a lost acknowledgment may mean the
             # additive counters were already committed successfully.
+            started = time.monotonic()
             sess.commit()
+            if self.timing_observer is not None:
+                self.timing_observer("commit", time.monotonic()-started)
             return results
         finally:
             sess.close()
@@ -829,7 +873,8 @@ class IngestDB:
             sess.begin()
             connection = sess.connection().connection
             raw_connection = connection.driver_connection
-            with connection.cursor() as cur:
+            with connection.cursor() as raw_cur:
+                cur = _TimedCursor(raw_cur, self.timing_observer) if self.timing_observer is not None else raw_cur
                 # Links first so discovery metadata is set before a matching
                 # crawl result updates the same URL.
                 for sid, items in links_by_shard.items():

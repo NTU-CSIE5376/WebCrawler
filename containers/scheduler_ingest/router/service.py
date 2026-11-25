@@ -207,7 +207,7 @@ class RouterService:
                             domain_resolver = DomainResolver(sess, domain_cache)
                             with sess.begin():
                                 # resolve domain_id from DB (insert if missing)
-                                domain_id, _ = domain_resolver.ensure_and_get(domain, shard_id)
+                                domain_id, domain_score = domain_resolver.ensure_and_get(domain, shard_id)
 
                                 src_url = rec.get("url")
                                 # Score of the page these outlinks were found on,
@@ -241,6 +241,7 @@ class RouterService:
                             "outlinks": new_outlinks,
                             "shard_id": shard_id,
                             "domain_id": domain_id,
+                            "domain_score": domain_score,
                             "content_hash": content_hash,
                             "title": rec.get("title"),
                             "hreflang_count": rec.get("hreflang_count"),

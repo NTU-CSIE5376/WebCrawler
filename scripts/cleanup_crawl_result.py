@@ -82,20 +82,20 @@ def _template_dir(template: str) -> tuple[Path, re.Pattern]:
 
 def discover_stages(raw: dict) -> list[Stage]:
     router = require(raw, "router")
-    ingestor = require(raw, "ingestor")
     extractor = require(raw, "extractor")
-
     consumers = {
-        # base-dir template -> progress templates of its readers
         str(require(router, "crawler_dir_template")): [str(require(router, "progress_template"))],
-        str(require(ingestor, "result_dir_template")): [
-            str(require(ingestor, "progress_template")),
-            str(require(extractor, "progress_template")),
-        ],
     }
+    split = "discovery_ingestor" in raw or "content_ingestor" in raw
+    components = ("discovery_ingestor", "content_ingestor") if split else ("ingestor",)
+    for name in components:
+        settings = require(raw, name)
+        directory = str(require(settings, "result_dir_template"))
+        consumers.setdefault(directory, []).append(str(require(settings, "progress_template")))
     extractor_dir = str(require(extractor, "result_dir_template"))
     if extractor_dir not in consumers:
         raise ValueError("extractor.result_dir_template must equal ingestor.result_dir_template")
+    consumers[extractor_dir].append(str(require(extractor, "progress_template")))
 
     stages: list[Stage] = []
     for dir_template, progress_templates in consumers.items():
