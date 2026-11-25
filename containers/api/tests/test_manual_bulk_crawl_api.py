@@ -575,3 +575,40 @@ def test_performance_endpoint_uses_fresh_feedback_and_rejects_stale_samples(setu
     payload['generated_at']=time.time()-60;path.write_text(json.dumps(payload))
     assert client.get('/v1/crawlers/0/performance').json()['domains']=={}
     assert not client.get('/v1/crawlers/1/performance').json()['available']
+
+
+def test_offerer_http_client_uses_the_same_api_contract(setup_api, monkeypatch):
+    from containers.scheduler_control.offerer.job_client import CrawlJobClient
+    client, svc, *_ = setup_api
+    jobs = CrawlJobClient("http://testserver", 0)
+
+    def request(url, payload=None):
+        response = client.get(url) if payload is None else client.post(url, json=payload)
+        response.raise_for_status()
+        return response.json()
+
+    monkeypatch.setattr(jobs, "_request", request)
+    job_id = jobs.submit(1944, ["https://example.com/a", "https://example.com/b"])
+    assert jobs.active_inventory() == ({1944}, 2)
+    batch = next_batch(svc.pending_dir)
+    assert batch.payload["processing_mode"] == "ingest"
+    batch.save(0, final_url=batch.urls[0], status_code=200)
+    assert jobs.active_inventory() == ({1944}, 1)
+    batch.save(1, final_url=batch.urls[1], status_code=200)
+    assert jobs.active_inventory() == (set(), 0)
+    assert svc.status(job_id)["status"] == "completed"
+
+
+def test_multiple_jobs_for_one_domain_are_counted_and_reconciled_by_unique_reference(setup_api,monkeypatch):
+    from containers.scheduler_control.offerer.job_client import CrawlJobClient
+    client,service,*_=setup_api
+    jobs=CrawlJobClient('http://testserver',0)
+    def request(url,payload=None):
+        r=client.get(url) if payload is None else client.post(url,json=payload);r.raise_for_status();return r.json()
+    monkeypatch.setattr(jobs,'_request',request)
+    a=jobs.new_reference(1944);b=jobs.new_reference(1944)
+    id_a=jobs.submit(1944,['https://example.com/a'],reference=a)
+    id_b=jobs.submit(1944,['https://example.com/b'],reference=b)
+    assert id_a!=id_b and jobs.inventory_by_domain()==({1944:2},2)
+    assert jobs.submit(1944,['https://example.com/b'],reference=b,reconcile=True)==id_b
+    assert jobs.inventory_by_domain()==({1944:2},2)

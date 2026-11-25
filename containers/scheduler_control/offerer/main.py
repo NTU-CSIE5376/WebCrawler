@@ -54,7 +54,8 @@ def main() -> None:
     if strategy_name == "read_only":
         selector = ReadOnlyStrategy(Session=Session)
     elif strategy_name == "golden_discovery_ranker_v1":
-        selector = GoldenDiscoveryRankerV1Strategy(Session=Session)
+        selector = GoldenDiscoveryRankerV1Strategy(
+            Session=Session, use_url_priority=bool(offerer.get("job_api_url")))
     else:
         selector = ExampleStrategy(Session=Session)
 
@@ -71,8 +72,17 @@ def main() -> None:
         low_watermark_domains=int(offerer.get("low_watermark_domains", 16)),
         per_domain_url_cap=int(offerer.get("per_domain_url_cap", 100)),
         stats_dir=str(offerer.get("stats_dir", "/data/ipc/stats")),
+        job_api_url=str(offerer.get("job_api_url", "")),
+        max_outstanding_job_urls=int(offerer.get("max_outstanding_job_urls", 16384)),
+        job_allocation_method=str(offerer.get("job_allocation_method", "mip")),
+        job_planning_horizon_sec=float(offerer.get("job_planning_horizon_sec", 60)),
+        job_probe_urls=int(offerer.get("job_probe_urls", 8)),
+        job_overload_penalty=float(offerer.get("job_overload_penalty", .2)),
+        job_mip_time_limit_sec=float(offerer.get("job_mip_time_limit_sec", 1)),
         peek_multiplier=int(offerer.get("peek_multiplier", 3)),
         peek_hard_cap=int(offerer.get("peek_hard_cap", 1000)),
+        job_url_budget=int(offerer.get("job_url_budget", 10000)),
+        job_domain_slots=int(offerer.get("job_domain_slots", 16)),
     )
 
     OffererService(cfg, deriv, selector).run_forever()
