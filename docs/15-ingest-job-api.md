@@ -22,7 +22,6 @@ so a crash between output and acknowledgement may produce a duplicate record.
 Fetch/ingest queues share domain limits, retain existing service-time scheduling,
 and reserve the reviewed 20/80 dispatch share while borrowing unused capacity.
 
-Set `IPC_JOB_INGEST_ENABLED=true` on a crawler after draining its legacy input to
-use API jobs as its only input. The later retirement layer removes that migration
-switch and the legacy domain-file reader. The offerer submits through HTTP; it
-never needs the API's filesystem mount.
+API jobs are the sole crawler input after the retirement layer. Drain legacy
+work before deploying that layer, then configure the offerer job API URL. The
+offerer submits through HTTP and never needs the API's filesystem mount.

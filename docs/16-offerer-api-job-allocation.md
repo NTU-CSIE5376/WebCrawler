@@ -31,8 +31,7 @@ resubmitting. An unavailable API stops new claims instead of silently switching
 to the old file feed. There remains a crash window between committing the DB
 claim and writing its outbox; this series does not make those two stores atomic.
 
-During migration, set `offerer.job_api_url` and first enable job input on the
-matching crawlers after draining existing work. The legacy file-feed fallback
+Before upgrading, drain existing file-fed work and configure `offerer.job_api_url`. The legacy file-feed fallback
 remains selected only when that URL is empty. The final crawler-retirement PR
 sets the job API as the reviewed deployment default. Controls are
 `job_url_budget`, `job_domain_slots`, `max_outstanding_job_urls`,
