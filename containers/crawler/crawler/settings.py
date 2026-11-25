@@ -73,6 +73,11 @@ CONCURRENT_REQUESTS = int(os.getenv("CRAWLER_CONCURRENT_REQUESTS", "256"))
 # Scrapy's scraper size limit also bounds responses waiting for a parser slot.
 # Zero retains inline parsing for comparison or rollback.
 PARSER_PROCESSES = int(os.getenv("CRAWLER_PARSER_PROCESSES", "4"))
+# Zero keeps inline output; one spawned writer preserves JSONL append order.
+JSON_WRITER_PROCESSES = int(os.getenv("CRAWLER_JSON_WRITER_PROCESSES", "0"))
+JSON_WRITER_BATCH_SIZE = int(os.getenv("CRAWLER_JSON_WRITER_BATCH_SIZE", "8"))
+JSON_WRITER_BATCH_BYTES = int(os.getenv("CRAWLER_JSON_WRITER_BATCH_BYTES", str(4 * 1024**2)))
+JSON_WRITER_FLUSH_INTERVAL_MS = float(os.getenv("CRAWLER_JSON_WRITER_FLUSH_INTERVAL_MS", "50"))
 SCRAPER_SLOT_MAX_ACTIVE_SIZE = int(
     os.getenv("CRAWLER_SCRAPER_SLOT_MAX_ACTIVE_SIZE", "100000000")
 )

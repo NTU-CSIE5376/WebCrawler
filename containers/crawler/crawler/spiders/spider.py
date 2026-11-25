@@ -343,6 +343,13 @@ class HtmlSpider(scrapy.Spider):
         return self.html_parser_pool.close()
 
     def _parser_pool_broken(self) -> None:
+        self._worker_pool_broken("parser_pool_broken", "parser.pool_broken", "parser/pool_broken")
+
+    def _writer_pool_broken(self) -> None:
+        self._worker_pool_broken("json_writer_pool_broken", "json_writer.pool_broken",
+                                 "json_writer/pool_broken")
+
+    def _worker_pool_broken(self, reason, event, counter) -> None:
         if self._parser_failed:
             return
         self._parser_failed = True
@@ -351,16 +358,16 @@ class HtmlSpider(scrapy.Spider):
         self.manual_bulk_crawls.closed = True
         if self.manual_bulk_crawls.poller.running:
             self.manual_bulk_crawls.poller.stop()
-        self.crawler.stats.inc_value("parser/pool_broken")
+        self.crawler.stats.inc_value(counter)
         logger.critical(
-            "parser.pool_broken",
-            extra={"event": "parser.pool_broken", "reason": "parser_pool_broken"},
+            event,
+            extra={"event": event, "reason": reason},
         )
         # Do not await closure inside a response callback: Scrapy must wait for
         # that callback to finish before it can close the spider. Supervisor's
         # autorestart=true restarts the worker even after a clean exit.
-        self.crawler.engine.close_spider(self, reason="parser_pool_broken").addErrback(
-            lambda failure: logger.error("Parser failure shutdown failed: %s", failure),
+        self.crawler.engine.close_spider(self, reason=reason).addErrback(
+            lambda failure: logger.error("Worker failure shutdown failed: %s", failure),
         )
 
     def _emit_heartbeat(self):
@@ -383,6 +390,11 @@ class HtmlSpider(scrapy.Spider):
                 "event": "spider.heartbeat",
                 "parser_inflight": self.html_parser_pool.inflight,
                 "parser_waiting": self.html_parser_pool.waiting,
+                "json_writer_pending": stats.get_value("json_writer/pending", 0),
+                "json_writer_errors": stats.get_value("json_writer/errors", 0),
+                "json_writer_inflight_batches": stats.get_value("json_writer/inflight_batches", 0),
+                "json_writer_buffered_bytes": stats.get_value("json_writer/buffered_bytes", 0),
+                "json_writer_batches": stats.get_value("json_writer/batches", 0),
                 "active_domains": len(self._domain_pending),
                 "pending": self._pending_requests,
                 "pending_max": self._max_pending_requests,
