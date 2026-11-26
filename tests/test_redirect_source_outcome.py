@@ -177,9 +177,24 @@ class RouterRedirectSourceTest(unittest.TestCase):
 class _Cur:
     def __init__(self):
         self.sql = []
+        self.calls = []
 
     def execute(self, sql, params=None):
         self.sql.append(sql)
+        self.calls.append((sql, params))
+
+    def domain_updates(self) -> tuple[set[int], set[int]]:
+        """(paused domain_ids, reset domain_ids) from the domain_state UPDATEs."""
+        paused, reset = set(), set()
+        for sql, params in self.calls:
+            if "UPDATE domain_state" not in sql:
+                continue
+            ids = set(params[0])
+            if "crawl_paused_until = NOW()" in sql:
+                paused |= ids
+            elif "crawl_paused_until = NULL" in sql:
+                reset |= ids
+        return paused, reset
 
     def fetchall(self):
         return []
@@ -227,6 +242,89 @@ class IngestRedirectSourceTest(unittest.TestCase):
         self.assertEqual(domains[22]["num_fetch_ok"], 1)
         self.assertEqual(domains[11]["num_fetch_ok"], 1)
         self.assertNotIn(33, domains)
+
+
+def _ingest_routed(routed: list[dict]) -> _Cur:
+    """Feed router output through IngestDB._bulk_results_unique per shard, as
+    the ingestor does, and return the cursor that saw every statement."""
+    cur = _Cur()
+    db = IngestDB.__new__(IngestDB)
+    by_shard: dict[int, list] = defaultdict(list)
+    for i, rec in enumerate(routed):
+        by_shard[int(rec["shard_id"])].append((i, rec))
+    with patch.object(ingest_db_ops, "execute_values", return_value=[]), \
+         patch.object(IngestDB, "_existing_urls", return_value=set()):
+        for sid, items in by_shard.items():
+            db._bulk_results_unique(cur, sid, items)
+    return cur
+
+
+class RedirectSourceDomainPauseTest(unittest.TestCase):
+    """A -> B cross-domain redirect: B's failure must pause only B, and the
+    synthetic record for A must neither pause nor reset A."""
+
+    SOURCE = "https://www.sayweee.com/vi/explore/gao-vang"  # domain_id 11
+    TARGET = "https://www.weee.com/vi/explore/gao-vang"     # domain_id 22
+
+    def _redirect(self, **kw) -> list[dict]:
+        return _route([{
+            "url": self.TARGET,
+            "source_url": self.SOURCE,
+            "outlinks": [],
+            "is_redirect": True,
+            "redirect_hop_count": 1,
+            **kw,
+        }])
+
+    def test_target_failure_pauses_only_target_domain(self):
+        for reason in ("HttpError 403", "HttpError 429", "HttpError 410"):
+            with self.subTest(reason=reason):
+                routed = self._redirect(status="fail", fail_reason=reason, content=None)
+                src = next(r for r in routed if r.get("redirect_source"))
+                # The cross-domain statistics are still credited to A.
+                self.assertEqual(src["domain_id"], 11)
+                self.assertTrue(src["count_domain_stats"])
+
+                paused, reset = _ingest_routed(routed).domain_updates()
+                self.assertEqual(paused, {22})
+                self.assertEqual(reset, set())
+
+    def test_target_failure_still_counts_for_source_domain_stats(self):
+        routed = self._redirect(status="fail", fail_reason="HttpError 403", content=None)
+        src = next(r for r in routed if r.get("redirect_source"))
+        db = IngestDB.__new__(IngestDB)
+        with patch.object(ingest_db_ops, "execute_values", return_value=[]), \
+             patch.object(IngestDB, "_existing_urls", return_value=set()):
+            ((_, ir),) = db._bulk_results_unique(_Cur(), src["shard_id"], [(0, src)])
+        self.assertEqual((ir.domain_id, ir.is_ok, ir.count_global, ir.count_domain),
+                         (11, False, False, True))
+        self.assertEqual(ir.fail_reason, "HttpError 403")
+
+    def test_successful_source_outcome_does_not_reset_source_pause(self):
+        routed = self._redirect(status="ok", content="<html/>")
+        paused, reset = _ingest_routed(routed).domain_updates()
+        self.assertEqual(paused, set())
+        # Only the host that actually answered may clear its own pause.
+        self.assertEqual(reset, {22})
+
+    def test_deduped_source_outcome_does_not_reset_source_pause(self):
+        routed = _route([{
+            "url": self.TARGET, "source_url": self.SOURCE, "status": "ok",
+            "content": None, "outlinks": [], "is_redirect": True,
+            "redirect_deduped": True,
+        }])
+        self.assertEqual([r["url"] for r in routed], [self.SOURCE])
+        paused, reset = _ingest_routed(routed).domain_updates()
+        self.assertEqual((paused, reset), (set(), set()))
+
+    def test_direct_fetch_still_pauses_and_resets(self):
+        cur = _ingest_routed(_route([
+            {"url": "https://www.sayweee.com/a", "status": "fail",
+             "fail_reason": "HttpError 403", "content": None, "outlinks": []},
+            {"url": "https://www.weee.com/a", "status": "ok",
+             "content": "c", "outlinks": []},
+        ]))
+        self.assertEqual(cur.domain_updates(), ({11}, {22}))
 
 
 if __name__ == "__main__":
