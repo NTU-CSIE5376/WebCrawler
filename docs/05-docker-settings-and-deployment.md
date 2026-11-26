@@ -151,11 +151,13 @@ domains:
     allow: false
   sofascore.com:
     allow: false
+  espn.com:
+    allow: false
 ```
 
-The bundled exclusions reflect the following published policies, checked on
-November 8, 2026. They apply to the registered domain and its subdomains through
-the shared dispatcher, including normal requests, manual jobs, and redirects.
+The table lists the exclusions based on published policies checked on November
+8, 2026. The shared dispatcher applies each domain exclusion to the registered
+domain and its subdomains, including normal requests, manual jobs, and redirects.
 
 | Domain | Reason for `allow: false` | Supporting source |
 | --- | --- | --- |
@@ -254,24 +256,8 @@ posts, profiles, and sharing/composer links without a custom middleware.
 
 #### ESPN
 
-`crawler.middlewares.espn.ESPNMiddleware` skips login, members, and personalization
-paths on ESPN's public frontend before downloading. It preserves content URLs
-and query parameters, identifies as `WebCrawlerBot/1.0`, requests gzip, and disables
-cookies. Configured site headers can override the identity. Robots checks,
-bounded retries, and the common 429 cooldown remain enabled.
-
-The `espn.com` domain policy uses an AutoThrottle target of 32, nominal 64 QPS,
-a shared domain concurrency cap of 16, and one `espn.com` download slot. The target
-controls pacing; the hard cap remains 16 across crawler processes and subdomains.
-Global defaults remain unchanged.
-
-A fresh 10,000-URL benchmark on `www.espn.com` completed in 377.75 seconds with
-9,826 successful HTTP-200 pages (26.01 pages/sec), no HTTP 429s, and no cooldowns.
-First-half and second-half rates were 26.05 and 25.98 pages/sec. The run used one
-crawler with a two-CPU quota and 4 GiB RAM, retaining the production middleware,
-HTML parser, and JSON output pipeline. These are measured tuning values, not
-limits published by ESPN; the benchmark did not validate rates for other ESPN
-hosts. Other hosts share the domain slot, so their cooldowns also affect it.
+`espn.com` uses `allow: false` to block crawling on the domain and all its
+subdomains before any download, including requests from manual crawl jobs.
 
 #### Yahoo
 
