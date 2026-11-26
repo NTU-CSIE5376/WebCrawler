@@ -96,14 +96,28 @@ and the content is stored once:
   fail counters). The feature extractor skips it. It is left out of the
   global fetch counters. In per-domain counters it counts only when the
   redirect crossed domains, so the scheduled domain gets credit without
-  counting the same fetch twice. Switch: `router.emit_redirect_source` /
-  `ROUTER_EMIT_REDIRECT_SOURCE`.
+  counting the same fetch twice. It never pauses or resets a domain: the
+  outcome belongs to the final host, whose own record drives its pause and
+  reset, so a 403/429/410 from B does not pause A, and B answering does not
+  clear a pause on A. Switch: `router.emit_redirect_source` /
+  `ROUTER_EMIT_REDIRECT_SOURCE` (startup event
+  `router.redirect_source_enabled` / `_disabled`).
 - Redirect target dedup: each crawler remembers canonical URLs it fetched
   successfully in the last `CRAWLER_REDIRECT_DEDUP_TTL_SEC` (default 1 h).
   A redirect to one of them is not fetched again. The crawler reports
   `"status": "ok", "redirect_deduped": true` with no content, and the router
   then emits only the queued URL's record. First-hop requests are never
-  skipped. Switch: `CRAWLER_REDIRECT_DEDUP_ENABLED`.
+  skipped. Switch: `CRAWLER_REDIRECT_DEDUP_ENABLED` (startup event
+  `crawler.redirect_dedup_enabled` / `_disabled`).
+- A deduped record is never forwarded as a normal result. With the router
+  switch off it is dropped and counted as `redirect_dedup_dropped` in
+  `route.folder_done`; the queued URL then gets no outcome, as before
+  redirect-source records existed. The feature extractor also skips any
+  `ok` record without content. So each switch can be turned off on its own.
+  Turning off both restores the old behaviour completely.
+- Deploy order: scheduler_ingest (router, ingestor, extractor) before the
+  crawlers, so the new record fields are understood before crawlers emit
+  `redirect_deduped`.
 
 ```json
 {

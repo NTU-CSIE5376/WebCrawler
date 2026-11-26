@@ -74,6 +74,19 @@ class HtmlSpider(scrapy.Spider):
             if crawler.settings.getbool("REDIRECT_DEDUP_ENABLED", False)
             else None
         )
+        dedup_event = (
+            "crawler.redirect_dedup_enabled" if spider.recent_fetches is not None
+            else "crawler.redirect_dedup_disabled"
+        )
+        logger.info(
+            dedup_event,
+            extra={
+                "event": dedup_event,
+                "ttl_sec": crawler.settings.getfloat("REDIRECT_DEDUP_TTL_SEC", 3600.0),
+                "max_entries": crawler.settings.getint("REDIRECT_DEDUP_MAX_ENTRIES", 200000),
+                "switch": "CRAWLER_REDIRECT_DEDUP_ENABLED",
+            },
+        )
 
         crawler.signals.connect(spider.on_idle, signal=signals.spider_idle)
         crawler.signals.connect(spider.req_scheduled, signal=signals.request_scheduled)

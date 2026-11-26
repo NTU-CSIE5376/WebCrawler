@@ -49,9 +49,17 @@ class ExtractService:
                 if rec.get("status") != "new":
                     records += 1
                 try:
-                    # Redirect-source records only carry the queued URL's
-                    # fetch outcome; content and features stay on the final URL.
-                    if rec.get("status") == "ok" and not rec.get("redirect_source"):
+                    # Redirect-source and crawler-deduped records only carry
+                    # a fetch outcome; content and features stay on the final
+                    # URL. Any other ok record without content (e.g. written
+                    # by a router that predates redirect dedup) has nothing to
+                    # extract either, so skip it instead of erroring.
+                    if (
+                        rec.get("status") == "ok"
+                        and not rec.get("redirect_source")
+                        and not rec.get("redirect_deduped")
+                        and isinstance(rec.get("content"), str)
+                    ):
                         feat = extract_basic(rec)
                         self.db.process(feat)
                         yt = extract_youtube(rec)

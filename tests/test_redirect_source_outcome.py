@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from containers.scheduler_ingest.feature_extractor.service import ExtractService
 from containers.scheduler_ingest.ingestor import db_ops as ingest_db_ops
 from containers.scheduler_ingest.ingestor.db_ops import IngestDB, IngestResult
 from containers.scheduler_ingest.ingestor.service import IngestService
@@ -325,6 +326,144 @@ class RedirectSourceDomainPauseTest(unittest.TestCase):
              "content": "c", "outlinks": []},
         ]))
         self.assertEqual(cur.domain_updates(), ({11}, {22}))
+
+
+# ------------------------------------------- rollback: router switch off
+
+def _route_with(recs: list[dict], **cfg_overrides) -> tuple[list[dict], list[dict]]:
+    """Route with RouterConfig overrides; returns (records, folder_done logs)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        svc = _router(tmp)
+        svc.cfg = svc.cfg.__class__(**{**svc.cfg.__dict__, **cfg_overrides})
+        folder = Path(tmp) / "in"
+        folder.mkdir()
+        (folder / "0000.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+        with patch.object(router_service, "DomainResolver", _FakeResolver), \
+             patch.object(router_service.logger, "info") as info:
+            svc.process_folder(folder)
+        done = [c.kwargs["extra"] for c in info.call_args_list
+                if c.args and c.args[0] == "route.folder_done"]
+        out = [json.loads(l) for p in Path(tmp).glob("ingestor_*/**/*.jsonl")
+               for l in p.read_text().splitlines()]
+    return out, done
+
+
+class _FeatureDB:
+    def __init__(self):
+        self.features, self.youtube = [], []
+
+    def process(self, feat):
+        self.features.append(feat)
+
+    def process_youtube(self, yt):
+        self.youtube.append(yt)
+
+
+def _extract(recs: list[dict]) -> tuple[_FeatureDB, list[dict]]:
+    """Run ExtractService over recs; returns (db, stats counters written)."""
+    db, written = _FeatureDB(), []
+    stats = SimpleNamespace(write=lambda **kw: written.append(kw["counters"]))
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = Path(tmp)
+        (folder / "0000.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+        ExtractService(0, db, stats).process_folder(folder)
+    return db, written
+
+
+DEDUPED = {
+    "url": "https://pacificleague.com/maintenance/",
+    "source_url": "https://pacificleague.com/news/1",
+    "status": "ok",
+    "fail_reason": None,
+    "content": None,
+    "outlinks": [],
+    "is_redirect": True,
+    "redirect_deduped": True,
+}
+
+
+class RedirectSourceSwitchOffTest(unittest.TestCase):
+    """ROUTER_EMIT_REDIRECT_SOURCE=false while crawler dedup stays on."""
+
+    def test_deduped_redirect_is_dropped_not_forwarded_as_empty_ok(self):
+        out, done = _route_with([DEDUPED], emit_redirect_source=False)
+        self.assertEqual(out, [])
+        self.assertEqual(done[0]["redirect_dedup_dropped"], 1)
+        self.assertEqual(done[0]["redirect_sources"], 0)
+
+    def test_normal_records_unaffected_by_drop(self):
+        fetched = {"url": "https://www.weee.com/a", "source_url": "https://www.sayweee.com/a",
+                   "status": "ok", "content": "<html/>", "outlinks": []}
+        out, done = _route_with([DEDUPED, fetched], emit_redirect_source=False)
+        self.assertEqual([r["url"] for r in out], ["https://www.weee.com/a"])
+        self.assertNotIn("redirect_source", out[0])
+        self.assertEqual(done[0]["redirect_dedup_dropped"], 1)
+
+    def test_switch_off_output_is_safe_for_extractor_and_ingestor(self):
+        fetched = {"url": "https://www.weee.com/a", "source_url": "https://www.sayweee.com/a",
+                   "status": "ok", "content": "<html/>", "outlinks": []}
+        out, _ = _route_with([DEDUPED, fetched], emit_redirect_source=False)
+        db, written = _extract(out)
+        self.assertEqual([f["url"] for f in db.features], ["https://www.weee.com/a"])
+        self.assertEqual(written, [])  # no extract_error
+        self.assertEqual(_ingest_routed(out).domain_updates(), (set(), {22}))
+
+    def test_switch_on_output_is_safe_for_extractor(self):
+        out, done = _route_with([DEDUPED], emit_redirect_source=True)
+        self.assertEqual([r["url"] for r in out], ["https://pacificleague.com/news/1"])
+        self.assertEqual(done[0]["redirect_sources"], 1)
+        self.assertEqual(done[0]["redirect_dedup_dropped"], 0)
+        db, written = _extract(out)
+        self.assertEqual((db.features, written), ([], []))
+
+    def test_extractor_skips_metadata_only_ok_record(self):
+        # What a router without dedup support forwards for a deduped redirect.
+        legacy = {**DEDUPED, "shard_id": 5, "domain_id": 44}
+        db, written = _extract([legacy, {**legacy, "redirect_deduped": False}])
+        self.assertEqual((db.features, db.youtube, written), ([], [], []))
+
+
+class RedirectSourceConfigTest(unittest.TestCase):
+    def _load(self, router_block: dict, env: dict) -> RouterConfig:
+        import os
+        from unittest.mock import MagicMock
+
+        import yaml
+        from containers.scheduler_ingest.router.service import load_router_config
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "ingest.yaml"
+            # The repo's ingest.yaml as a prod host may still have it: without
+            # the new router.emit_redirect_source key unless the test sets it.
+            repo_cfg = Path(__file__).resolve().parents[1] / "containers/scheduler_ingest/config/ingest.yaml"
+            raw = yaml.safe_load(repo_cfg.read_text())
+            raw["router"].pop("emit_redirect_source", None)
+            raw["router"].update(router_block)
+            p.write_text(yaml.safe_dump(raw))
+            saved = os.environ.pop("ROUTER_EMIT_REDIRECT_SOURCE", None)
+            try:
+                with patch.dict(os.environ, env), \
+                     patch.object(router_service.psycopg2, "connect", MagicMock()), \
+                     patch.object(router_service, "load_sharding_config",
+                                  return_value=({}, set())):
+                    return load_router_config(str(p), 0)
+            finally:
+                if saved is not None:
+                    os.environ["ROUTER_EMIT_REDIRECT_SOURCE"] = saved
+
+    def test_config_without_new_key_defaults_on(self):
+        self.assertTrue(self._load({}, {}).emit_redirect_source)
+
+    def test_env_kill_switch_overrides_config(self):
+        self.assertFalse(self._load({"emit_redirect_source": True},
+                                    {"ROUTER_EMIT_REDIRECT_SOURCE": "false"}).emit_redirect_source)
+
+    def test_startup_log_names_state(self):
+        for flag, event in ((True, "router.redirect_source_enabled"),
+                            (False, "router.redirect_source_disabled")):
+            with self.subTest(flag=flag), patch.object(router_service.logger, "info") as info:
+                cfg = SimpleNamespace(emit_redirect_source=flag)
+                router_service.log_redirect_source_state(cfg)
+                self.assertEqual(info.call_args.kwargs["extra"]["event"], event)
 
 
 if __name__ == "__main__":

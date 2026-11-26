@@ -90,6 +90,7 @@ class RouterConfig:
 class RouterService:
     def __init__(self, cfg: RouterConfig):
         self.cfg = cfg
+        log_redirect_source_state(cfg)
         self.sharder = ShardRouter(
             num_shards=self.cfg.num_shards,
             shards_per_ingestor=self.cfg.shards_per_ingestor,
@@ -170,6 +171,10 @@ class RouterService:
         record_cnt = 0
         records = 0
         links = 0
+        redirect_sources = 0
+        # Crawler-deduped redirects that could not become a redirect-source
+        # record (switch off or no source_url): dropped, see below.
+        redirect_dedup_dropped = 0
 
         domain_cache = self._domain_cache_for_folder()
 
@@ -266,14 +271,23 @@ class RouterService:
                             "redirect_hop_count": rec.get("redirect_hop_count"),
                         }
 
-                        # A deduped redirect did not fetch the target again:
-                        # only the queued URL gets an outcome.
-                        if not (rec.get("redirect_deduped") and source_out is not None):
+                        # A deduped redirect did not fetch the target again
+                        # and carries no content: it is never forwarded as a
+                        # normal record (the extractor and the target's row
+                        # would treat it as a fresh, empty fetch). With a
+                        # redirect-source record only the queued URL gets an
+                        # outcome; without one (switch off) it is dropped,
+                        # which matches the pre-redirect-source behaviour of
+                        # the queued URL getting no outcome.
+                        dropped = bool(rec.get("redirect_deduped")) and source_out is None
+                        if not rec.get("redirect_deduped"):
                             pending[ingestor_id].append(out)
                         if source_out is not None:
                             pending[source_out.pop("_ingestor_id")].append(source_out)
                         self._flush(pending)
                         records += 1
+                        redirect_sources += source_out is not None
+                        redirect_dedup_dropped += dropped
                         links += len(new_outlinks)
                         break # success
 
@@ -329,6 +343,8 @@ class RouterService:
                 "errors": error,
                 "records": records,
                 "links": links,
+                "redirect_sources": redirect_sources,
+                "redirect_dedup_dropped": redirect_dedup_dropped,
                 "duration_s": duration,
             },
         )
@@ -480,4 +496,26 @@ def load_router_config(path: str, router_id: int) -> RouterConfig:
             if "ROUTER_EMIT_REDIRECT_SOURCE" in os.environ
             else bool(r.get("emit_redirect_source", True))
         ),
+    )
+
+
+def log_redirect_source_state(cfg: RouterConfig) -> None:
+    """One startup line so a rollout or rollback can be confirmed in Loki."""
+    if "ROUTER_EMIT_REDIRECT_SOURCE" in os.environ:
+        source = "env ROUTER_EMIT_REDIRECT_SOURCE"
+    else:
+        source = "router.emit_redirect_source (default true)"
+    event = (
+        "router.redirect_source_enabled" if cfg.emit_redirect_source
+        else "router.redirect_source_disabled"
+    )
+    logger.info(
+        event,
+        extra={
+            "event": event,
+            "source": source,
+            # With the switch off, crawler-deduped redirects are dropped
+            # (counted as redirect_dedup_dropped in route.folder_done).
+            "deduped_redirects": "redirect_source" if cfg.emit_redirect_source else "dropped",
+        },
     )
