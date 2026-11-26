@@ -34,6 +34,12 @@ class IngestResult:
     is_ok: bool = False
     is_upd: bool = False
     fail_reason: str | None = None
+    # Redirect-source outcomes (router `redirect_source`) update the queued
+    # row but are not an extra fetch: they skip the global counters, and the
+    # per-domain ones unless the redirect crossed domains. They never pause or
+    # reset a domain (the outcome belongs to the redirect target's host).
+    count_global: bool = True
+    count_domain: bool = True
 
 
 BATCH_SIZE = 2000
@@ -387,6 +393,11 @@ class IngestDB:
                 "is_redirect": rec.get("is_redirect"),
                 "redirect_hop_count": rec.get("redirect_hop_count"),
                 "robots_bits": self._robots_bits(is_ok, rec.get("fail_reason")),
+                "redirect_source": bool(rec.get("redirect_source")),
+                "count_domain": (
+                    bool(rec.get("count_domain_stats"))
+                    if rec.get("redirect_source") else True
+                ),
             })
             if is_ok and content_hash is not None:
                 check_urls.append(url)
@@ -501,10 +512,18 @@ class IngestDB:
         # deadline indefinitely forward. The ok-majority requirement on
         # reset prevents a single stale in-flight ok from wiping out a
         # pause set by dozens of fails in the same chunk.
+        #
+        # Only real fetches of this record's host take part. A redirect-source
+        # record carries the *final* host's outcome under the queued URL's
+        # domain: a 403/429/410 from B must not pause A, and B answering must
+        # not clear a pause on A. Its statistics still count via count_domain
+        # (see IngestResult); B's own record drives B's pause/reset.
         pause_by_interval: dict[str, set[int]] = defaultdict(set)
         ok_counts: Counter[int] = Counter()
         fail_counts: Counter[int] = Counter()
         for d in decoded:
+            if d["redirect_source"]:
+                continue
             if d["is_ok"]:
                 ok_counts[d["domain_id"]] += 1
                 continue
@@ -544,6 +563,8 @@ class IngestDB:
                 is_ok=d["is_ok"],
                 is_upd=d["is_upd"],
                 fail_reason=d["fail_reason"],
+                count_global=not d["redirect_source"],
+                count_domain=d["count_domain"],
             ))
             for d in decoded
         ]
