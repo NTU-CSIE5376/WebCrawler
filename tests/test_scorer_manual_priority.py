@@ -74,7 +74,7 @@ class ScorerManualPriorityTest(unittest.TestCase):
         session.connection = lambda: type("C", (), {"connection": session})()
         svc = GoldenDiscoveryRankerService(cfg=cfg, Session=session, scorer=None)
         self.assertEqual(svc._score_batch(0), 0)
-        return " ".join(cursor.sql[0].split())
+        return " ".join(next(sql for sql in cursor.sql if "FOR UPDATE" in sql or "CROSS JOIN LATERAL" in sql).split())
 
     def test_legacy_path_skips_manual_priority(self):
         self.assertIn(MANUAL_PRIORITY_GUARD, self._picked_sql(False))

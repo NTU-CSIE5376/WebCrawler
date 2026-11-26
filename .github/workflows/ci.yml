@@ -32,6 +32,16 @@ jobs:
         run: task install
       - name: Test
         run: task test
+      - name: Test approved configuration and ranker
+        if: matrix.service == 'scheduler_ingest'
+        working-directory: .
+        run: >-
+          containers/scheduler_ingest/.venv/bin/python -m pytest -q
+          tests/test_approved_control_sitemap_config.py
+          tests/test_scorer_bounded_claims.py
+          tests/test_scorer_manual_priority.py
+          tests/test_golden_discovery_strategy_and_migration.py
+          tests/test_golden_discovery_scorer_shard_ids.py
 
   golden_inject:
     name: golden_inject
@@ -62,6 +72,7 @@ jobs:
         run: >-
           python -m pip install pytest==8.4.2 psycopg2-binary==2.9.11
           PyYAML==6.0.2 tldextract==5.1.1 sqlalchemy==2.0.44
+          joblib==1.5.3 numpy==2.1.2 scipy==1.17.0
       - name: Test injection, retries and real database recovery
         run: >-
           python -m pytest -q -p no:cacheprovider
@@ -69,3 +80,9 @@ jobs:
           tests/test_golden_inject_srsltid_variant.py
           tests/test_golden_inject_batch.py
           tests/test_golden_inject_integration.py
+          tests/test_cleanup_crawl_result.py
+      - name: Test bounded ranker claims against PostgreSQL
+        env:
+          RANKER_CLAIM_TEST_DSN: postgresql://golden_test:golden_test@127.0.0.1:5432/golden_test
+          RANKER_CLAIM_TEST_LARGE: '1'
+        run: python -m pytest -q -p no:cacheprovider tests/test_scorer_claims_db.py

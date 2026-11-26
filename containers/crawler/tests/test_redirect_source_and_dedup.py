@@ -168,7 +168,7 @@ def test_errback_reports_deduped_redirect_as_resolved():
 def _write(tmp_path, item):
     p = JsonPipeline(result_dir_template=str(tmp_path / "{id}"), interval_minutes=10)
     p.base_dir = tmp_path
-    p.process_item(item, spider=None)
+    p.process_item(item, spider=SimpleNamespace())
     (path,) = list(tmp_path.rglob("*.jsonl"))
     return json.loads(path.read_text().splitlines()[0])
 

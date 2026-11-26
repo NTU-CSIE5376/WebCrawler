@@ -1,12 +1,7 @@
 """Delete ``/data/ipc/crawl_result`` folders only after every consumer has read them.
 
-Today a root cron on Host2 deletes crawl_result files older than 8 hours,
-whether or not they were processed. When the router or ingestor falls more
-than 8 h behind (it did on 2026-11-04 and 11-05, after the move to YB), folders
-are deleted before they are read, and those crawl results and outlinks are lost
-without any error: FolderReader just skips the missing folders.
-
-This script replaces the age-only rule with a progress-based one:
+Age-only cleanup can remove results before a slow or stopped consumer reads
+them. This script uses consumer progress instead:
 
   crawl_result/crawler_NN/<date>/<HHMM>   is read by router NN
   crawl_result/ingestor_NN/<date>/<HHMM>  is read by ingestor NN and extractor NN
@@ -14,26 +9,26 @@ This script replaces the age-only rule with a progress-based one:
 
 A folder is deleted when
   * every consumer's progress file (``/data/ipc/progress/<svc>/NN.json``) is at
-    or past it, and it is at least ``--min-age-hours`` old (default 8, which
-    keeps HTML around as long as the current cron does), or
-  * it is older than ``--max-age-hours`` (default 48) even though it was not
-    consumed. This is the disk safety net for a stopped consumer; each such
-    folder is logged as UNCONSUMED so the loss is visible.
+    or past it, and it is at least ``--min-age-hours`` old (default 2).
 
-A base dir whose consumer has no progress file is left alone until the safety
-net applies. Folder names are UTC (FolderReader/current_interval), so ages are
-computed from the name, not mtime.
+``--max-age-hours`` defaults to 0: unconsumed folders and folders with missing
+consumer progress are kept regardless of age. A positive value explicitly opts
+into age-based deletion of unconsumed data and logs each loss as UNCONSUMED.
+Production does not enable that override; disk pressure requires operator
+attention rather than automatic deletion of unread results.
 
-Dry run by default; pass ``--apply`` to delete. Suggested cron (Host2, root),
-replacing the 8 h ``find ... -delete`` job:
+Folder names are UTC (FolderReader/current_interval), so ages are computed from
+the name, not mtime or the time consumption completed. This is not a promise to
+retain data for two more hours after consumption.
 
-  */30 * * * * cd /opt/WebCrawler && python3 -m scripts.cleanup_crawl_result --apply \\
-      >> /var/log/crawl_result_cleanup.log 2>&1
+Dry run by default; pass ``--apply`` to delete. The production cron template is
+``ops/production/cron.d/crawl-result-cleanup``; it explicitly sets both approved
+age values and runs inside scheduler_ingest against the shared IPC mount.
 
 Examples:
   python -m scripts.cleanup_crawl_result                        # dry run
   python -m scripts.cleanup_crawl_result --apply
-  python -m scripts.cleanup_crawl_result --apply --min-age-hours 2 --max-age-hours 72
+  python -m scripts.cleanup_crawl_result --apply --min-age-hours 2 --max-age-hours 0
 """
 
 from __future__ import annotations
@@ -261,10 +256,10 @@ def run(
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=DEFAULT_CONFIG)
-    ap.add_argument("--min-age-hours", type=float, default=8.0,
-                    help="never delete a folder younger than this, consumed or not (default 8)")
-    ap.add_argument("--max-age-hours", type=float, default=48.0,
-                    help="delete folders older than this even if unconsumed; 0 disables (default 48)")
+    ap.add_argument("--min-age-hours", type=float, default=2.0,
+                    help="never delete a folder younger than this, consumed or not (default 2)")
+    ap.add_argument("--max-age-hours", type=float, default=0.0,
+                    help="opt into deletion even if unconsumed; 0 disables (default 0)")
     ap.add_argument("--apply", action="store_true", help="delete; without it, only report")
     args = ap.parse_args(argv)
 

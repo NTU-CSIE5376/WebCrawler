@@ -6,7 +6,7 @@ max_content_length: 314572800  # 300 MiB
 ingest_config_path: "containers/scheduler_ingest/config/ingest.yaml"
 
 postgres:
-  dsn: "postgresql+psycopg2://crawler:crawler@172.16.191.1:5432/crawlerdb"
+  dsn: "postgresql+psycopg2://yugabyte@172.16.191.2:5433/crawlerdb"
 
 manual_bulk_crawl:
   gc_interval_sec: 3600  # Expired manual bulk crawl jobs are removed hourly.

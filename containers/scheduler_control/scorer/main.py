@@ -138,6 +138,10 @@ def main() -> None:
             f"{ENV_PREFIX}_MIN_AGE_DAYS",
             int(scorer_raw.get("min_age_days", 3)),
         ),
+        statement_timeout_sec=_env_int(
+            f"{ENV_PREFIX}_STATEMENT_TIMEOUT_SEC",
+            int(scorer_raw.get("statement_timeout_sec", 30)),
+        ),
     )
 
     svc = GoldenDiscoveryRankerService(cfg=cfg, Session=Session, scorer=scorer)

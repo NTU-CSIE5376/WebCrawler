@@ -74,6 +74,21 @@ Runtime behavior of `golden_discovery_ranker_v1`:
 3. Scores those URLs with the artifact heads and writes the combined ranker score into the existing `url_score`.
 4. Sets `url_score_updated_at=NOW()` as the only completion marker; it does not append experiment logs or score-history rows.
 
+With domain-priority steering enabled, the ranker discovers candidate URLs
+without locking the per-domain candidates consumed by the global sort. It then
+claims at most `batch_size` rows once with `FOR UPDATE OF u SKIP LOCKED`,
+rechecks eligibility, and reads current feature values. A partial batch is scored,
+updated, and committed immediately; the ranker never refills it by searching again
+while retaining row locks. An empty claim advances to the next shard. Age, TTL,
+manual-priority, and domain-tier gates apply to both discovery and claiming.
+Claims remain held through scoring and the score update. Each SQL statement in
+the scoring transaction has a 30-second timeout, configured by
+`golden_discovery_ranker_v1.statement_timeout_sec` or
+`GOLDEN_DISCOVERY_RANKER_V1_STATEMENT_TIMEOUT_SEC`. This is a per-statement limit,
+not a deadline for Python model inference or the whole transaction. A canceled
+statement rolls back the batch, releases its locks, logs
+`golden_discovery_ranker_v1.statement_timeout`, and advances to the next shard.
+
 ## 2.3 `crawler` Container
 
 Runs `supervisord` with:
@@ -101,7 +116,7 @@ Crawler worker behavior:
 
 ## 2.4 `scheduler_ingest` Container
 
-The container has an 8-CPU limit shared by 4 program families via `supervisord`:
+The container has a 32-CPU limit shared by 4 program families via `supervisord`:
 
 - `router` x16
 - `ingestor` x16
@@ -121,14 +136,62 @@ Responsibilities:
 - For each outlink, ensure destination domain exists and emit separate `status="new"` records.
 - Write transformed records to `ingestor_{id}` bucket JSONL files.
 
+During Host2 memory-incident recovery, routers use the original direct routing
+and per-record parent-score queries. The hostname routing cache and batched
+score prefetch are disabled. Domain resolution and output writes remain per
+record. `route.folder_done` retains its input/output counts and duration fields
+to measure throughput and compare it with the ten-minute input interval.
+
+This rollback does not bound the existing whole-file/whole-folder reads or
+shrink queued buckets. Do not restart the pipeline solely because the rollback
+tests pass: inspect queued bucket sizes and coordinate recovery with its owner.
+
+On TERM or INT, a router finishes its current folder and saves progress before
+exiting. Supervisor allows 20 minutes before forcing termination; Compose gives
+the scheduler-ingest container 21 minutes. Rebuild/recreate the container to
+apply these deployment settings. A crash or forced kill can still replay the
+last incomplete folder under the existing folder-level checkpoint scheme.
+
 ### Ingestor (x16)
 
 Input: router output folders `ingestor_{id}`.
 
+The ingestor snapshots input filenames and streams the folder twice: discoveries
+first, then crawl results. Each shard buffers at most 128,000 discovery records or
+2,000 crawl results, with a shared
+2 GiB estimated decoded-record budget per ingestor. Reaching either limit
+flushes a database batch; the byte limit flushes the largest shard buffer first.
+One oversized record can exceed the budget while it is decoded, but is flushed
+immediately. JSONL readers in the router and extractor also yield one record at
+a time. Ready input folders must remain unchanged during the two passes.
+
+`ingestor.discovery_batch_size` configures discovery batches; the
+`INGESTOR_DISCOVERY_BATCH_SIZE` environment variable overrides it.
+`ingestor.max_buffer_mib` configures the shared buffer budget in MiB; the
+`INGESTOR_MAX_BUFFER_MIB` environment variable overrides it. Both settings must
+be positive. For example, `max_buffer_mib: 2048` allows 2 GiB of estimated input
+buffers per worker, or 32 GiB across 16 workers, in addition to model and database
+working memory. Changes apply when the ingestor worker starts.
+The configured inline-scoring budget is 30 seconds per discovery batch, controlled
+by `golden_discovery_ranker_v1.ingest_inline_score_timeout_sec` or the
+`GOLDEN_DISCOVERY_RANKER_V1_INGEST_INLINE_SCORE_TIMEOUT_SEC` environment override.
+Scoring still runs in 5,000-URL chunks. Startup logs include the effective scoring
+budget and chunk size alongside the record and memory limits.
+`ingest.batch_done` records input count, count
+after deduplication/filtering, kind, and batch processing duration (including
+inline scoring and database work) for tuning.
+
+Discovery deduplication and URL normalization run within each flushed batch.
+Duplicates in later batches use the existing database UPSERT, preserving additive
+inlink counts and parent/priority conflict handling. This can increase database
+work and audit-event counts compared with folder-wide deduplication. Statistics
+still accumulate per domain until the folder finishes, so the byte budget bounds
+record buffers rather than the entire process RSS.
+
 Responsibilities:
 
 - `status="new"` records: insert new URL candidates into `url_state_current_{shard}` and history.
-  - Trap filter (`trap_filter` in `ingest.yaml`, `ingestor/trap_filter.py`), applied before any DB work: strip the approved params in `normalize_params` (default only `srsltid`, the same policy as `golden_inject.py`), merge links that collapse to the same URL, log what stripping every other tracking / session param would change without applying it (`would_normalize`), then drop links hitting a high-confidence trap rule (`libs/frontier/trap_rules.HIGH_CONFIDENCE`: path repeat, too many path segments, nested redirect, faceted navigation, calendar plugin). Every affected link is appended to `/data/ipc/trap_filter/ingestor_{id}/YYYY-MM-DD.jsonl.gz`; `scripts/trap_filter_golden_check.py` measures golden false kills from these logs. Crawl results are never filtered. Rule definitions: [10-frontier-trap-rules.md](10-frontier-trap-rules.md).
+  - Trap filter (`ingestor/trap_filter.py`; on by default, optional `trap_filter` block in `ingest.yaml` to override, see [10](10-frontier-trap-rules.md#configuration-and-rollout)), applied before any DB work: strip the approved params in `normalize_params` (default only `srsltid`, the same policy as `golden_inject.py`), merge links that collapse to the same URL, log what stripping every other tracking / session param would change without applying it (`would_normalize`), then drop links hitting a high-confidence trap rule (`libs/frontier/trap_rules.HIGH_CONFIDENCE`: path repeat, too many path segments, nested redirect, faceted navigation, calendar plugin). Every affected link is appended to `/data/ipc/trap_filter/ingestor_{id}/YYYY-MM-DD.jsonl.gz`; `scripts/trap_filter_golden_check.py` measures golden false kills from these logs. Crawl results are never filtered. Rule definitions: [10-frontier-trap-rules.md](10-frontier-trap-rules.md).
   - Links whose domain has `domain_state.discovery_frozen=TRUE` are skipped (frontier budget; see `frontier_gc` in 2.2), so frozen domains stop accumulating new frontier rows.
   - If `GOLDEN_DISCOVERY_RANKER_V1_INGEST_INLINE_ENABLED=true`, check which URLs are truly new, score those with the mounted ranker artifact before writing them to DB, and fall back to unscored insert when the inline scoring time budget is exhausted.
   - If inline scoring is disabled, new URLs keep `url_score_updated_at=NULL` and the background ranker can score them later.

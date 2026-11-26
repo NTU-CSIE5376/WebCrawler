@@ -27,6 +27,8 @@ x-loki-logging: &loki-logging
 
 services:
   postgres:
+    mem_limit: ${POSTGRES_MEMORY_LIMIT:-128g}
+    memswap_limit: ${POSTGRES_MEMORY_LIMIT:-128g}
     image: postgres:16
     container_name: postgres
     command: >
@@ -62,6 +64,8 @@ services:
         max-file: "10"
 
   scheduler_control:
+    mem_limit: ${SCHEDULER_CONTROL_MEMORY_LIMIT:-48g}
+    memswap_limit: ${SCHEDULER_CONTROL_MEMORY_LIMIT:-48g}
     build:
       context: .
       dockerfile: containers/scheduler_control/Dockerfile
@@ -73,10 +77,16 @@ services:
       - /data/ipc:/data/ipc
     environment:
       - GOLDEN_DISCOVERY_RANKER_V1_ENABLED=true
+      - GOLDEN_DISCOVERY_RANKER_V1_MODEL_KIND=v2
+      - GOLDEN_DISCOVERY_RANKER_V1_ARTIFACT=/app/artifacts/golden_discovery_ranker_v2.joblib
+      - GOLDEN_DISCOVERY_RANKER_V1_V1_FALLBACK_ARTIFACT=/app/artifacts/golden_discovery_ranker_v1.joblib
+      - GOLDEN_DISCOVERY_RANKER_V1_DOMAIN_PRIORITY_STEERING_ENABLED=true
       - OFFERER_STRATEGY=golden_discovery_ranker_v1
     logging: *loki-logging
 
   api:
+    mem_limit: ${API_MEMORY_LIMIT:-8g}
+    memswap_limit: ${API_MEMORY_LIMIT:-8g}
     build:
       context: .
       dockerfile: containers/api/Dockerfile
@@ -97,12 +107,16 @@ services:
         max-file: "5"
 
   scheduler_ingest:
+    mem_limit: ${SCHEDULER_INGEST_MEMORY_LIMIT:-128g}
+    memswap_limit: ${SCHEDULER_INGEST_MEMORY_LIMIT:-128g}
     build:
       context: .
       dockerfile: containers/scheduler_ingest/Dockerfile
     container_name: scheduler_ingest
     cpus: 32
     init: true
+    # Longer than the router's 20-minute graceful shutdown deadline.
+    stop_grace_period: 21m
     restart: unless-stopped
     volumes:
       - ./:/app
@@ -112,14 +126,15 @@ services:
     logging: *loki-logging
 
   crawler:
+    mem_limit: ${CRAWLER_MEMORY_LIMIT:-64g}
+    memswap_limit: ${CRAWLER_MEMORY_LIMIT:-64g}
     build:
       context: .
       dockerfile: containers/crawler/Dockerfile
     container_name: crawler
     init: true
     environment:
-      - MANUAL_BULK_CRAWL_SCHEDULING_POLICY
-      - MANUAL_BULK_CRAWL_SHARE_PERCENT
+      - MANUAL_BULK_CRAWL_SCHEDULING_POLICY=weighted
     dns:
       - 8.8.8.8
       - 1.1.1.1
@@ -131,6 +146,8 @@ services:
     logging: *loki-logging
 
   sitemap_patroller:
+    mem_limit: ${SITEMAP_PATROLLER_MEMORY_LIMIT:-8g}
+    memswap_limit: ${SITEMAP_PATROLLER_MEMORY_LIMIT:-8g}
     build:
       context: .
       dockerfile: containers/sitemap_patroller/Dockerfile
@@ -146,6 +163,8 @@ services:
     logging: *loki-logging
 
   loki:
+    mem_limit: ${LOKI_MEMORY_LIMIT:-8g}
+    memswap_limit: ${LOKI_MEMORY_LIMIT:-8g}
     image: grafana/loki:3.0.0
     container_name: loki
     restart: unless-stopped
@@ -167,6 +186,8 @@ services:
         max-file: "5"
 
   grafana:
+    mem_limit: ${GRAFANA_MEMORY_LIMIT:-2g}
+    memswap_limit: ${GRAFANA_MEMORY_LIMIT:-2g}
     image: grafana/grafana:11.0.0
     container_name: grafana
     restart: unless-stopped

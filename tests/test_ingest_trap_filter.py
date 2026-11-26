@@ -284,3 +284,39 @@ class GoldenMatchTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LoadTrapFilterConfigTest(unittest.TestCase):
+    """Rollout must not depend on the host's ingest.yaml carrying the block."""
+
+    def _load(self, raw):
+        from containers.scheduler_ingest.ingestor import main as ingest_main
+        with self.assertLogs("ingestor", level="INFO") as logs:
+            tf = ingest_main._load_trap_filter(raw, 4)
+        events = [r.event for r in logs.records if hasattr(r, "event")]
+        return tf, events, logs.records
+
+    def test_config_without_block_enables_reviewed_defaults(self):
+        tf, events, records = self._load({"ingestor": {}})
+        self.assertIsNotNone(tf)
+        self.assertEqual(events, ["ingest.trap_filter_enabled"])
+        self.assertEqual(records[0].config_source, "default")
+        self.assertEqual(tf.cfg, TrapFilterConfig(log_dir="/data/ipc/trap_filter/ingestor_04"))
+
+    def test_partial_block_keeps_defaults_for_missing_keys(self):
+        tf, _, records = self._load({"trap_filter": {"drop": False}})
+        self.assertEqual(records[0].config_source, "yaml")
+        self.assertEqual(tf.cfg, TrapFilterConfig(
+            drop=False, log_dir="/data/ipc/trap_filter/ingestor_04"))
+
+    def test_kill_switch_logs_disabled(self):
+        tf, events, records = self._load({"trap_filter": {"enabled": False}})
+        self.assertIsNone(tf)
+        self.assertEqual(events, ["ingest.trap_filter_disabled"])
+        self.assertEqual(records[0].config_source, "yaml")
+
+    def test_shipped_ingest_yaml_runs_filter_with_defaults(self):
+        import yaml
+        path = Path(__file__).resolve().parents[1] / "containers/scheduler_ingest/config/ingest.yaml"
+        tf, _, _ = self._load(yaml.safe_load(path.read_text()))
+        self.assertEqual(tf.cfg, TrapFilterConfig(log_dir="/data/ipc/trap_filter/ingestor_04"))

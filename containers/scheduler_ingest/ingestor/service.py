@@ -1,16 +1,33 @@
 from __future__ import annotations
 import logging
+import sys
+import time
 from pathlib import Path
 from collections import defaultdict
 
 from libs.ipc.jsonio import read_json, read_jsonl
 from libs.stats.delta_writer import StatsDeltaWriter
 
-from .db_ops import IngestDB, IngestResult, BATCH_SIZE
+from .db_ops import IngestDB, BATCH_SIZE
 from .trap_filter import TrapFilter
 
 
 logger = logging.getLogger("ingestor")
+MAX_BUFFER_BYTES = 64 * 1024 * 1024
+
+
+def _record_size(value):
+    """Conservative decoded JSON size, including nested content/outlinks.
+
+    Shared keys/scalars are counted repeatedly, so the budget is an estimate
+    rather than an exact RSS measurement. JSON records contain no cycles.
+    """
+    size = sys.getsizeof(value)
+    if isinstance(value, dict):
+        size += sum(_record_size(k) + _record_size(v) for k, v in value.items())
+    elif isinstance(value, list):
+        size += sum(_record_size(v) for v in value)
+    return size
 
 
 class IngestService:
@@ -20,11 +37,19 @@ class IngestService:
         db: IngestDB,
         stats: StatsDeltaWriter,
         trap_filter: TrapFilter | None = None,
+        max_buffer_bytes: int = MAX_BUFFER_BYTES,
+        discovery_batch_size: int | None = None,
     ):
+        if max_buffer_bytes <= 0:
+            raise ValueError("max_buffer_bytes must be positive")
         self.ingestor_id = ingestor_id
         self.db = db
         self.stats = stats
         self.trap_filter = trap_filter
+        self.max_buffer_bytes = max_buffer_bytes
+        self.discovery_batch_size = BATCH_SIZE if discovery_batch_size is None else discovery_batch_size
+        if self.discovery_batch_size <= 0:
+            raise ValueError("discovery_batch_size must be positive")
 
     def _accumulate_result(self, result, counters, domains):
         if isinstance(result, bool):
@@ -62,61 +87,81 @@ class IngestService:
             "ingest.folder_start",
             extra={"event": "ingest.folder_start", "folder": str(folder)},
         )
-        file_cnt = 0
+        started = time.monotonic()
         counters = defaultdict(int)
         domains = {}
-
-        # Collect all records first, then process in batches.
-        all_recs = []
-        for f in folder.iterdir():
-            if not f.is_file():
-                continue
-            if f.suffix == ".json":
-                all_recs.append(read_json(f))
-                file_cnt += 1
-            elif f.suffix == ".jsonl":
-                all_recs.extend(read_jsonl(f))
-                file_cnt += 1
-
-        link_recs = self.db.aggregate_links(
-            [r for r in all_recs if r.get("status") == "new"]
-        )
+        # Snapshot filenames only so both passes use the same input files.
+        files = [f for f in folder.iterdir() if f.is_file() and f.suffix in {".json", ".jsonl"}]
         trap_dropped = url_normalized = url_would_normalize = 0
-        if self.trap_filter is not None:
-            link_recs, fstats = self.trap_filter.apply(link_recs)
-            trap_dropped, url_normalized = fstats.dropped, fstats.normalized
-            url_would_normalize = fstats.would_normalize
-            if url_normalized:
-                # Stripped variants of one page collapse into a single row.
-                link_recs = self.db.aggregate_links(link_recs)
-        result_recs = [r for r in all_recs if r.get("status") != "new"]
 
-        # Links before results: a url that appears as both discovery and crawl
-        # result needs its domain_score set before the result UPSERT runs.
-        for batch_recs in (link_recs, result_recs):
-            # Fill each shard's batches before moving to the next shard. Slicing
-            # mixed shards first repeats lookups and scoring for small groups.
+        def flush(batch, discovery):
+            nonlocal trap_dropped, url_normalized, url_would_normalize
+            input_records = len(batch)
+            if discovery:
+                # Dedup only within the bounded batch. Repeated URLs in later
+                # batches are handled by the database's existing UPSERT.
+                batch = self.db.aggregate_links(batch)
+                if self.trap_filter is not None:
+                    batch, fstats = self.trap_filter.apply(batch)
+                    trap_dropped += fstats.dropped
+                    url_normalized += fstats.normalized
+                    url_would_normalize += fstats.would_normalize
+                    if fstats.normalized:
+                        batch = self.db.aggregate_links(batch)
+            if not batch:
+                return
+            batch_started = time.monotonic()
+            try:
+                for result in self.db.process_batch(batch):
+                    self._accumulate_result(result, counters, domains)
+                logger.info(
+                    "ingest.batch_done",
+                    extra={"event": "ingest.batch_done",
+                           "batch_kind": "discovery" if discovery else "result",
+                           "input_records": input_records, "records": len(batch),
+                           "duration_s": round(time.monotonic() - batch_started, 3)},
+                )
+            except Exception as e:
+                logger.error(
+                    "ingest.batch_error",
+                    extra={
+                        "event": "ingest.batch_error",
+                        "error": str(e),
+                        "batch_size": len(batch),
+                    },
+                )
+                counters["error_count"] += len(batch)
+                counters["ingest_error"] += len(batch)
+
+        # Stream twice to finish all discoveries before any crawl results,
+        # without retaining results during discovery. Enforce the record limit
+        # for each kind per shard and a shared byte budget across all shards. A
+        # single oversized record is processed immediately. Flush tails before
+        # the next pass/folder.
+        for discovery in (True, False):
+            batch_limit = self.discovery_batch_size if discovery else BATCH_SIZE
             recs_by_shard = defaultdict(list)
-            for rec in batch_recs:
-                recs_by_shard[int(rec["shard_id"])].append(rec)
-            for shard_recs in recs_by_shard.values():
-                for i in range(0, len(shard_recs), BATCH_SIZE):
-                    batch = shard_recs[i : i + BATCH_SIZE]
-                    try:
-                        results = self.db.process_batch(batch)
-                        for result in results:
-                            self._accumulate_result(result, counters, domains)
-                    except Exception as e:
-                        logger.error(
-                            "ingest.batch_error",
-                            extra={
-                                "event": "ingest.batch_error",
-                                "error": str(e),
-                                "batch_size": len(batch),
-                            },
-                        )
-                        counters["error_count"] += len(batch)
-                        counters["ingest_error"] += len(batch)
+            bytes_by_shard = defaultdict(int)
+            buffered_bytes = 0
+            for f in files:
+                recs = [read_json(f)] if f.suffix == ".json" else read_jsonl(f)
+                for rec in recs:
+                    if (rec.get("status") == "new") != discovery:
+                        continue
+                    shard_id = int(rec["shard_id"])
+                    recs_by_shard[shard_id].append(rec)
+                    size = _record_size(rec)
+                    bytes_by_shard[shard_id] += size
+                    buffered_bytes += size
+                    if len(recs_by_shard[shard_id]) >= batch_limit:
+                        buffered_bytes -= bytes_by_shard.pop(shard_id)
+                        flush(recs_by_shard.pop(shard_id), discovery)
+                    while buffered_bytes >= self.max_buffer_bytes:
+                        largest = max(bytes_by_shard, key=bytes_by_shard.get)
+                        buffered_bytes -= bytes_by_shard.pop(largest)
+                        flush(recs_by_shard.pop(largest), discovery)
+            for shard_id in list(recs_by_shard):
+                flush(recs_by_shard.pop(shard_id), discovery)
 
         domains.pop(None, None)
         self.stats.write(
@@ -129,7 +174,7 @@ class IngestService:
             extra={
                 "event": "ingest.folder_done",
                 "folder": str(folder),
-                "file_cnt": file_cnt,
+                "file_cnt": len(files),
                 "num_fetch_ok": counters.get("num_fetch_ok", 0),
                 "num_fetch_fail": counters.get("num_fetch_fail", 0),
                 "num_content_update": counters.get("num_content_update", 0),
@@ -138,6 +183,8 @@ class IngestService:
                 "url_normalized": url_normalized,
                 "url_would_normalize": url_would_normalize,
                 "num_redirect_source": counters.get("num_redirect_source", 0),
+                "duration_s": round(time.monotonic() - started, 1),
+                "discovery_batch_size": self.discovery_batch_size,
             },
         )
 
