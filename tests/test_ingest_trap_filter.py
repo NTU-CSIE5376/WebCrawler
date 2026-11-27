@@ -27,6 +27,8 @@ def _link(url, **kw):
 
 
 def _filter(log_dir=None, **kw):
+    # Policy tests keep immediate visibility; bounded writer tests are separate.
+    kw.setdefault("audit_batch_size", 1)
     return TrapFilter(TrapFilterConfig(log_dir=log_dir, **kw), now=lambda: NOW)
 
 

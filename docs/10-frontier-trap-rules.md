@@ -285,7 +285,8 @@ The filter needs no config change to run. Every setting has a default in
 code (`ingestor/main.py::_load_trap_filter`, `TrapFilterConfig`), so a host
 that keeps its own `ingest.yaml` gets the reviewed behaviour after
 `git pull` and `docker compose restart scheduler_ingest`. The shipped
-`ingest.yaml` carries no `trap_filter` block for that reason.
+`ingest.yaml` explicitly lists the audit batching limits; the filtering policy
+still uses the defaults below unless overridden.
 
 To override, add a block; missing keys keep their defaults:
 
@@ -297,7 +298,26 @@ trap_filter:
   shadow_normalize: true
   drop: true
   log_dir_template: "/data/ipc/trap_filter/ingestor_{id:02d}"
+  audit_batch_size: 4096
+  audit_max_buffer_bytes: 1048576
+  audit_flush_interval_seconds: 1.0
 ```
+
+Audit output flushes at the first event-count, encoded-byte or oldest-event
+deadline. A lazy background thread publishes a low-volume tail even while the
+discovery worker is idle or blocked in a database call. Each batch is a complete
+gzip member in the existing daily JSONL file, with the original event fields,
+timestamps and order. Day rollover and graceful discovery shutdown flush tails;
+an individual event larger than the byte cap is written immediately on its own.
+Set `audit_batch_size: 1` for immediate per-entry writes. Limits take effect on
+worker restart and appear in `ingest.trap_filter_enabled`.
+
+The byte cap bounds queued serialized payload, not total process RSS or the
+largest individual event. Writes serialize with producers, so a slow filesystem
+cannot accumulate an unbounded queue. Audit output remains best effort: a failed
+write reports `ingest.trap_filter_log_error` with the batch's `lost_events` and
+discards that batch. A forced process kill can lose the unflushed tail. Filtering
+decisions and database checkpoint semantics do not depend on audit persistence.
 
 Each ingestor logs one startup event, with `config_source` set to `default`
 (no block) or `yaml`:

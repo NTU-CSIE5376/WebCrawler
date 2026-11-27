@@ -19,6 +19,10 @@ finish after a deadline. The budget covers all shard buffers **within one
 discovery process**, not the fleet or its full RSS. The bounded URL-policy LRU,
 Python/driver allocations, filtering, and serialization need additional RAM.
 The policy audit logs record cache misses; they are not per-occurrence counts.
+Audit output uses bounded batches, configurable under `trap_filter` in
+`ingest.yaml`: 4,096 events, 1 MiB serialized bytes or one second, whichever
+comes first. An idle timer flushes during DB waits; graceful shutdown flushes
+the last batch even if a database write fails. See `docs/10-frontier-trap-rules.md`.
 
 Content independently processes parsed results in 2,000-record, single-shard
 transactions with a 64 MiB estimated buffer budget and flushes every folder

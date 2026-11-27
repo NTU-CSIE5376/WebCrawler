@@ -184,4 +184,8 @@ def run(kind):
                     time.sleep(float(settings.get("poll_seconds", 1)))
             service.close()
         finally:
-            engine.dispose()
+            try:
+                if is_discovery and service.trap_filter is not None:
+                    service.trap_filter.close()
+            finally:
+                engine.dispose()

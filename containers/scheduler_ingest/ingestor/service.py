@@ -158,6 +158,8 @@ class IngestService:
             for shard_id in list(recs_by_shard):
                 flush(recs_by_shard.pop(shard_id), discovery)
 
+        if self.trap_filter is not None:
+            self.trap_filter.flush()
         domains.pop(None, None)
         self.stats.write(
             source="ingestor",

@@ -153,4 +153,8 @@ class DiscoveryIngestor:
                     "buffered_bytes": self.buffered_bytes, "duration_s": round(self.clock()-started, 3)})
 
     def close(self):
-        self.flush_all("shutdown")
+        try:
+            self.flush_all("shutdown")
+        finally:
+            if self.trap_filter is not None:
+                self.trap_filter.close()

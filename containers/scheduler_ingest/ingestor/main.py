@@ -131,6 +131,9 @@ def _load_trap_filter(raw: dict[str, Any], ingestor_id: int) -> TrapFilter | Non
         shadow_normalize=bool(tf.get("shadow_normalize", True)),
         drop=bool(tf.get("drop", True)),
         log_dir=log_dir_template.format(id=ingestor_id) if log_dir_template else None,
+        audit_batch_size=int(tf.get("audit_batch_size", TrapFilterConfig.audit_batch_size)),
+        audit_max_buffer_bytes=int(tf.get("audit_max_buffer_bytes", TrapFilterConfig.audit_max_buffer_bytes)),
+        audit_flush_interval_seconds=float(tf.get("audit_flush_interval_seconds", TrapFilterConfig.audit_flush_interval_seconds)),
     )
     LOGGER.info(
         "ingest.trap_filter_enabled",
@@ -138,7 +141,9 @@ def _load_trap_filter(raw: dict[str, Any], ingestor_id: int) -> TrapFilter | Non
                "normalize": cfg.normalize,
                "normalize_params": ",".join(sorted(cfg.normalize_params)),
                "shadow_normalize": cfg.shadow_normalize, "drop": cfg.drop, "drop_rules": ",".join(sorted(cfg.drop_rules)),
-               "log_dir": cfg.log_dir},
+               "log_dir": cfg.log_dir, "audit_batch_size": cfg.audit_batch_size,
+               "audit_max_buffer_bytes": cfg.audit_max_buffer_bytes,
+               "audit_flush_interval_seconds": cfg.audit_flush_interval_seconds},
     )
     return TrapFilter(cfg)
 
