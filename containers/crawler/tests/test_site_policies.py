@@ -44,7 +44,9 @@ def test_allow_requires_a_boolean(value, section):
         SitePolicies(document)
 
 
-@pytest.mark.parametrize("domain", ["instagram.com", "facebook.com", "reddit.com", "x.com", "imdb.com", "sofascore.com"])
+@pytest.mark.parametrize("domain", [
+    "instagram.com", "facebook.com", "reddit.com", "x.com", "imdb.com", "sofascore.com", "espn.com",
+])
 @pytest.mark.parametrize("prefix", ["", "www.", "developers."])
 @pytest.mark.parametrize("path", ["/page?key=value", "/robots.txt"])
 @pytest.mark.parametrize("manual", [False, True])
