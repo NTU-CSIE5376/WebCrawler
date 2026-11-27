@@ -2,8 +2,8 @@
 
 ## 3.1 End-to-End Flow
 
-1. `offerer` reads eligible URLs from sharded DB tables and writes queue batch JSON files.
-2. `crawler` consumes queue JSON files, fetches pages, writes crawl JSONL results.
+1. `offerer` allocates eligible URLs using latency-aware MIP / greedy fallback, claims them from sharded DB tables, and submits ingest jobs through the API.
+2. `crawler` consumes API job partitions, downloads and parses pages, and writes crawl JSONL before acknowledging each job URL. Fetch-only API jobs retain HTML results.
 3. `router` transforms crawl records, ensures domain IDs, computes shard targets, emits normalized ingest JSONL.
 4. `ingestor` updates URL state/history/event-counter tables from normalized records.
 5. `feature_extractor` computes content metrics and updates feature tables.
@@ -13,8 +13,12 @@
 
 ## 3.2 Filesystem Layout Under `/data/ipc`
 
-- URL queue
-  - `/data/ipc/url_queue/crawler_{id:02d}/*.json`
+- Durable offerer HTTP outbox (not crawler input)
+  - `/data/ipc/url_queue/crawler_{id:02d}/dispatch_outbox/*.json`
+- API jobs and measured feedback
+  - `/data/manual_bulk_crawls/pending/*.json`
+  - `/data/manual_bulk_crawls/pending/crawler_{id:02d}/*.json`
+  - `/data/manual_bulk_crawls/pending/feedback/crawler_{id:02d}.json`
 - Crawl results
   - `/data/ipc/crawl_result/crawler_{id:02d}/{YYYYMMDD}/{HHMM}/*.jsonl`
 - Router output / Ingest input
@@ -33,14 +37,21 @@ Notes:
 
 ## 3.3 File Record Schemas
 
-### Offerer Queue Batch (`*.json`)
+### Offerer API Submission
 
 ```json
 {
-  "generated_at": "2026-01-01T01:01:01+00:00",
+  "processing_mode": "ingest",
+  "validate_urls": false,
+  "client_reference": "offerer/0/domain/123/unique-reference",
   "urls": ["https://example.com/a", "https://example.com/b"]
 }
 ```
+
+The API publishes immutable job manifests and per-crawler markers. See
+[15-ingest-job-api.md](15-ingest-job-api.md) for acknowledgement semantics.
+The legacy domain-file input is retired; existing JSONL consumer contracts below
+remain unchanged.
 
 ### Crawler Result Record (`*.jsonl`)
 

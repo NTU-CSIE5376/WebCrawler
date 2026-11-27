@@ -18,6 +18,19 @@ offerer:
   low_watermark_domains: 120
   per_domain_url_cap: 100
 
+  # API jobs are the crawler input. Drain legacy work before deploying this layer.
+  job_api_url: "http://api:8080"
+  max_outstanding_job_urls: 16384
+  job_allocation_method: mip
+  job_planning_horizon_sec: 60  # A soft target, not a measured-capacity ceiling.
+  job_probe_urls: 8
+  job_overload_penalty: 0.2
+  job_mip_time_limit_sec: 1
+
+  # Additional hard limits for each API planning cycle.
+  job_url_budget: 10000
+  job_domain_slots: 16
+
 
 postgres:
   dsn: "postgresql+psycopg2://yugabyte:yugabyte@172.16.191.3:5433/crawlerdb"

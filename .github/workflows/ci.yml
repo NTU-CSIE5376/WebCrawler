@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [api, scheduler_ingest, crawler]
+        service: [api, scheduler_control, scheduler_ingest, crawler]
     defaults:
       run:
         working-directory: containers/${{ matrix.service }}
@@ -32,16 +32,12 @@ jobs:
         run: task install
       - name: Test
         run: task test
-      - name: Test approved configuration and ranker
+      - name: Test bounded scorer claims
         if: matrix.service == 'scheduler_ingest'
         working-directory: .
         run: >-
           containers/scheduler_ingest/.venv/bin/python -m pytest -q
-          tests/test_approved_control_sitemap_config.py
           tests/test_scorer_bounded_claims.py
-          tests/test_scorer_manual_priority.py
-          tests/test_golden_discovery_strategy_and_migration.py
-          tests/test_golden_discovery_scorer_shard_ids.py
 
   golden_inject:
     name: golden_inject

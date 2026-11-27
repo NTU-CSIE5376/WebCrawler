@@ -12,7 +12,7 @@ from uuid import uuid4
 from libs.urls import MAX_URL_LEN, validate_url
 from libs.ipc.manual_bulk_crawl import (
     DEFAULT_TTL_DAYS, expiration, is_expired, job_status,
-    prepare_job, worker_directory, validate_ttl_days,
+    worker_directory, validate_ttl_days, validate_processing_mode, publish_job,
 )
 
 
@@ -27,18 +27,30 @@ def validate_manual_bulk_crawl_request(
     payload: object, max_urls: int, max_url_length: int = MAX_URL_LEN,
 ) -> tuple[list[str], int]:
     """Validate the request envelope and options before routing or writing."""
-    if not isinstance(payload, dict) or "urls" not in payload or set(payload) - {"urls", "ttl_days"}:
+    if not isinstance(payload, dict) or "urls" not in payload or set(payload) - {"urls", "ttl_days", "processing_mode", "client_reference", "validate_urls"}:
         raise ValueError('Expected an object containing "urls" and optional "ttl_days"')
+    reference = payload.get("client_reference")
+    if reference is not None and (not isinstance(reference, str) or len(reference) > 128):
+        raise ValueError("Invalid client_reference")
+    validate_processing_mode(payload.get("processing_mode", "fetch"))
     ttl_days = validate_ttl_days(payload.get("ttl_days", DEFAULT_TTL_DAYS))
-    return validate_urls(payload["urls"], max_urls, max_url_length), ttl_days
+    validation_enabled = payload.get("validate_urls", True)
+    if not isinstance(validation_enabled, bool):
+        raise ValueError("validate_urls must be a boolean")
+    return validate_urls(payload["urls"], max_urls, max_url_length, enabled=validation_enabled), ttl_days
 
 
-def validate_urls(urls: object, max_urls: int, max_url_length: int = MAX_URL_LEN) -> list[str]:
+def validate_urls(urls: object, max_urls: int, max_url_length: int = MAX_URL_LEN, *, enabled: bool = True) -> list[str]:
     """Validate a URL list and deduplicate in canonical order."""
     if not isinstance(urls, list) or not 1 <= len(urls) <= max_urls:
         raise ValueError(f'"urls" must contain 1 to {max_urls} URLs')
     normalized = {}
     for index, url in enumerate(urls):
+        if not isinstance(url, str) or not url or len(url) > max_url_length:
+            raise ValueError(f"Invalid URL string at index {index}")
+        if not enabled:
+            normalized[url] = None
+            continue
         try:
             canonical = validate_url(url, max_length=max_url_length)
         except ValueError:
@@ -53,41 +65,48 @@ class ManualBulkCrawlService:
         self.result_dir = Path(crawl_config["result_dir"])
         self.route_urls = route_urls
 
-    def submit(self, urls: list[str], ttl_days: int = DEFAULT_TTL_DAYS) -> str:
+    def submit(self, urls: list[str], ttl_days: int = DEFAULT_TTL_DAYS, *, processing_mode: str = "fetch",
+               client_reference: str | None = None) -> str:
         validate_ttl_days(ttl_days)
-        created = datetime.now(timezone.utc)
-        file_tag = uuid4().hex
-        records = {"version": 1, "urls": urls,
-                   "crawler_ids": self.route_urls(urls),
-                   "result_dir": str(self.result_dir.resolve()),
-                   "created_at": created.isoformat(), "ttl_days": ttl_days,
-                   "expires_at": (created + timedelta(days=ttl_days)).isoformat()}
+        validate_processing_mode(processing_mode)
+        return publish_job(self.pending_dir, self.result_dir, urls, self.route_urls(urls),
+                           ttl_days=ttl_days, processing_mode=processing_mode,
+                           client_reference=client_reference)
 
-        # One rename is the acceptance boundary, regardless of shard count.
-        # No fallible work follows it: a returned storage error means no batch
-        # was published. Existing crawlers handle the accepted job separately.
-        self.pending_dir.mkdir(parents=True, exist_ok=True)
-        target = self.pending_dir / f"{file_tag}.json"
-        temporary = target.with_suffix(".json.tmp")
+    def crawler_performance(self, crawler_id):
+        path = self.pending_dir / "feedback" / f"crawler_{crawler_id:02d}.json"
         try:
-            prepare_job(target, records)
-            with temporary.open("x", encoding="utf-8") as handle:
-                json.dump(records, handle, ensure_ascii=False)
-                handle.flush()
-                os.fsync(handle.fileno())
-            # Partition entries are ignored until this immutable manifest exists.
-            os.replace(temporary, target)
-        except OSError:
-            # A leftover .tmp is never accepted or read by crawlers.
+            data = json.loads(path.read_text())
+        except FileNotFoundError:
+            return {"version": 1, "available": False, "domains": {}}
+        age = datetime.now(timezone.utc).timestamp() - data.get("generated_at", 0)
+        if data.get("version") != 1 or not 0 <= age <= 30:
+            return {"version": 1, "available": False, "domains": {}}
+        return {**data, "available": True}
+
+    def active_jobs(self, *, crawler_id=None, client_prefix="", limit=200, after=""):
+        # Completed jobs retain manifests for result retrieval. Scan unfinished
+        # partition markers instead, so hourly/daily history does not grow this query.
+        pattern = f"crawler_{crawler_id:02d}/*.json" if crawler_id is not None else "crawler_*/*.json"
+        ids = sorted({p.stem for p in self.pending_dir.glob(pattern) if p.stem > after})
+        jobs = []
+        cursor = None
+        for job_id in ids:
             try:
-                temporary.unlink(missing_ok=True)
-                for crawler_id in set(records["crawler_ids"]):
-                    (self.pending_dir / f"crawler_{crawler_id:02d}" / target.name).unlink(missing_ok=True)
-                shutil.rmtree(self.result_dir / file_tag, ignore_errors=True)
-            except OSError:
-                pass
-            raise
-        return file_tag
+                _, payload = self._manifest(job_id)
+                if not (payload.get("client_reference") or "").startswith(client_prefix):
+                    continue
+                status = self.status(job_id)
+            except FileNotFoundError:
+                continue
+            if status["status"] == "completed":
+                continue
+            status.pop("result_dir", None)
+            if len(jobs) == limit:
+                cursor = jobs[-1]["job_id"]
+                break
+            jobs.append(status)
+        return {"jobs": jobs, "next_cursor": cursor}
 
     def _manifest(self, job_id: str) -> tuple[Path, dict]:
         if not re.fullmatch(r"[a-f0-9]{32}", job_id):

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures.process import BrokenProcessPool
 
-import tldextract
 from w3lib.url import canonicalize_url
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -10,28 +10,24 @@ from email.utils import parsedate_to_datetime
 import scrapy
 from scrapy import signals
 from scrapy.exceptions import DontCloseSpider, IgnoreRequest
-from scrapy.linkextractors import LinkExtractor
 from scrapy.spidermiddlewares.httperror import HttpError
 from twisted.internet import task as twisted_task
 
 from crawler.items import PageItem
-from crawler.queue_consumer import QueueConsumer
-from crawler.middlewares.youtube import normalize_youtube_url
+from crawler.dispatch_defaults import is_api_request
 from crawler.manual_bulk_crawls import ManualBulkCrawlConsumer
+from crawler.spiders.parser import HtmlParserPool
 from libs.obslog import configure as configure_logging
-from libs.urls import host_of
+from libs.urls import domain_of, host_of
 
 logger = logging.getLogger("crawler")
 
 ACCEPTED_CONTENT_TYPES = ["text/html", "application/xhtml+xml"]
 
-# Cap below the PG btree row entry max (~2700 bytes).
-MAX_URL_LEN = 2500
 MAX_HEADER_VALUE_LEN = 500
 
-
 def _source(request) -> str:
-    return "manual" if "manual_bulk_crawl_job_id" in request.meta else "normal"
+    return "manual" if is_api_request(request) else "normal"
 
 class HtmlSpider(scrapy.Spider):
     name = "html_spider"
@@ -43,44 +39,43 @@ class HtmlSpider(scrapy.Spider):
         self._max_slot_active = 0
         self._max_transferring = 0
         self._max_slot_queue = 0
-        self._pending_requests = 0
         self._max_pending_requests = 0
-        self._domain_pending: dict[int, int] = {}
         self._heartbeat_task: twisted_task.LoopingCall | None = None
-        self._top_up_task: twisted_task.LoopingCall | None = None
         # Results written to crawl_result since the last heartbeat (JsonPipeline).
         self.items_written = 0
         self.items_ok = 0
+        self._parser_failed = False
 
     @classmethod
     def from_crawler(cls, crawler, *args, **kwargs):
         spider = super().from_crawler(crawler, *args, **kwargs)
 
-        qtpl = crawler.settings["URL_QUEUE_TEMPLATE"]
-        spider.queue = QueueConsumer(queue_dir=qtpl.format(id=spider.crawler_id))
         spider.manual_bulk_crawls = ManualBulkCrawlConsumer(spider)
-        spider.link_extractor = LinkExtractor(canonicalize=True)
-
-        spider.domain_low_watermark = max(
-            0, crawler.settings.getint("IPC_DOMAIN_LOW_WATERMARK", 10)
+        spider.html_parser_pool = HtmlParserPool(
+            crawler.settings.getint("PARSER_PROCESSES", 4),
+            on_broken=spider._parser_pool_broken,
         )
 
         crawler.signals.connect(spider.on_idle, signal=signals.spider_idle)
         crawler.signals.connect(spider.req_scheduled, signal=signals.request_scheduled)
         crawler.signals.connect(spider.req_start, signal=signals.request_reached_downloader)
         crawler.signals.connect(spider.req_end, signal=signals.response_received)
-        crawler.signals.connect(spider.req_dropped, signal=signals.request_dropped)
         crawler.signals.connect(spider.spider_opened, signal=signals.spider_opened)
         crawler.signals.connect(spider.spider_closed, signal=signals.spider_closed)
 
         spider.heartbeat_interval_sec = float(
             crawler.settings.getfloat("OBSLOG_HEARTBEAT_SEC", 5.0)
         )
-        spider.top_up_interval_sec = float(
-            crawler.settings.getfloat("IPC_TOP_UP_INTERVAL_SEC", 5.0)
-        )
 
         return spider
+
+    def _input_inventory(self):
+        consumer = self.manual_bulk_crawls
+        pending = consumer.pending_by_mode["ingest"] + consumer.outstanding_by_mode["ingest"]
+        active_domains = sum(bool(domain.ingest_pending or domain.ingest_outstanding)
+                             for domain in consumer.domains.values())
+        self._max_pending_requests = max(self._max_pending_requests, pending)
+        return pending, active_domains
 
     def _set_inflight_stats(self):
         stats = getattr(self.crawler, "stats", None)
@@ -89,9 +84,10 @@ class HtmlSpider(scrapy.Spider):
         runtime = self._downloader_runtime()
         stats.set_value("inflight/current", runtime["slot_active"])
         stats.set_value("inflight/max", self._max_slot_active)
-        stats.set_value("pending/current", self._pending_requests)
+        pending, active_domains = self._input_inventory()
+        stats.set_value("pending/current", pending)
         stats.set_value("pending/max", self._max_pending_requests)
-        stats.set_value("active_domains/current", len(self._domain_pending))
+        stats.set_value("active_domains/current", active_domains)
         stats.set_value("transferring/current", runtime["transferring"])
         stats.set_value("transferring/max", self._max_transferring)
         stats.set_value("slot_queue/current", runtime["slot_queue"])
@@ -120,7 +116,6 @@ class HtmlSpider(scrapy.Spider):
             "slot_active": slot_active,
             "slots": len(slots),
         }
-    
     def _count_domains_at_limit(self) -> int:
         downloader = getattr(getattr(self.crawler, "engine", None), "downloader", None)
         slots = getattr(downloader, "slots", {}) or {}
@@ -172,34 +167,6 @@ class HtmlSpider(scrapy.Spider):
             "scheduler_size": scheduler_size,
         }
 
-    def _log(self, message: str):
-        runtime = self._downloader_runtime()
-        logger.info(
-            message,
-            extra={
-                "event": "spider.stats",
-                "active_domains": len(self._domain_pending),
-                "pending": self._pending_requests,
-                "pending_max": self._max_pending_requests,
-                "inflight": runtime["slot_active"],
-                "inflight_max": self._max_slot_active,
-                "transferring": runtime["transferring"],
-                "transferring_max": self._max_transferring,
-                "slot_queue": runtime["slot_queue"],
-                "slot_queue_max": self._max_slot_queue,
-                "slot_active": runtime["slot_active"],
-                "slots": runtime["slots"],
-            },
-        )
-
-    def _build_request(self, url: str, domain_id: int) -> scrapy.Request:
-        self._domain_pending[domain_id] = self._domain_pending.get(domain_id, 0) + 1
-        return scrapy.Request(
-            url=url,
-            callback=self.parse,
-            errback=self.errback,
-            meta={"source_url": url, "_track_domain_id": domain_id},
-        )
 
     def _response_metadata(self, response) -> dict:
         def header_text(name: str) -> str | None:
@@ -231,73 +198,17 @@ class HtmlSpider(scrapy.Spider):
         }
 
 
-    def _reserve_urls(self, reason: str, force: bool = False) -> list[tuple[int, str]]:
-        needs_domains = len(self._domain_pending) < self.domain_low_watermark
-        if not force and not needs_domains:
-            return []
 
-        pending_before = self._pending_requests
-        slots = self.domain_low_watermark - len(self._domain_pending)
-        if slots <= 0:
-            slots = 1 if force else 0
-        if slots <= 0:
-            return []
-
-        batch = self.queue.pop_domain_batches(
-            limit=slots,
-            exclude_domain_ids=set(self._domain_pending.keys()),
-        )
-
-        reserved: list[tuple[int, str]] = []
-        for domain_id, urls in batch.items():
-            for url in urls:
-                reserved.append((domain_id, url))
-            self._pending_requests += len(urls)
-
-        if reserved:
-            self._max_pending_requests = max(self._max_pending_requests, self._pending_requests)
-            self._set_inflight_stats()
-            self._log(
-                "Top-up loaded "
-                f"{len(reserved)} requests in {len(batch)} domain files, reason={reason}, "
-                f"pending_before={pending_before}, pending_after={self._pending_requests}, "
-                f"new_domains={len(batch)}"
-            )
-        elif force or needs_domains:
-            self._set_inflight_stats()
-            self._log(
-                f"Top-up found no batch, reason={reason}, "
-                f"pending_before={pending_before}, pending_after={self._pending_requests}"
-            )
-
-        return reserved
-
-    def _schedule_reserved_urls(self, entries: list[tuple[int, str]]) -> int:
-        for domain_id, url in entries:
-            self.crawler.engine.crawl(self._build_request(url, domain_id))
-        return len(entries)
-
-    def _maybe_top_up(self, reason: str, force: bool = False) -> int:
-        entries = self._reserve_urls(reason=reason, force=force)
-        return self._schedule_reserved_urls(entries)
-
-    def _finish_owned_request(self, reason: str, domain_id: int = 0) -> None:
-        self._pending_requests = max(0, self._pending_requests - 1)
-        if domain_id and domain_id in self._domain_pending:
-            self._domain_pending[domain_id] -= 1
-            if self._domain_pending[domain_id] <= 0:
-                del self._domain_pending[domain_id]
-        self._set_inflight_stats()
-        if len(self._domain_pending) < self.domain_low_watermark:
-            self._maybe_top_up(reason=f"{reason}_low_watermark")
 
     def spider_opened(self, spider=None):
-        self.manual_bulk_crawls.start()
         settings = self.crawler.settings
+        parser_processes = settings.getint("PARSER_PROCESSES", 4)
+        self.manual_bulk_crawls.start()
         logger.info(
             "crawler.config",
             extra={
                 "event": "crawler.config",
+                "parser_processes": parser_processes,
                 "throttle_mode": settings.get("CRAWLER_THROTTLE_MODE", "fixed"),
                 "autothrottle_enabled": settings.getbool("AUTOTHROTTLE_ENABLED"),
                 "concurrent_requests": settings.getint("CONCURRENT_REQUESTS"),
@@ -323,18 +234,41 @@ class HtmlSpider(scrapy.Spider):
         if self.heartbeat_interval_sec > 0 and self._heartbeat_task is None:
             self._heartbeat_task = twisted_task.LoopingCall(self._emit_heartbeat)
             self._heartbeat_task.start(self.heartbeat_interval_sec, now=False)
-        if self.top_up_interval_sec > 0 and self._top_up_task is None:
-            self._top_up_task = twisted_task.LoopingCall(self._periodic_top_up)
-            self._top_up_task.start(self.top_up_interval_sec, now=False)
 
     def spider_closed(self, spider=None, reason: str | None = None):
         self.manual_bulk_crawls.close()
         if self._heartbeat_task is not None and self._heartbeat_task.running:
             self._heartbeat_task.stop()
         self._heartbeat_task = None
-        if self._top_up_task is not None and self._top_up_task.running:
-            self._top_up_task.stop()
-        self._top_up_task = None
+        return self.html_parser_pool.close()
+
+    def _parser_pool_broken(self) -> None:
+        self._worker_pool_broken("parser_pool_broken", "parser.pool_broken", "parser/pool_broken")
+
+    def _writer_pool_broken(self) -> None:
+        self._worker_pool_broken("json_writer_pool_broken", "json_writer.pool_broken",
+                                 "json_writer/pool_broken")
+
+    def _worker_pool_broken(self, reason, event, counter) -> None:
+        if self._parser_failed:
+            return
+        self._parser_failed = True
+        # Stop refilling manual work while its already active callbacks drain.
+        # spider_closed still closes job files after those callbacks finish.
+        self.manual_bulk_crawls.closed = True
+        if self.manual_bulk_crawls.poller.running:
+            self.manual_bulk_crawls.poller.stop()
+        self.crawler.stats.inc_value(counter)
+        logger.critical(
+            event,
+            extra={"event": event, "reason": reason},
+        )
+        # Do not await closure inside a response callback: Scrapy must wait for
+        # that callback to finish before it can close the spider. Supervisor's
+        # autorestart=true restarts the worker even after a clean exit.
+        self.crawler.engine.close_spider(self, reason=reason).addErrback(
+            lambda failure: logger.error("Worker failure shutdown failed: %s", failure),
+        )
 
     def _emit_heartbeat(self):
         runtime = self._downloader_runtime()
@@ -343,10 +277,11 @@ class HtmlSpider(scrapy.Spider):
         domains_at_limit = self._count_domains_at_limit()
         downloader = getattr(getattr(self.crawler, "engine", None), "downloader", None)
         manual_active = sum(
-            "manual_bulk_crawl_job_id" in r.meta for r in getattr(downloader, "active", ()) or ()
+            is_api_request(r) for r in getattr(downloader, "active", ()) or ()
         )
         stats = self.crawler.stats
         consumer = self.manual_bulk_crawls
+        pending, active_domains = self._input_inventory()
         items_written, items_ok = self.items_written, self.items_ok
         self.items_written = self.items_ok = 0
 
@@ -354,8 +289,15 @@ class HtmlSpider(scrapy.Spider):
             "spider.heartbeat",
             extra={
                 "event": "spider.heartbeat",
-                "active_domains": len(self._domain_pending),
-                "pending": self._pending_requests,
+                "parser_inflight": self.html_parser_pool.inflight,
+                "parser_waiting": self.html_parser_pool.waiting,
+                "json_writer_pending": stats.get_value("json_writer/pending", 0),
+                "json_writer_errors": stats.get_value("json_writer/errors", 0),
+                "json_writer_inflight_batches": stats.get_value("json_writer/inflight_batches", 0),
+                "json_writer_buffered_bytes": stats.get_value("json_writer/buffered_bytes", 0),
+                "json_writer_batches": stats.get_value("json_writer/batches", 0),
+                "active_domains": active_domains,
+                "pending": pending,
                 "pending_max": self._max_pending_requests,
                 "inflight": runtime["slot_active"],
                 "inflight_max": self._max_slot_active,
@@ -384,33 +326,50 @@ class HtmlSpider(scrapy.Spider):
         )
 
     async def start(self):
-        for domain_id, url in self._reserve_urls(reason="start", force=True):
-            yield self._build_request(url, domain_id)
-
-    def _periodic_top_up(self):
-        if len(self._domain_pending) < self.domain_low_watermark:
-            self._maybe_top_up(reason="periodic")
+        # The polling job consumer is the only producer of crawl requests.
+        self.manual_bulk_crawls.refill()
+        for request in ():
+            yield request
 
     def on_idle(self):
-        self._maybe_top_up(reason="idle", force=True)
+        self.manual_bulk_crawls.refill()
         raise DontCloseSpider
 
-    def _extract_domain(self, url):
-        extracted = tldextract.extract(url)
-        domain = ".".join([p for p in [extracted.domain, extracted.suffix] if p])
-        return domain
+    async def parse(self, response):
+        reason = "parse"
+        try:
+            fields = None
+            ctype = response.headers.get("Content-Type", b"").decode().lower()
+            if not any(t in ctype for t in ACCEPTED_CONTENT_TYPES):
+                reason = "non_html"
+            else:
+                fields = await self.html_parser_pool.parse(response)
+            return list(self._parse_response(response, fields))
+        except BrokenProcessPool:
+            reason = "parser_pool_broken"
+            self.crawler.stats.inc_value("parser/interrupted")
+            logger.error(
+                "parser.interrupted",
+                extra={
+                    "event": "parser.interrupted", "url": response.url,
+                    "source_url": response.meta.get("source_url", response.url),
+                    "domain_id": response.meta.get("_track_domain_id", 0),
+                    "reason": reason,
+                },
+            )
+            raise
+        except BaseException:
+            reason = "parse_error"
+            raise
 
-
-    def parse(self, response):
+    def _parse_response(self, response, fields=None):
         url = canonicalize_url(response.url)
         source_url = response.meta.get("source_url", response.url)
-        track_domain_id = response.meta.get("_track_domain_id", 0)
         fetched_url = canonicalize_url(response.url)
-        domain = self._extract_domain(fetched_url)
+        domain = domain_of(fetched_url)
 
         ctype = response.headers.get("Content-Type", b"").decode().lower()
         if not any(t in ctype for t in ACCEPTED_CONTENT_TYPES):
-            self._finish_owned_request(reason="non_html", domain_id=track_domain_id)
             yield PageItem(
                 url=url,
                 domain=domain,
@@ -424,48 +383,20 @@ class HtmlSpider(scrapy.Spider):
             )
             return
 
-        outlinks = []
-        seen_urls: set[str] = set()
-
-        for link in self.link_extractor.extract_links(response):
-            if link.nofollow:
-                continue
-            # watch?v=ID&t=.., /shorts/ID and youtu.be/ID collapse to one URL.
-            u = normalize_youtube_url(canonicalize_url(link.url))
-            if len(u) > MAX_URL_LEN or u in seen_urls:
-                continue
-            seen_urls.add(u)
-            outlinks.append({
-                "url": u,
-                "domain": self._extract_domain(u),
-                "anchor": (link.text or "").strip()[:200]
-            })
-
-        title = (response.xpath("//title/text()").get() or "").strip()[:500] or None
-        hreflang_count = len(response.xpath(
-            "//link[contains(concat(' ', normalize-space(@rel), ' '), ' alternate ') and @hreflang]"
-        ))
-        has_json_ld = bool(response.xpath('//script[@type="application/ld+json"]'))
-
-        self._finish_owned_request(reason="parse", domain_id=track_domain_id)
         yield PageItem(
             url=url,
             domain=domain,
             fail_reason=None,
             content=response.text,
-            outlinks=outlinks,
-            title=title,
-            hreflang_count=hreflang_count,
-            has_json_ld=has_json_ld,
+            **fields,
             **self._response_metadata(response),
         )
 
     def errback(self, failure):
         url = canonicalize_url(failure.request.url)
         source_url = failure.request.meta.get("source_url", failure.request.url)
-        track_domain_id = failure.request.meta.get("_track_domain_id", 0)
         fetched_url = canonicalize_url(failure.request.url)
-        domain = self._extract_domain(fetched_url)
+        domain = domain_of(fetched_url)
 
         item = PageItem(
             url=url,
@@ -503,7 +434,6 @@ class HtmlSpider(scrapy.Spider):
                 "source": "normal",
             },
         )
-        self._finish_owned_request(reason="errback", domain_id=track_domain_id)
         yield item
 
     def req_scheduled(self, request):
@@ -515,12 +445,6 @@ class HtmlSpider(scrapy.Spider):
                 "domain": host_of(request.url),
             },
         )
-    def req_dropped(self, request, spider=None):
-        # The scheduler can drop an owned request (e.g. a redirect target the
-        # dupefilter has seen); neither parse nor errback runs for it then.
-        domain_id = request.meta.get("_track_domain_id")
-        if domain_id:
-            self._finish_owned_request(reason="dropped", domain_id=domain_id)
 
     def req_start(self, request):
         t = datetime.now()

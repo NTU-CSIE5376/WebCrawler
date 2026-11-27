@@ -5,7 +5,7 @@ from pathlib import Path
 from scrapy.core.scheduler import BaseScheduler, Scheduler
 from scrapy.dupefilters import BaseDupeFilter
 
-from .dispatch_defaults import MANUAL_SHARE_PERCENT
+from .dispatch_defaults import MANUAL_SHARE_PERCENT, is_api_request
 from .middlewares.site_dispatcher import restore_scheduling_meta
 
 POLICIES = ("weighted", "balanced", "manual_first", "normal_first")
@@ -75,7 +75,7 @@ class FairScheduler(BaseScheduler):
         if self.restore_policy_meta:
             # Queue a retry/redirect under its own host, not the policy slot.
             restore_scheduling_meta(request)
-        queue = self.manual if MANUAL in request.meta else self.normal
+        queue = self.manual if is_api_request(request) else self.normal
         return queue.enqueue_request(request)
 
     def _take(self, queue, source):

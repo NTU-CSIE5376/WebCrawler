@@ -32,15 +32,17 @@ def test_pipeline_counts_written_and_ok_items(tmp_path):
 def test_heartbeat_reports_and_resets_counts(tmp_path, caplog, monkeypatch):
     spider = HtmlSpider.__new__(HtmlSpider)
     spider.crawler_id = 3
-    spider._domain_pending = {}
-    spider._pending_requests = spider._max_pending_requests = 0
+    spider._max_pending_requests = 0
     spider._max_slot_active = spider._max_transferring = spider._max_slot_queue = 0
     spider.items_written = spider.items_ok = 0
+    spider.html_parser_pool = SimpleNamespace(inflight=0, waiting=0)
     spider.crawler = SimpleNamespace(
         engine=SimpleNamespace(downloader=SimpleNamespace(active=())),
         stats=SimpleNamespace(get_value=lambda key, default=None: default),
     )
-    spider.manual_bulk_crawls = SimpleNamespace(inflight={}, saves=0, save_seconds=0.0)
+    spider.manual_bulk_crawls = SimpleNamespace(inflight={}, saves=0, save_seconds=0.0,
+                                                      pending_by_mode={"ingest": 0},
+                                                      outstanding_by_mode={"ingest": 0}, domains={})
     monkeypatch.setattr(spider, "_downloader_runtime",
                         lambda: {"slot_active": 0, "transferring": 0, "slot_queue": 0, "slots": 0})
     monkeypatch.setattr(spider, "_scraper_runtime",

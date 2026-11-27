@@ -69,6 +69,15 @@ SCHEDULER_RESTORE_POLICY_META = _env_bool("CRAWLER_SCHEDULER_RESTORE_POLICY_META
 
 
 CONCURRENT_REQUESTS = int(os.getenv("CRAWLER_CONCURRENT_REQUESTS", "256"))
+# Per crawler worker. Submit at most twice this many HTML responses at once;
+# Scrapy's scraper size limit also bounds responses waiting for a parser slot.
+# Zero retains inline parsing for comparison or rollback.
+PARSER_PROCESSES = int(os.getenv("CRAWLER_PARSER_PROCESSES", "4"))
+# Zero keeps inline output; one spawned writer preserves JSONL append order.
+JSON_WRITER_PROCESSES = int(os.getenv("CRAWLER_JSON_WRITER_PROCESSES", "0"))
+JSON_WRITER_BATCH_SIZE = int(os.getenv("CRAWLER_JSON_WRITER_BATCH_SIZE", "8"))
+JSON_WRITER_BATCH_BYTES = int(os.getenv("CRAWLER_JSON_WRITER_BATCH_BYTES", str(4 * 1024**2)))
+JSON_WRITER_FLUSH_INTERVAL_MS = float(os.getenv("CRAWLER_JSON_WRITER_FLUSH_INTERVAL_MS", "50"))
 SCRAPER_SLOT_MAX_ACTIVE_SIZE = int(
     os.getenv("CRAWLER_SCRAPER_SLOT_MAX_ACTIVE_SIZE", "100000000")
 )
@@ -86,17 +95,6 @@ AUTOTHROTTLE_MAX_DELAY = float(os.getenv("CRAWLER_AUTOTHROTTLE_MAX_DELAY", "10.0
 AUTOTHROTTLE_TARGET_CONCURRENCY = float(os.getenv("CRAWLER_AUTOTHROTTLE_TARGET_CONCURRENCY", "4.0"))
 AUTOTHROTTLE_DEBUG = _env_bool("CRAWLER_AUTOTHROTTLE_DEBUG", False)
 DOWNLOAD_SLOTS = _SITE_POLICIES.download_slots(start_delay=AUTOTHROTTLE_START_DELAY)
-
-# Keep a local request backlog so one slow domain does not block the next IPC batch.
-IPC_PREFETCH_LOW_WATERMARK_REQUESTS = CONCURRENT_REQUESTS * 2
-IPC_PREFETCH_TARGET_REQUESTS = CONCURRENT_REQUESTS * 8
-
-# Reload domain files when active in-flight domains drop below this threshold.
-IPC_DOMAIN_LOW_WATERMARK = 144
-# Also check the watermark on a timer: completions of owned requests and
-# spider_idle are not enough once owned work has drained while manual bulk
-# crawls keep the engine busy.
-IPC_TOP_UP_INTERVAL_SEC = 5.0
 
 DNS_TIMEOUT = 15
 DOWNLOAD_TIMEOUT = 15
@@ -123,7 +121,6 @@ ITEM_PIPELINES = {
     "crawler.pipelines.JsonPipeline": 500,
 }
 
-URL_QUEUE_TEMPLATE = "/data/ipc/url_queue/crawler_{id:02d}"
 RESULT_DIR_TEMPLATE = "/data/ipc/crawl_result/crawler_{id:02d}"
 # Transport location and resource limits belong to the crawler. Per-job output
 # destinations arrive in the queue payload, without reading API configuration.

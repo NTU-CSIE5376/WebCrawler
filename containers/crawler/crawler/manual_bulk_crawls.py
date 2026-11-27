@@ -1,15 +1,17 @@
 """Feed bounded API work into the existing downloader and domain slots."""
 import logging
 import math
+import re
 from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from itertools import islice
 from pathlib import Path
-from random import random
 from time import monotonic
+from random import random
 
 import scrapy
+from scrapy import signals
 from pqdict import pqdict
 from twisted.internet.task import LoopingCall
 
@@ -17,7 +19,10 @@ from libs.ipc.manual_bulk_crawl import (
     JobUnavailable, ManualBulkCrawlBatch, iter_batches, is_expired,
 )
 from libs.urls import host_of
+from libs.ipc.processing_feedback import ProcessingFeedback
+from libs.ipc.manual_bulk_crawl import write_json
 from .site_policies import SitePolicies
+from .dispatch_defaults import MANUAL_SHARE_PERCENT
 
 logger = logging.getLogger("crawler")
 
@@ -28,14 +33,19 @@ class _ActiveJob:
     pending: set[int]
     inflight: set[int] = field(default_factory=set)
     failed: bool = False
+    domain_id: int | None = None
 
 
 @dataclass
 class _DomainQueue:
     pending: deque[tuple[str, int]] = field(default_factory=deque)
+    ingest_pending: deque[tuple[str, int]] = field(default_factory=deque)
     outstanding: int = 0
+    ingest_outstanding: int = 0
+    ready_mode: str = "fetch"
+    passes: dict = field(default_factory=lambda: {"fetch": 0, "ingest": 0})
+    jitter: float = field(default_factory=random)
     latency: float = 1.0  # Bootstrap estimate until a response supplies download_latency.
-    jitter: float = field(default_factory=random)  # Fixed [0, 1) seconds per downloader slot.
 
 
 def _int_setting(settings, name, default, minimum):
@@ -55,6 +65,14 @@ class ManualBulkCrawlConsumer:
         self.max_active_jobs = _int_setting(settings, "MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS", 64, 1)
         self.host_headroom = _int_setting(settings, "MANUAL_BULK_CRAWL_HOST_HEADROOM", 1, 0)
         self.jobs: dict[str, _ActiveJob] = {}
+        self.processing_feedback = ProcessingFeedback()
+        self.admitted_at = {}
+        self.pending_by_mode = {"fetch": 0, "ingest": 0}
+        self.outstanding_by_mode = {"fetch": 0, "ingest": 0}
+        self.mode_passes = {"fetch": 0, "ingest": 0}
+        policy = settings.get("MANUAL_BULK_CRAWL_SCHEDULING_POLICY", "weighted")
+        self.share = 50 if policy == "balanced" else settings.getint("MANUAL_BULK_CRAWL_SHARE_PERCENT", MANUAL_SHARE_PERCENT)
+        self.reserve_sources = policy in ("weighted", "balanced")
         self.inflight: set[tuple[str, int]] = set()
         self.saves = 0
         self.save_seconds = 0.0
@@ -67,6 +85,11 @@ class ManualBulkCrawlConsumer:
         self.closed = False
         self.filling = False
         self.poller = LoopingCall(self.poll)
+        signal_manager = getattr(spider.crawler, "signals", None)
+        if signal_manager is not None:
+            signal_manager.connect(self.item_saved, signal=signals.item_scraped)
+            signal_manager.connect(self.item_failed, signal=signals.item_error)
+            signal_manager.connect(self.item_failed, signal=signals.item_dropped)
 
     def start(self):
         self.poller.start(1, now=False)
@@ -78,6 +101,7 @@ class ManualBulkCrawlConsumer:
         for job in self.jobs.values():
             job.batch.close()
         self.jobs.clear()
+        self.admitted_at.clear()
         self.inflight.clear()
         self.inflight_domains.clear()
         self.domains.clear()
@@ -97,9 +121,17 @@ class ManualBulkCrawlConsumer:
                 self._discard_pending(job_id, job)
                 self.release_if_drained(job_id, job)
         # Re-read live slot delays, including AutoThrottle changes.
-        self._refresh_priorities()
+        self._refresh_ready()
         self.next_job_scan = 0.0
         self.refill()
+        try:
+            feedback = self.pending_dir / "feedback"
+            feedback.mkdir(parents=True, exist_ok=True)
+            write_json(feedback / f"crawler_{self.spider.crawler_id:02d}.json",
+                       self.processing_feedback.snapshot())
+        except OSError:
+            logger.exception("crawler.processing_feedback_error",
+                             extra={"event":"crawler.processing_feedback_error"})
 
     def _domain_limits(self, slot_key, domain):
         settings = self.spider.crawler.settings
@@ -122,34 +154,73 @@ class ManualBulkCrawlConsumer:
             concurrency = min(concurrency, math.ceil(domain.latency / delay - 1e-9) + self.host_headroom)
         return concurrency, seconds_per_url
 
-    def _refresh_priorities(self, slot_keys: Iterable[str] | None = None) -> None:
-        """Update queue eligibility and scores for selected slots, or all slots."""
+    @staticmethod
+    def _queue(domain, mode):
+        return domain.ingest_pending if mode == "ingest" else domain.pending
+
+    def _source_limit(self, total, mode, other_has_work):
+        if self.reserve_sources and total > 1 and other_has_work:
+            fetch = max(1, min(total - 1, total * self.share // 100))
+            return fetch if mode == "fetch" else total - fetch
+        return total
+
+    def _mode_available(self, domain, mode, limit):
+        if not self._queue(domain, mode) or domain.outstanding >= limit:
+            return False
+        other = "ingest" if mode == "fetch" else "fetch"
+        other_work = self.pending_by_mode[other] or self.outstanding_by_mode[other]
+        if self.outstanding_by_mode[mode] >= self._source_limit(self.concurrency, mode, other_work):
+            return False
+        if self.concurrency == 1 and self.reserve_sources and other_work and self.pending_by_mode[other]:
+            preferred = min(self.mode_passes, key=lambda m: (self.mode_passes[m], m))
+            if mode != preferred:
+                return False
+        own = domain.ingest_outstanding if mode == "ingest" else domain.outstanding - domain.ingest_outstanding
+        other_active = domain.outstanding - own
+        if own >= self._source_limit(limit, mode, bool(self._queue(domain, other) or other_active)):
+            return False
+        if limit == 1 and self.reserve_sources and self._queue(domain, other):
+            preferred = min(domain.passes, key=lambda m: (domain.passes[m], m))
+            if mode != preferred:
+                return False
+        return True
+
+    def _refresh_ready(self, slot_keys: Iterable[str] | None = None) -> None:
+        """Preserve source shares and the existing remaining-service-time heuristic."""
         for slot_key in list(self.domains) if slot_keys is None else slot_keys:
             domain = self.domains[slot_key]
-            if not domain.pending:
+            if not domain.pending and not domain.ingest_pending:
                 self.ready.pop(slot_key, None)
                 if not domain.outstanding:
                     del self.domains[slot_key]
                 continue
             limit, seconds_per_url = self._domain_limits(slot_key, domain)
-            if domain.outstanding >= limit:
+            eligible = [mode for mode in ("fetch", "ingest") if self._mode_available(domain, mode, limit)]
+            if not eligible:
                 self.ready.pop(slot_key, None)
                 continue
-            remaining = len(domain.pending) + domain.outstanding
-            # Prefer the longest remaining service time. A capped slot yields to others.
+            mode = min(eligible, key=lambda m: (domain.passes[m], m))
+            domain.ready_mode = mode
+            remaining = len(domain.pending) + len(domain.ingest_pending) + domain.outstanding
             self.ready[slot_key] = remaining * seconds_per_url + domain.jitter
 
     def _discard_pending(self, job_id, job):
         if not job.pending:
             return
+        self.pending_by_mode[job.batch.processing_mode] -= len(job.pending)
         job.pending.clear()
         touched = set()
         for slot_key, domain in self.domains.items():
-            pending = deque(entry for entry in domain.pending if entry[0] != job_id)
-            if len(pending) != len(domain.pending):
-                domain.pending = pending
-                touched.add(slot_key)
-        self._refresh_priorities(touched)
+            for mode in ("fetch", "ingest"):
+                previous = self._queue(domain, mode)
+                pending = deque(entry for entry in previous if entry[0] != job_id)
+                if len(pending) != len(previous):
+                    if mode == "ingest":
+                        domain.ingest_pending = pending
+                    else:
+                        domain.pending = pending
+                    touched.add(slot_key)
+        self._refresh_ready(touched)
 
     def _load_jobs(self):
         if monotonic() < self.next_job_scan or len(self.jobs) >= self.max_active_jobs:
@@ -163,19 +234,22 @@ class ManualBulkCrawlConsumer:
             )
             for batch in islice(batches, self.max_active_jobs - len(self.jobs)):
                 job_id = batch.path.stem
-                self.jobs[job_id] = _ActiveJob(batch=batch, pending=set(batch.remaining))
+                match = re.fullmatch(r"offerer/\d+/domain/(\d+)(?:/[^/]+)?", batch.payload.get("client_reference") or "")
+                domain_id = int(match[1]) if match and batch.processing_mode == "ingest" else None
+                self.jobs[job_id] = _ActiveJob(batch=batch, pending=set(batch.remaining), domain_id=domain_id)
+                self.pending_by_mode[batch.processing_mode] += len(batch.remaining)
                 for index in sorted(batch.remaining):
                     host = host_of(batch.urls[index])
                     slot_key = self.policies.resolve(host).request_limits.download_slot or host
                     domain = self.domains.get(slot_key)
                     if domain is None:
                         domain = self.domains[slot_key] = _DomainQueue()
-                    domain.pending.append((job_id, index))
+                    self._queue(domain, batch.processing_mode).append((job_id, index))
                     touched.add(slot_key)
         except Exception:
             self.spider.logger.exception("manual_bulk_crawl.queue_failed")
         finally:
-            self._refresh_priorities(touched)
+            self._refresh_ready(touched)
 
     def refill(self):
         if self.closed or self.filling:
@@ -188,25 +262,44 @@ class ManualBulkCrawlConsumer:
             while len(self.inflight) < self.concurrency and self.ready:
                 slot_key, _ = self.ready.popitem()
                 domain = self.domains[slot_key]
-                job_id, index = domain.pending[0]
+                mode = domain.ready_mode
+                limit, _ = self._domain_limits(slot_key, domain)
+                if not self._mode_available(domain, mode, limit):
+                    self._refresh_ready([slot_key])
+                    continue
+                job_id, index = self._queue(domain, mode)[0]
                 job = self.jobs[job_id]
                 if not job.batch.path.exists() or is_expired(job.batch.payload):
                     job.failed = True
                     self._discard_pending(job_id, job)
                     self.release_if_drained(job_id, job)
                     continue
-                domain.pending.popleft()
+                self._queue(domain, mode).popleft()
+                self.pending_by_mode[mode] -= 1
+                self.outstanding_by_mode[mode] += 1
+                other = "fetch" if mode == "ingest" else "ingest"
+                for passes in (domain.passes, self.mode_passes):
+                    passes[other] = max(passes[other], passes[mode])
+                    passes[mode] += self.share if mode == "ingest" else 100 - self.share
                 job.pending.remove(index)
                 domain.outstanding += 1
+                domain.ingest_outstanding += int(mode == "ingest")
                 self.inflight_domains[job_id, index] = slot_key
                 job.inflight.add(index)
                 self.inflight.add((job_id, index))
-                self._refresh_priorities([slot_key])
+                if job.domain_id is not None:
+                    self.admitted_at[job_id,index] = monotonic()
+                    active = sum(len(j.inflight) for j in self.jobs.values() if j.domain_id == job.domain_id)
+                    self.processing_feedback.admitted(job.domain_id, active)
+                self._refresh_ready([slot_key])
                 try:
                     self.spider.crawler.engine.crawl(scrapy.Request(
-                        job.batch.urls[index], callback=self.parse, errback=self.fetch_failed,
+                        job.batch.urls[index],
+                        callback=self.parse_ingest if job.batch.processing_mode == "ingest" else self.parse,
+                        errback=self.fetch_failed,
                         dont_filter=True,
-                        meta={"manual_bulk_crawl_job_id": job_id, "manual_bulk_crawl_index": index},
+                        meta={"manual_bulk_crawl_job_id": job_id, "manual_bulk_crawl_index": index,
+                              "crawl_job_mode": job.batch.processing_mode},
                     ))
                 except Exception:
                     job.failed = True
@@ -230,7 +323,66 @@ class ManualBulkCrawlConsumer:
                   final_url=response.url, status_code=response.status,
                   body=response.body if html else None, error=error)
 
+    async def parse_ingest(self, response):
+        """Reuse normal parsing; the item-saved signal acknowledges persistence."""
+        try:
+            items = await self.spider.parse(response)
+            for item in items:
+                item["ingest_job"] = self._item_context(response.request, response)
+            return items
+        except Exception:
+            self._output_failed(response.meta["manual_bulk_crawl_job_id"],
+                                response.meta["manual_bulk_crawl_index"])
+            raise
+
+    @staticmethod
+    def _item_context(request, response=None):
+        return dict(job_id=request.meta["manual_bulk_crawl_job_id"],
+                    index=request.meta["manual_bulk_crawl_index"],
+                    final_url=response.url if response is not None else request.url,
+                    status_code=response.status if response is not None else None,
+                    download_latency=request.meta.get("download_latency"))
+
+    def item_saved(self, item, response=None, spider=None):
+        context = item.get("ingest_job")
+        if context:
+            self.save(context["job_id"], context["index"],
+                      download_latency=context["download_latency"],
+                      final_url=context["final_url"], status_code=context["status_code"],
+                      error=item.get("fail_reason"))
+
+    def item_failed(self, item, response=None, spider=None, **kwargs):
+        context = item.get("ingest_job")
+        if context:
+            self._output_failed(context["job_id"], context["index"])
+
+    def _output_failed(self, job_id, index):
+        """Leave failed output unacknowledged so the existing job retry resumes it."""
+        job = self.jobs.get(job_id)
+        if job is None or index not in job.inflight:
+            return
+        job.failed = True
+        job.inflight.discard(index)
+        self.inflight.discard((job_id, index))
+        self._release_domain(job_id, index)
+        self._discard_pending(job_id, job)
+        self.release_if_drained(job_id, job)
+        self.refill()
+
     def fetch_failed(self, failure):
+        job = self.jobs.get(failure.request.meta["manual_bulk_crawl_job_id"])
+        if job is not None and job.batch.processing_mode == "ingest":
+            # HTTP/network failures produce the same failure records as ordinary
+            # crawling and are acknowledged only after those records are written.
+            try:
+                items = list(self.spider.errback(failure))
+            except Exception:
+                self._output_failed(failure.request.meta["manual_bulk_crawl_job_id"],
+                                    failure.request.meta["manual_bulk_crawl_index"])
+                raise
+            for item in items:
+                item["ingest_job"] = self._item_context(failure.request, getattr(failure.value, "response", None))
+            return items
         response = getattr(failure.value, "response", None)
         logger.warning("request.fail", extra={
             "event": "request.fail", "url": failure.request.url, "domain": host_of(failure.request.url),
@@ -244,12 +396,16 @@ class ManualBulkCrawlConsumer:
                   final_url=failure.request.url, status_code=None, error=failure.type.__name__)
 
     def _release_domain(self, job_id, index, latency=None):
+        self.admitted_at.pop((job_id,index), None)
         slot_key = self.inflight_domains.pop((job_id, index))
         domain = self.domains[slot_key]
         domain.outstanding -= 1
+        mode = self.jobs[job_id].batch.processing_mode
+        domain.ingest_outstanding -= int(mode == "ingest")
+        self.outstanding_by_mode[mode] -= 1
         if latency is not None and latency > 0:
             domain.latency = 0.8 * domain.latency + 0.2 * latency
-        self._refresh_priorities([slot_key])
+        self._refresh_ready()
 
     def save(self, job_id, index, *, download_latency=None, **result):
         job = self.jobs.get(job_id)
@@ -259,6 +415,9 @@ class ManualBulkCrawlConsumer:
             if not job.failed:
                 started = monotonic()
                 job.batch.save(index, **result)
+                admitted = self.admitted_at.get((job_id,index))
+                if admitted is not None and job.domain_id is not None:
+                    self.processing_feedback.completed(job.domain_id, monotonic()-admitted)
                 # Saves run on the reactor thread; the heartbeat reports their total time.
                 self.saves += 1
                 self.save_seconds += monotonic() - started

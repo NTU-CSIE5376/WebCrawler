@@ -29,19 +29,14 @@ Runs `supervisord` with four program types:
 
 Runtime behavior per offerer:
 
-1. Check queue depth in `/data/ipc/url_queue/crawler_{id:02d}`.
-2. If below `low_watermark_batches`, query its 16 assigned shards in DB.
-3. Select URLs where `should_crawl=TRUE` using strategy ordering:
-   - Phase A: score-aware (`url_score`, `domain_score`, `last_scheduled`, `first_seen`)
-   - Golden Discovery Ranker v1 mode (`OFFERER_STRATEGY=golden_discovery_ranker_v1`): prefer rows with refreshed `url_score_updated_at`, then highest `url_score`
-   - Phase B: fairness (`last_scheduled`, `first_seen`)
-4. Atomically update selected rows:
-   - `should_crawl=FALSE`
-   - `last_scheduled=NOW()`
-   - `num_scheduled_90d += 1`
-5. Upsert daily per-URL schedule event in `url_event_counter_{shard}`.
-6. Emit queue files containing URL batches (`batch_size=512`).
-7. Write stats delta with `num_scheduled` and per-domain schedule counts.
+1. Query unfinished API-job inventory and fresh per-domain crawler feedback.
+2. Peek eligible frontier candidates in the offerer’s assigned shards, then probe bounded usable URL counts and frontier value.
+3. Allocate new work with latency-aware MIP and a feasible greedy fallback. Observed capacity is a soft target; frontier, batch, domain and global outstanding limits are hard bounds.
+4. Claim selected URLs atomically in scored-first order, updating scheduling state and daily event counters.
+5. Persist a local HTTP outbox and submit `processing_mode: ingest` jobs through the API. Reconcile lost replies using the exact unique client reference.
+6. Write scheduling stats deltas. The offerer decides business priority; crawler policy remains inside the crawler.
+
+See [16-offerer-api-job-allocation.md](16-offerer-api-job-allocation.md) for the objective, limits and remaining claim/outbox crash window.
 
 Runtime behavior of `accounting_rolloff`:
 
@@ -99,20 +94,16 @@ Runs `supervisord` with:
 
 Crawler worker behavior:
 
-1. Pop earliest queue batch JSON from `/data/ipc/url_queue/crawler_{id:02d}`.
-2. Delete queue file immediately after read.
-3. Crawl URLs with Scrapy AutoThrottle (robots obeyed, retries enabled).
-   - Baseline workers and the `crawler_id=15` canary currently use the same AutoThrottle values.
-   - `crawler_id=15` remains a separate supervisord program so future canary parameters can be adjusted independently.
-   - Domains and hosts can select fixed pacing with `crawler_mode: fixed` in `config/site_policies.yml`.
-   - Scrapy scraper-slot backpressure defaults to `SCRAPER_SLOT_MAX_ACTIVE_SIZE=50000000`; the canary uses `150000000`.
-   - Domain/host policies and site middleware behavior are documented in [Middleware](05-docker-settings-and-deployment.md#531-middleware).
-4. For each response:
-   - if HTML/XHTML: save full content + extracted outlinks.
-   - on `youtube.com` pages, outlinks also include videos, channels and playlists parsed from the embedded `ytInitialData` JSON, with an optional `priority` for high-subscriber channels (see [09-youtube-discovery.md](./09-youtube-discovery.md)).
-   - otherwise: emit failure record (`NonHTML content-type`).
-5. For request errors: emit failure record with normalized reason (`HttpError`, `IgnoreRequest`, etc.).
-6. Write records as JSONL into `/data/ipc/crawl_result/crawler_{id:02d}/{YYYYMMDD}/{HHMM}/HHMM.jsonl`.
+1. Poll this crawler’s unfinished API-job partitions. Legacy domain-file input is retired.
+2. Admit bounded fetch/ingest work using the existing service-time heuristic, per-site policies and source sharing. Requests use Scrapy robots handling, retries and downloader rate/concurrency enforcement.
+3. For fetch jobs, persist HTML job results without extraction or downstream ingest records.
+4. For ingest jobs, parse HTML/XHTML, extract links and metadata, and emit the existing success/failure records. Parser processes and the optional bounded writer process preserve backpressure.
+5. Append ingest records to `/data/ipc/crawl_result/crawler_{id:02d}/{YYYYMMDD}/{HHMM}/HHMM.jsonl`; acknowledge the job URL after JSONL fsync and checkpoint persistence.
+6. Publish bounded per-domain processing feedback, exposed through the API for offerer allocation. Heartbeat pending inventory describes ingest jobs.
+
+The JSONL contract for router, ingestor and feature extraction is unchanged.
+See [15-ingest-job-api.md](15-ingest-job-api.md) and the coordinated
+[migration procedure](17-api-job-input-migration.md) before deploying this layer.
 
 ## 2.4 `scheduler_ingest` Container
 

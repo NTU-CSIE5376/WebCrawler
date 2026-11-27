@@ -1,6 +1,7 @@
 import scrapy
 
 class PageItem(scrapy.Item):
+    ingest_job = scrapy.Field()  # Internal acknowledgement marker; never written to JSONL.
     url = scrapy.Field()
     domain = scrapy.Field()
     fail_reason = scrapy.Field()
