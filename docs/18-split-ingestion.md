@@ -56,6 +56,13 @@ folders remain durable until all consumers finish; cleanup now waits for both
 components and the extractor. For compatibility with an existing cleanup cron,
 the old combined checkpoint advances to the slower of the new checkpoints.
 
+The exact Yugabyte `XX000` error `Duplicate request <id> from client <uuid>
+(min running <id>)` is also retried, only during execution before COMMIT.
+The whole explicit transaction is rolled back and a fresh session replays the
+batch, with three attempts and exponential backoff. This refers to an internal
+write RPC that Yugabyte has already replicated. Other internal errors are not
+retried, and the same message during COMMIT is not sufficient to replay it.
+
 Recovery remains **at least once**, as in the old folder pipeline: restarting
 from the last durable checkpoint can replay already committed batches from an
 unfinished interval and increment counters again. The maximum-age flush bounds

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -65,6 +66,28 @@ def _transaction_aborted(exc: Exception) -> bool:
     """
     original = exc.orig if isinstance(exc, DBAPIError) else exc
     return getattr(original, "pgcode", None) in {"40001", "40P01"}
+
+
+def _duplicate_write_rpc(exc: Exception) -> bool:
+    """Recognize Yugabyte's specific retryable-RPC replay error, not XX000 generally.
+
+    This is safe to replay only before COMMIT, after rolling back the whole
+    explicit transaction. A replicated RPC is not proof of a committed SQL
+    transaction, nor is it proof that a COMMIT did not take effect.
+    """
+    original = exc.orig if isinstance(exc, DBAPIError) else exc
+    if getattr(original, "pgcode", None) != "XX000":
+        return False
+    message = getattr(getattr(original, "diag", None), "message_primary", None) or str(original)
+    return re.fullmatch(
+        r"Duplicate request \d+ from client "
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12} "
+        r"\(min running \d+\)", message.strip(),
+    ) is not None
+
+
+def _retryable_execution_error(exc: Exception) -> bool:
+    return _connection_error(exc) or _duplicate_write_rpc(exc)
 
 ROBOTS_UNKNOWN = 0
 ROBOTS_ALLOWED = 1
@@ -853,8 +876,9 @@ class IngestDB:
     def _process_batch_once(self, recs: list[dict]) -> list[IngestResult | bool | None]:
         """Retry confirmed aborts in a fresh transaction, with bounded jitter.
 
-        Connection failures are retried only during execution by _execute_batch;
-        a connection failure during COMMIT still escapes without replay.
+        Connection failures and exact duplicate-write-RPC errors are retried
+        only during execution by _execute_batch; an uncertain COMMIT still
+        escapes without replay.
         """
         sess, results = self._execute_batch(recs)
         try:
@@ -870,7 +894,7 @@ class IngestDB:
             sess.close()
 
     @retry(
-        retry=retry_if_exception(_connection_error),
+        retry=retry_if_exception(_retryable_execution_error),
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=0.2),
         before_sleep=before_sleep_log(LOGGER, logging.WARNING),

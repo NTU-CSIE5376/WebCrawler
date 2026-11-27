@@ -28,8 +28,8 @@ class Connection(sqlite3.Connection):
 
 
 class StateError(psycopg2.OperationalError):
-    def __init__(self, code):
-        super().__init__("query failed")
+    def __init__(self, code, message="query failed"):
+        super().__init__(message)
         self.code = code
 
     @property
@@ -282,6 +282,97 @@ def test_service_counts_recovered_records_only_once(transaction_db, tmp_path):
 def test_decorator_preserves_method_metadata():
     assert IngestDB._execute_batch.__name__ == "_execute_batch"
     assert IngestDB._execute_batch.__wrapped__.__name__ == "_execute_batch"
+
+
+DUPLICATE_RPC = (
+    "Duplicate request 808693154 from client "
+    "fa1feb23-2310-4636-a3ed-6a9294edbf85 (min running 808693136)\n"
+)
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_duplicate_rpc_rolls_back_partial_writes_before_full_retry(transaction_db, wrapped):
+    db, engine, sleep, invalidations = transaction_db
+    calls = []
+
+    def bulk(cur, shard, items):
+        calls.append(shard)
+        cur.execute("UPDATE tally SET value=value+1")
+        if len(calls) == 2:
+            error = StateError("XX000", DUPLICATE_RPC)
+            if wrapped:
+                error = OperationalError(None, None, error)
+            raise error
+        return [(idx, True) for idx, _ in items]
+
+    def after_rollback(delay):
+        assert value(engine) == 0  # Rollback happened before sleeping/retrying.
+
+    sleep.side_effect = after_rollback
+    db._bulk_links = bulk
+    assert db.process_batch([link(1), link(2)]) == [True, True]
+    assert calls == [1, 2, 1, 2]
+    assert value(engine) == 2
+    assert not invalidations
+    sleep.assert_called_once_with(0.2)
+
+
+def test_duplicate_rpc_exhaustion_stops_without_committing(transaction_db):
+    db, engine, sleep, invalidations = transaction_db
+    error = StateError("XX000", DUPLICATE_RPC)
+    calls = []
+
+    def bulk(cur, shard, items):
+        calls.append(shard)
+        cur.execute("UPDATE tally SET value=value+1")
+        raise error
+
+    db._bulk_links = bulk
+    with pytest.raises(StateError) as caught:
+        db.process_batch([link()])
+    assert caught.value is error
+    assert calls == [1, 1, 1]
+    assert value(engine) == 0
+    assert [c.args[0] for c in sleep.call_args_list] == [0.2, 0.4]
+
+
+@pytest.mark.parametrize("error", [
+    StateError("XX000", "unrelated internal error"),
+    StateError("XX000", "Duplicate request from an unrelated subsystem"),
+    StateError("XX000", DUPLICATE_RPC + "other context"),
+    StateError("08007", DUPLICATE_RPC),
+    psycopg2.InternalError(DUPLICATE_RPC),  # Message alone is not enough.
+])
+def test_duplicate_rpc_retry_requires_exact_server_error(transaction_db, error):
+    db, engine, sleep, invalidations = transaction_db
+    db._bulk_links = MagicMock(side_effect=error)
+    with pytest.raises(type(error)):
+        db.process_batch([link()])
+    db._bulk_links.assert_called_once()
+    sleep.assert_not_called()
+
+
+def test_duplicate_rpc_at_commit_never_replays_successful_additive_writes(transaction_db, monkeypatch):
+    db, engine, sleep, invalidations = transaction_db
+    original_commit = engine.dialect.do_commit
+    calls = []
+
+    def bulk(cur, shard, items):
+        calls.append(shard)
+        cur.execute("UPDATE tally SET value=value+1")
+        return [(idx, True) for idx, _ in items]
+
+    def uncertain_commit(connection):
+        original_commit(connection)
+        raise StateError("XX000", DUPLICATE_RPC)
+
+    db._bulk_links = bulk
+    monkeypatch.setattr(engine.dialect, "do_commit", uncertain_commit)
+    with pytest.raises((OperationalError, StateError)):
+        db.process_batch([link()])
+    assert value(engine) == 1
+    assert calls == [1]
+    sleep.assert_not_called()
 
 
 @pytest.mark.parametrize("disconnect_after_provisioning", [False, True])
