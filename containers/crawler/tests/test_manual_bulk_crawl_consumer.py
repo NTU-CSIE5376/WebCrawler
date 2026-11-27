@@ -969,3 +969,21 @@ def test_priority_updates_replace_entries_and_capped_domains_leave_queue(queue):
         assert set(consumer.ready) == {"a.example"}
     finally:
         consumer.close()
+
+
+def test_feedback_measures_admission_through_persisted_result_not_headers(queue,monkeypatch):
+    from containers.crawler.crawler import manual_bulk_crawls as module
+    enqueue,factory,_=queue
+    path=enqueue('ingest',1)
+    import json
+    payload=json.loads(path.read_text());payload['client_reference']='offerer/0/domain/1944/unique';path.write_text(json.dumps(payload))
+    clock=[100.0];monkeypatch.setattr(module,'monotonic',lambda:clock[0])
+    consumer,requests=factory(concurrency=1)
+    try:
+        consumer.poll()
+        clock[0]=105.0
+        consumer.save('ingest',0,download_latency=.1,final_url=requests[0].url,status_code=200)
+        domain=consumer.processing_feedback.snapshot()['domains']['1944']
+        assert domain['service_latency_sec']==5.0
+        assert domain['observed_parallelism']==1
+    finally:consumer.close()

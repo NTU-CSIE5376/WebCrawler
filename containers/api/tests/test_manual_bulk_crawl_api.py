@@ -476,3 +476,17 @@ def test_api_does_not_publish_crawler_dispatch_policy(setup_api, monkeypatch):
     assert response.status_code == 200
     payload = json.loads((root / "pending" / f'{response.json()["job_id"]}.json').read_text())
     assert "scheduling_policy" not in payload
+
+
+def test_performance_endpoint_uses_fresh_feedback_and_rejects_stale_samples(setup_api):
+    import time
+    client,service,*_=setup_api
+    directory=service.pending_dir/'feedback';directory.mkdir(parents=True)
+    path=directory/'crawler_00.json'
+    payload=dict(version=1,generated_at=time.time(),domains={'1944':dict(samples=4,service_latency_sec=2,observed_parallelism=6)})
+    path.write_text(json.dumps(payload))
+    result=client.get('/v1/crawlers/0/performance').json()
+    assert result['available'] and result['domains']['1944']['service_latency_sec']==2
+    payload['generated_at']=time.time()-60;path.write_text(json.dumps(payload))
+    assert client.get('/v1/crawlers/0/performance').json()['domains']=={}
+    assert not client.get('/v1/crawlers/1/performance').json()['available']

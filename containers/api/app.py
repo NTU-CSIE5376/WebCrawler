@@ -106,6 +106,15 @@ def create_app(config_path: str | None = None, *, service=None) -> FastAPI:
             logger.exception("submission.failed")
             return JSONResponse({"error": "Submission failed; no URLs accepted"}, status_code=500)
 
+    @app.get("/v1/crawlers/{crawler_id}/performance")
+    def crawler_performance(crawler_id: int):
+        if crawler_id < 0:
+            return JSONResponse({"error": "Invalid crawler ID"}, status_code=400)
+        try:
+            return service.crawler_performance(crawler_id)
+        except OSError:
+            return JSONResponse({"error": "Processing feedback unavailable"}, status_code=503)
+
     @app.delete("/v1/manual-bulk-crawls/{job_id}", status_code=204)
     def delete_manual_bulk_crawl(job_id: str):
         service.delete(job_id)

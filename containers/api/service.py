@@ -53,6 +53,17 @@ class ManualBulkCrawlService:
         self.result_dir = Path(crawl_config["result_dir"])
         self.route_urls = route_urls
 
+    def crawler_performance(self, crawler_id):
+        path = self.pending_dir / "feedback" / f"crawler_{crawler_id:02d}.json"
+        try:
+            data = json.loads(path.read_text())
+        except FileNotFoundError:
+            return {"version": 1, "available": False, "domains": {}}
+        age = datetime.now(timezone.utc).timestamp() - data.get("generated_at", 0)
+        if data.get("version") != 1 or not 0 <= age <= 30:
+            return {"version": 1, "available": False, "domains": {}}
+        return {**data, "available": True}
+
     def submit(self, urls: list[str], ttl_days: int = DEFAULT_TTL_DAYS) -> str:
         validate_ttl_days(ttl_days)
         created = datetime.now(timezone.utc)

@@ -19,6 +19,7 @@ def spider(tmp_path, monkeypatch):
     queue_dir = tmp_path / "url_queue" / "crawler_00"
     queue_dir.mkdir(parents=True)
     crawler = get_crawler(HtmlSpider, {
+        "PARSER_PROCESSES": 0,
         "URL_QUEUE_TEMPLATE": str(tmp_path / "url_queue" / "crawler_{id:02d}"),
         "MANUAL_BULK_CRAWL_QUEUE_DIR": str(tmp_path / "manual"),
     })
