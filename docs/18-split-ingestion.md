@@ -46,7 +46,12 @@ UPSERT, history, other SQL, optional inline scoring and commit, without logging 
 Discovery's scan cursor can run ahead of its durable checkpoint. It advances
 the checkpoint only when every buffered discovery has committed. Content has
 its own checkpoint, so a discovery tail does not block parsed-result progress.
-A failed batch aborts the worker without silently advancing past it. Source
+Confirmed serialization failures (`40001`) and deadlocks (`40P01`) retry the
+whole transaction up to three attempts, with exponential random backoff and a
+fresh session after rollback. This also covers explicit server aborts at COMMIT.
+Connection retries remain restricted to execution before COMMIT; an uncertain
+commit acknowledgment is never replayed automatically. If retries exhaust,
+the failed batch aborts the worker without silently advancing past it. Source
 folders remain durable until all consumers finish; cleanup now waits for both
 components and the extractor. For compatibility with an existing cleanup cron,
 the old combined checkpoint advances to the slower of the new checkpoints.

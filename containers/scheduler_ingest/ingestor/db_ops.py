@@ -11,7 +11,7 @@ from psycopg2.extras import execute_values
 from sqlalchemy.dialects.postgresql.psycopg2 import PGDialect_psycopg2
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import sessionmaker
-from tenacity import before_sleep_log, retry, retry_if_exception, stop_after_attempt, wait_exponential
+from tenacity import before_sleep_log, retry, retry_if_exception, stop_after_attempt, wait_exponential, wait_random_exponential
 
 from libs.db.sharding.history_partition import ensure_partitions, missing_partition_target
 from libs.ipc.new_link_record import SOURCE_NATURAL, SOURCE_YOUTUBE_CHANNEL
@@ -55,6 +55,16 @@ def _connection_error(exc: Exception, raw_connection=None) -> bool:
     if raw_connection is None and isinstance(original, psycopg2.OperationalError):
         return True  # Connection acquisition failed; no transaction exists yet.
     return _DIALECT.is_disconnect(original, raw_connection, None)
+
+
+def _transaction_aborted(exc: Exception) -> bool:
+    """Only explicit server aborts are safe to replay, including at COMMIT.
+
+    Do not infer an abort from timeout messages or lost commit acknowledgments:
+    replaying an uncertain commit can double additive inlink/fetch counters.
+    """
+    original = exc.orig if isinstance(exc, DBAPIError) else exc
+    return getattr(original, "pgcode", None) in {"40001", "40P01"}
 
 ROBOTS_UNKNOWN = 0
 ROBOTS_ALLOWED = 1
@@ -833,12 +843,24 @@ class IngestDB:
             )
         return self._process_batch_once(recs)
 
+    @retry(
+        retry=retry_if_exception(_transaction_aborted),
+        stop=stop_after_attempt(3),
+        wait=wait_random_exponential(multiplier=0.2, max=2),
+        before_sleep=before_sleep_log(LOGGER, logging.WARNING),
+        reraise=True,
+    )
     def _process_batch_once(self, recs: list[dict]) -> list[IngestResult | bool | None]:
-        """Retry transaction execution, but never replay an uncertain commit."""
+        """Retry confirmed aborts in a fresh transaction, with bounded jitter.
+
+        Connection failures are retried only during execution by _execute_batch;
+        a connection failure during COMMIT still escapes without replay.
+        """
         sess, results = self._execute_batch(recs)
         try:
-            # Keep COMMIT outside Tenacity: a lost acknowledgment may mean the
-            # additive counters were already committed successfully.
+            # Keep COMMIT outside the connection retry: a lost acknowledgment
+            # may mean the additive counters were already committed. Only an
+            # explicit serialization/deadlock abort is eligible for replay.
             started = time.monotonic()
             sess.commit()
             if self.timing_observer is not None:

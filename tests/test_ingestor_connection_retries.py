@@ -48,6 +48,7 @@ def transaction_db(tmp_path, monkeypatch):
         conn.execute(text("INSERT INTO tally VALUES (0)"))
     sleep = MagicMock()
     monkeypatch.setattr(IngestDB._execute_batch.retry, "sleep", sleep)
+    monkeypatch.setattr(IngestDB._process_batch_once.retry, "sleep", sleep)
     db = IngestDB(sessionmaker(bind=engine, autoflush=False))
     invalidations = []
     event.listen(engine, "invalidate", lambda *args: invalidations.append(args))
@@ -133,11 +134,9 @@ def test_exhaustion_is_bounded_and_preserves_original_error(transaction_db):
 @pytest.mark.parametrize("error", [
     psycopg2.ProgrammingError("syntax error"),
     StateError("57014"),  # Statement timeout.
-    StateError("40P01"),  # Deadlock is not a connection failure.
-    StateError("40001"),  # Serialization failure.
     ValueError("invalid record"),
 ])
-def test_non_connection_errors_are_not_retried(transaction_db, error):
+def test_non_retryable_errors_are_not_retried(transaction_db, error):
     db, engine, sleep, invalidations = transaction_db
     bulk = MagicMock(side_effect=error)
     db._bulk_links = bulk
@@ -147,6 +146,81 @@ def test_non_connection_errors_are_not_retried(transaction_db, error):
     bulk.assert_called_once()
     sleep.assert_not_called()
     assert not invalidations
+
+
+@pytest.mark.parametrize("code", ["40001", "40P01"])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_confirmed_abort_retries_entire_transaction_after_rollback(transaction_db, code, wrapped):
+    db, engine, sleep, invalidations = transaction_db
+    calls = []
+
+    def bulk(cur, shard, items):
+        calls.append(shard)
+        cur.execute("UPDATE tally SET value=value+1")
+        if len(calls) == 2:
+            error = StateError(code)
+            if wrapped:
+                error = OperationalError(None, None, error)
+            raise error
+        return [(idx, True) for idx, _ in items]
+
+    db._bulk_links = bulk
+    assert db.process_batch([link(1), link(2)]) == [True, True]
+    assert calls == [1, 2, 1, 2]
+    assert value(engine) == 2  # No duplicated increments from the failed attempt.
+    assert not invalidations  # An aborted transaction is not a broken connection.
+    sleep.assert_called_once()
+    assert 0 <= sleep.call_args.args[0] <= 0.2
+
+
+@pytest.mark.parametrize("code", ["40001", "40P01"])
+def test_confirmed_abort_exhaustion_rolls_back_and_stays_bounded(transaction_db, code):
+    db, engine, sleep, invalidations = transaction_db
+    error = StateError(code)
+    calls = []
+
+    def bulk(cur, shard, items):
+        calls.append(shard)
+        cur.execute("UPDATE tally SET value=value+1")
+        raise error
+
+    db._bulk_links = bulk
+    with pytest.raises(StateError) as caught:
+        db.process_batch([link()])
+    assert caught.value is error
+    assert calls == [1, 1, 1]
+    assert value(engine) == 0
+    assert not invalidations
+    assert len(sleep.call_args_list) == 2
+    for call, cap in zip(sleep.call_args_list, [0.2, 0.4]):
+        assert 0 <= call.args[0] <= cap
+
+
+@pytest.mark.parametrize("code", ["40001", "40P01"])
+def test_explicit_commit_abort_can_retry_without_replaying_a_success(transaction_db, monkeypatch, code):
+    db, engine, sleep, invalidations = transaction_db
+    original_commit = engine.dialect.do_commit
+    commits = []
+
+    def bulk(cur, shard, items):
+        cur.execute("UPDATE tally SET value=value+1")
+        return [(idx, True) for idx, _ in items]
+
+    def commit(connection):
+        commits.append(connection)
+        if len(commits) == 1:
+            # Server explicitly rejected this COMMIT; it never took effect.
+            connection.rollback()
+            raise StateError(code)
+        return original_commit(connection)
+
+    db._bulk_links = bulk
+    monkeypatch.setattr(engine.dialect, "do_commit", commit)
+    assert db.process_batch([link()]) == [True]
+    assert len(commits) == 2
+    assert value(engine) == 1
+    assert not invalidations
+    sleep.assert_called_once()
 
 
 def test_lost_commit_acknowledgment_never_replays_additive_writes(transaction_db, monkeypatch):
