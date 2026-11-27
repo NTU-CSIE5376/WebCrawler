@@ -1,4 +1,6 @@
-Scrapy>=2.13
+# url_state keys are w3lib canonicalize_url output: change Scrapy or w3lib only as a key migration (#166)
+Scrapy==2.19.0
+w3lib==2.5.0
 requests
 idna>=3.6
 pydantic>=2,<3
