@@ -2,12 +2,23 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from typing import NamedTuple
+import math
 
 
 class CandidateDomain(NamedTuple):
     domain_id: int
     shard_id: int
     domain_score: float
+    available_urls: int | None = None
+    url_score: float | None = None
+
+    @property
+    def allocation_value(self) -> float:
+        # URL-level manual priorities and refreshed model scores already share
+        # the operational score scale. Domain score bootstraps unscored frontiers.
+        if self.url_score is not None and math.isfinite(self.url_score):
+            return max(0.0, self.url_score)
+        return self.domain_score
 
 
 class SelectionStrategy(ABC):

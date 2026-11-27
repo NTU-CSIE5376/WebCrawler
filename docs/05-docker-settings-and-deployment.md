@@ -77,15 +77,49 @@ and JVM internal memory budgets below their container cap as well.
   - 15 baseline AutoThrottle spiders (`crawler_id=0..14`)
   - 1 independently configurable AutoThrottle canary spider (`crawler_id=15`)
 
-Total long-running app processes (excluding postgres internals):
+Total long-running app processes with default HTML parser pools fully started
+(excluding postgres internals and Python process-management helpers):
 
-- Default: `17 + 49 + 16 = 82`
-- With Golden Discovery Ranker v1 enabled: `21 + 49 + 16 = 86`
+- Default: `17 + 49 + 16 + 64 = 146`
+- With Golden Discovery Ranker v1 enabled: `21 + 49 + 16 + 64 = 150`
 
 Supervisor keeps per-process global concurrency and AutoThrottle target/start/max
 tuning. Baseline workers use global concurrency 256; the canary uses 384 and a
-150,000,000-byte scraper buffer. The default scraper buffer is 50,000,000 bytes;
+150,000,000-byte scraper buffer. The default scraper buffer is 100,000,000 bytes;
 `CRAWLER_SCRAPER_SLOT_MAX_ACTIVE_SIZE` overrides it.
+
+HTML extraction runs in four child processes per crawler worker by default.
+`CRAWLER_PARSER_PROCESSES` controls this count; set it to `0` for inline parsing.
+With 16 crawler workers, the default adds 64 parser processes. At this setting,
+each worker submits at most eight responses to its parser pool; additional responses wait
+asynchronously under Scrapy's scraper size backpressure. Result writing and
+request accounting stay in the crawler process, and child processes return
+extracted fields without sending the HTML back. Manual bulk crawls use their
+existing save path. Heartbeats expose `parser_inflight` (submitted responses)
+and `parser_waiting` (callbacks waiting for a slot). Restart workers after
+changing this setting; pools drain and join during normal shutdown.
+If a parser child dies and breaks the pool, the crawler rejects further parser
+work and closes with reason `parser_pool_broken`. Supervisor's `autorestart=true`
+restarts it even after a clean exit. Interrupted HTML responses are logged as
+`parser.interrupted` with their URL and domain ID before ownership is released;
+they produce no page result and are not automatically replayed. Scrapy stats
+record `parser/pool_broken` and `parser/interrupted`. Already active callbacks
+drain and parser children are joined during closure.
+Compose passes `CRAWLER_PARSER_PROCESSES` (default `4`) into the container, and
+both Supervisor programs inherit it. Supervisor sends TERM only to the crawler
+parent, allowing it to drain and join parser children. After 60 seconds it kills
+the process group. Compose allows 90 seconds before forcibly stopping the
+container. Recreate the container to apply Compose environment or grace-period
+changes; rebuild the image when changing the copied Supervisor configuration.
+The crawler container sets both `nofile` limits to 4,096, and Supervisor sets
+`minfds=4096` so workers inherit enough descriptors for sockets, DNS, parser
+IPC, and output files. Recreate the container to apply the Compose limits;
+reloading Supervisor configuration does not change limits of running workers.
+On Linux, each parser child also registers `PR_SET_PDEATHSIG=SIGKILL` and checks
+the expected parent PID, so an abruptly killed crawler cannot leave its parser
+children running. Failure to register the signal fails worker initialization.
+This kernel protection is Linux-specific; normal pool shutdown still applies
+on other platforms.
 
 ### 5.3.1 Middleware
 

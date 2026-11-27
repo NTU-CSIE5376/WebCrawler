@@ -36,6 +36,7 @@ def test_heartbeat_reports_and_resets_counts(tmp_path, caplog, monkeypatch):
     spider._pending_requests = spider._max_pending_requests = 0
     spider._max_slot_active = spider._max_transferring = spider._max_slot_queue = 0
     spider.items_written = spider.items_ok = 0
+    spider.html_parser_pool = SimpleNamespace(inflight=0, waiting=0)
     spider.crawler = SimpleNamespace(
         engine=SimpleNamespace(downloader=SimpleNamespace(active=())),
         stats=SimpleNamespace(get_value=lambda key, default=None: default),
