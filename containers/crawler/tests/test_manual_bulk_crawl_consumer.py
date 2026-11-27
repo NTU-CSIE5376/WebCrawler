@@ -23,10 +23,11 @@ def queue(tmp_path, monkeypatch):
     pending = tmp_path / "pending"
     pending.mkdir()
 
-    def enqueue(job_id, count=0, *, urls=None):
+    def enqueue(job_id, count=0, *, urls=None, processing_mode="fetch"):
         urls = urls if urls is not None else [f"https://example.com/{job_id}/{i}" for i in range(count)]
         path = pending / f"{job_id}.json"
-        path.write_text(json.dumps({"version": 1,
+        path.write_text(json.dumps({"version": 2 if processing_mode == "ingest" else 1,
+                                   "processing_mode": processing_mode,
                                    "urls": urls,
                                    "crawler_ids": [0] * len(urls),
                                    "result_dir": str(tmp_path / "results")}))
@@ -371,7 +372,7 @@ def test_manual_and_normal_requests_share_the_hostname_slot(queue, monkeypatch):
                                    "CONCURRENT_REQUESTS_PER_DOMAIN": 16})
     crawler.spider = Spider(name="slot-test")
     downloader = Downloader(crawler)
-    spider = SimpleNamespace(_domain_pending={}, parse=None, errback=None)
+    spider = SimpleNamespace(_domain_pending={}, parse=None, errback=None, demand_tracker=None)
     normal = HtmlSpider._build_request(spider, "https://www.espn.com/nba/2", 7)
     try:
         consumer.poll()
@@ -672,7 +673,7 @@ def test_language_hosts_share_configured_slot_backlog_and_dispatch_cap(queue, fa
         assert set(consumer.domains) == {"wikipedia", "other.example"}
         shared = consumer.domains["wikipedia"]
         shared.jitter = 0
-        consumer._refresh_priorities()
+        consumer._refresh_ready()
         assert len(shared.pending) == 6
         assert consumer.ready["wikipedia"] == 60
 
@@ -723,7 +724,7 @@ def test_shared_slot_uses_live_autothrottle_delay_for_service_time(queue):
     try:
         consumer._load_jobs()
         consumer.domains["wikipedia"].jitter = 0
-        consumer._refresh_priorities()
+        consumer._refresh_ready()
         assert consumer.ready["wikipedia"] == 20
         consumer.refill()
         assert requests[0].url == "https://en.wikipedia.org/wiki/0"
@@ -956,7 +957,7 @@ def test_priority_updates_replace_entries_and_capped_domains_leave_queue(queue):
         consumer._load_jobs()
         for latency in range(1, 101):
             consumer.domains["a.example"].latency = latency
-            consumer._refresh_priorities(["a.example"])
+            consumer._refresh_ready(["a.example"])
             assert set(consumer.ready) == {"a.example", "b.example"}
         consumer.refill()
         assert requests[0].url == "https://a.example/0"
@@ -969,3 +970,161 @@ def test_priority_updates_replace_entries_and_capped_domains_leave_queue(queue):
         assert set(consumer.ready) == {"a.example"}
     finally:
         consumer.close()
+
+
+def test_ingest_job_holds_capacity_until_output_acknowledgement(queue):
+    import asyncio
+    from unittest.mock import AsyncMock
+    enqueue, factory, root = queue
+    enqueue("ingest", 2, processing_mode="ingest")
+    consumer, requests = factory(concurrency=1)
+    consumer.spider.parse = AsyncMock(return_value=[{"url": "page", "content": "html"}])
+    try:
+        consumer.poll()
+        request = requests[0]
+        response = HtmlResponse(request.url, request=request)
+        items = asyncio.run(consumer.parse_ingest(response))
+        assert consumer.spider.parse.await_count == 1
+        assert len(requests) == 1 and len(consumer.inflight) == 1
+        assert not (root / "results/ingest/crawler_00/00000.json").exists()
+        consumer.item_saved(items[0], response)
+        assert len(requests) == 2
+        result = json.loads((root / "results/ingest/crawler_00/00000.json").read_text())
+        assert result["html_file"] is None and result["error"] is None
+        consumer.item_saved(items[0], response)  # Duplicate signal cannot acknowledge another URL.
+        assert len(consumer.inflight) == 1
+    finally:
+        consumer.close()
+
+
+def test_ingest_output_failure_retries_only_unacknowledged_urls(queue):
+    import asyncio
+    from unittest.mock import AsyncMock
+    enqueue, factory, root = queue
+    path = enqueue("ingest", 2, processing_mode="ingest")
+    consumer, requests = factory(concurrency=1)
+    consumer.spider.parse = AsyncMock(side_effect=lambda r: [{"url": r.url, "content": "html"}])
+    try:
+        consumer.poll()
+        response = HtmlResponse(requests[0].url, request=requests[0])
+        item = asyncio.run(consumer.parse_ingest(response))[0]
+        consumer.item_saved(item, response)
+        response = HtmlResponse(requests[1].url, request=requests[1])
+        item = asyncio.run(consumer.parse_ingest(response))[0]
+        consumer.item_failed(item, response)
+        assert not consumer.inflight and not consumer.jobs
+        retry = next_batch(path.parent)
+        assert retry.remaining == {1}
+        retry.close()
+        assert not (root / "results/ingest/crawler_00/00001.json").exists()
+    finally:
+        consumer.close()
+
+
+def test_ingest_parse_failure_leaves_job_retryable(queue):
+    import asyncio
+    from unittest.mock import AsyncMock
+    enqueue, factory, _ = queue
+    path = enqueue("ingest", 1, processing_mode="ingest")
+    consumer, requests = factory(concurrency=1)
+    consumer.spider.parse = AsyncMock(side_effect=ValueError("parser failed"))
+    try:
+        consumer.poll()
+        with pytest.raises(ValueError, match="parser failed"):
+            asyncio.run(consumer.parse_ingest(HtmlResponse(requests[0].url, request=requests[0])))
+        assert not consumer.inflight
+        retry = next_batch(path.parent)
+        assert retry.remaining == {0}
+        retry.close()
+    finally:
+        consumer.close()
+
+
+def test_ingest_network_failure_is_acknowledged_after_failure_record_is_saved(queue):
+    from twisted.python.failure import Failure
+    enqueue, factory, root = queue
+    enqueue("ingest", 1, processing_mode="ingest")
+    consumer, requests = factory(concurrency=1)
+    consumer.spider.errback = Mock(return_value=[{"content": None, "fail_reason": "TimeoutError"}])
+    try:
+        consumer.poll()
+        failure = Failure(TimeoutError())
+        failure.request = requests[0]
+        item = consumer.fetch_failed(failure)[0]
+        assert len(consumer.inflight) == 1
+        consumer.item_saved(item, response=None)
+        result = json.loads((root / "results/ingest/crawler_00/00000.json").read_text())
+        assert result["error"] == "TimeoutError" and result["status_code"] is None
+        assert not consumer.inflight
+    finally:
+        consumer.close()
+
+
+def test_older_fetch_backlog_cannot_hide_ingest_work_in_same_site(queue):
+    enqueue, factory, _ = queue
+    enqueue("fetch", urls=[f"https://example.com/fetch/{i}" for i in range(100)])
+    enqueue("ingest", urls=[f"https://example.com/ingest/{i}" for i in range(100)],
+            processing_mode="ingest")
+    consumer, requests = factory(concurrency=32, domain_concurrency=7)
+    try:
+        consumer.poll()
+        modes = [r.meta["crawl_job_mode"] for r in requests]
+        assert modes.count("fetch") == 1
+        assert modes.count("ingest") == 6
+        for r in list(requests):
+            consumer.save(r.meta["manual_bulk_crawl_job_id"], r.meta["manual_bulk_crawl_index"],
+                          final_url=r.url, status_code=200)
+        assert consumer.outstanding_by_mode == {"fetch": 1, "ingest": 6}
+        assert len(consumer.inflight) == 7
+    finally:
+        consumer.close()
+
+
+def test_global_prefetch_reserves_ingest_capacity_despite_many_older_fetch_sites(queue):
+    enqueue, factory, _ = queue
+    enqueue("fetch", urls=[f"https://site{i}.example/page" for i in range(100)])
+    enqueue("ingest", urls=[f"https://ingest.example/{i}" for i in range(100)], processing_mode="ingest")
+    consumer, requests = factory(concurrency=10, domain_concurrency=10)
+    try:
+        consumer.poll()
+        assert consumer.outstanding_by_mode == {"fetch": 2, "ingest": 8}
+        assert len(requests) == 10
+    finally:
+        consumer.close()
+
+
+def test_single_capacity_shares_fetch_and_ingest_instead_of_starving_either(queue):
+    enqueue, factory, _ = queue
+    enqueue("fetch", 100)
+    enqueue("ingest", 100, processing_mode="ingest")
+    consumer, requests = factory(concurrency=1)
+    try:
+        consumer.poll()
+        observed = []
+        for _ in range(10):
+            request = requests[-1]
+            observed.append(request.meta["crawl_job_mode"])
+            consumer.save(request.meta["manual_bulk_crawl_job_id"], request.meta["manual_bulk_crawl_index"],
+                          final_url=request.url, status_code=200)
+        assert observed.count("fetch") == 2
+        assert observed.count("ingest") == 8
+    finally:
+        consumer.close()
+
+
+def test_feedback_measures_admission_through_persisted_result_not_headers(queue,monkeypatch):
+    from containers.crawler.crawler import manual_bulk_crawls as module
+    enqueue,factory,_=queue
+    path=enqueue('ingest',1,processing_mode='ingest')
+    import json
+    payload=json.loads(path.read_text());payload['client_reference']='offerer/0/domain/1944/unique';path.write_text(json.dumps(payload))
+    clock=[100.0];monkeypatch.setattr(module,'monotonic',lambda:clock[0])
+    consumer,requests=factory(concurrency=1)
+    try:
+        consumer.poll()
+        clock[0]=105.0
+        consumer.save('ingest',0,download_latency=.1,final_url=requests[0].url,status_code=200)
+        domain=consumer.processing_feedback.snapshot()['domains']['1944']
+        assert domain['service_latency_sec']==5.0
+        assert domain['observed_parallelism']==1
+    finally:consumer.close()

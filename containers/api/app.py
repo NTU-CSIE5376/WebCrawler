@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import errno
 import logging
+from typing import Literal
 
 import psycopg2
-from fastapi import Depends, FastAPI, Request, Response
+from fastapi import Depends, FastAPI, Request, Response, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
 from sqlalchemy.exc import SQLAlchemyError, TimeoutError as PoolTimeoutError
 from starlette.exceptions import HTTPException
 
@@ -47,6 +48,9 @@ def temporary_storage_error(error: Exception) -> bool:
 class ManualBulkCrawlRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    processing_mode: Literal["fetch", "ingest"] = "fetch"
+    validate_urls: StrictBool = True
+    client_reference: StrictStr | None = Field(default=None, max_length=128)
     urls: list[StrictStr]
     ttl_days: StrictInt = Field(default=DEFAULT_TTL_DAYS, ge=1, le=MAX_TTL_DAYS)
 
@@ -96,7 +100,8 @@ def create_app(config_path: str | None = None, *, service=None) -> FastAPI:
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         try:
-            return {"job_id": service.submit(urls, ttl_days=ttl_days)}
+            return {"job_id": service.submit(urls, ttl_days=ttl_days, processing_mode=payload["processing_mode"],
+                                             client_reference=payload["client_reference"])}
         except (OSError, SQLAlchemyError, psycopg2.Error) as exc:
             logger.exception("submission.storage_failed")
             if temporary_storage_error(exc):
@@ -105,6 +110,26 @@ def create_app(config_path: str | None = None, *, service=None) -> FastAPI:
         except Exception:
             logger.exception("submission.failed")
             return JSONResponse({"error": "Submission failed; no URLs accepted"}, status_code=500)
+
+    @app.get("/v1/crawlers/{crawler_id}/performance")
+    def crawler_performance(crawler_id: int):
+        if crawler_id < 0:
+            return JSONResponse({"error": "Invalid crawler ID"}, status_code=400)
+        try:
+            return service.crawler_performance(crawler_id)
+        except OSError:
+            return JSONResponse({"error": "Processing feedback unavailable"}, status_code=503)
+
+    @app.get("/v1/manual-bulk-crawls")
+    def list_active_jobs(crawler_id: int | None = Query(default=None, ge=0),
+                         client_prefix: str = Query(default="", max_length=128),
+                         limit: int = Query(default=200, ge=1, le=1000),
+                         after: str = ""):
+        try:
+            return service.active_jobs(crawler_id=crawler_id, client_prefix=client_prefix,
+                                       limit=limit, after=after)
+        except OSError:
+            return JSONResponse({"error": "Job status unavailable"}, status_code=503)
 
     @app.delete("/v1/manual-bulk-crawls/{job_id}", status_code=204)
     def delete_manual_bulk_crawl(job_id: str):

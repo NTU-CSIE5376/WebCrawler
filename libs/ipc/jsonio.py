@@ -23,15 +23,24 @@ def atomic_write_json(path: str, payload: Any) -> None:
 
     os.replace(tmp, p)
 
-def append_jsonl(path: str, payload: Any) -> None:
+def append_jsonl(path: str, payload: Any, *, sync: bool = False) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
 
     line = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
 
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-    os.write(fd, line)
-    os.close(fd)
+    try:
+        remaining = memoryview(line)
+        while remaining:
+            written = os.write(fd, remaining)
+            if written <= 0:
+                raise OSError("JSONL write made no progress")
+            remaining = remaining[written:]
+        if sync:
+            os.fsync(fd)
+    finally:
+        os.close(fd)
 
 def read_json(path: Path) -> Any:
     with open(path, "rb") as f:
