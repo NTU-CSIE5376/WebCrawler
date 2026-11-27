@@ -1,5 +1,4 @@
 click==8.5.0
-w3lib==2.3.1
 validators==0.35.0
 pytest==8.4.2
 tldextract==5.1.1

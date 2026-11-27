@@ -2,7 +2,8 @@ fastapi==0.146.0
 uvicorn==0.54.0
 httpx2==2.14.0
 click==8.5.0
-w3lib==2.3.1
+# Same canonicalize_url as the crawler's url_state keys (#166)
+w3lib==2.5.0
 validators==0.35.0
 pytest==8.4.2
 tldextract==5.1.1
