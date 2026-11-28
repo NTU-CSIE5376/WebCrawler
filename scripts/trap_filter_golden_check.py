@@ -5,7 +5,7 @@ Check the ingest trap filter's audit log against the golden set.
 The ingestors write every dropped / normalized / would-be-normalized discovery
 link to
 /data/ipc/trap_filter/ingestor_NN/YYYY-MM-DD.jsonl.gz (see
-containers/scheduler_ingest/ingestor/trap_filter.py). This script streams those
+containers/scheduler_ingest/ingestor/libs/trap_filter.py). This script streams those
 logs and reports, per rule:
 
   * drop events, and how many distinct golden URLs were dropped
@@ -39,7 +39,7 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from containers.scheduler_ingest.ingestor.trap_filter import (  # noqa: E402
+from containers.scheduler_ingest.ingestor.libs.trap_filter import (  # noqa: E402
     DEFAULT_NORMALIZE_PARAMS,
     read_audit_log,
 )

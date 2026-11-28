@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
-from containers.scheduler_ingest.ingestor.db_ops import IngestDB, _HIST_COLS
+from containers.scheduler_ingest.ingestor.libs.db_ops import IngestDB, _HIST_COLS
 
 
 @pytest.fixture

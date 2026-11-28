@@ -37,28 +37,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator
 
-from libs.frontier.trap_rules import HIGH_CONFIDENCE, match_rules
-from libs.frontier.url_normalize import strip_named_params, strip_params
+import pyarrow as pa
+import pyarrow.compute as pc
+
+from libs.frontier import URLPolicy, evaluate
+from libs.frontier.trap_rules import DEFAULT_NORMALIZE_PARAMS
 
 
 LOGGER = logging.getLogger("ingestor")
 
 
-# Params stripped for real: only srsltid (Google documents it as attribution
-# only), matching golden_inject (#103) and the coverage metric
-# (WebSearchEngine #19). Session ids and other tracking params are
-# shadow-logged until golden_inject and coverage support the same policy.
-DEFAULT_NORMALIZE_PARAMS = frozenset({"srsltid"})
-
-
 @dataclass(frozen=True)
-class TrapFilterConfig:
-    enabled: bool = True
-    normalize: bool = True
-    normalize_params: frozenset[str] = DEFAULT_NORMALIZE_PARAMS
-    shadow_normalize: bool = True
-    drop: bool = True
-    drop_rules: frozenset[str] = HIGH_CONFIDENCE
+class TrapFilterConfig(URLPolicy):
     log_dir: str | None = None
     audit_batch_size: int = 4096
     audit_max_buffer_bytes: int = 1024 * 1024
@@ -187,67 +177,71 @@ class TrapFilter:
         self._now = now
         self._audit = _AuditLogWriter(cfg) if cfg.log_dir else None
 
+    @staticmethod
+    def _event(rec, decision, ts):
+        new_url, shadow_url, hits = decision
+        url = rec["url"]
+        action = "drop" if hits else "normalize" if new_url != url else "would_normalize"
+        event = {"ts": ts.isoformat(), "action": action, "url": url}
+        if new_url != url:
+            event["normalized_url"] = new_url
+        if shadow_url is not None:
+            event["would_normalize_url"] = shadow_url
+        if hits:
+            event["rules"] = hits
+        event["domain_id"] = rec.get("domain_id")
+        event["shard_id"] = rec.get("shard_id")
+        event["discovered_from"] = rec.get("discovered_from")
+        return event
+
+    def evaluate_urls(self, urls):
+        return evaluate(urls, self.cfg, backend='pyarrow')
+
+    def record_decisions(self, records, decisions):
+        """Count policy actions and materialize only affected audit rows."""
+        dropped = decisions['dropped']
+        changed = pc.fill_null(pc.not_equal(decisions['url'], decisions['normalized_url']), False)
+        shadow = pc.is_valid(decisions['shadow_url'])
+        stats = TrapFilterStats(
+            dropped=pc.sum(dropped).as_py() or 0,
+            normalized=pc.sum(pc.and_(changed, pc.invert(dropped))).as_py() or 0,
+            would_normalize=pc.sum(shadow).as_py() or 0,
+        )
+        rule_names = decisions.schema.names[3:-1]
+        stats.by_rule.update({name:pc.sum(decisions[name]).as_py() or 0 for name in rule_names
+                              if pc.any(decisions[name]).as_py()})
+        affected = pc.or_(dropped,pc.or_(changed,shadow))
+        if self.cfg.log_dir and pc.any(affected).as_py():
+            metadata = records.filter(affected)
+            actions = decisions.filter(affected)
+            frame = metadata
+            for name in actions.schema.names[1:]:
+                frame = frame.append_column('__policy_'+name,actions[name])
+            ts = self._now().replace(microsecond=0)
+            events = []
+            for record in frame.to_pylist():
+                hits = [name for name in rule_names if record['__policy_'+name]]
+                decision = (record['__policy_normalized_url'],record['__policy_shadow_url'],hits)
+                events.append(self._event(record,decision,ts))
+            self._write_log(ts,events)
+        return stats
+
     def apply(self, recs: list[dict]) -> tuple[list[dict], TrapFilterStats]:
-        """Return (kept records, stats). Normalized records are copies with a
-        new `url`; dropped records are left out; shadow-only records are kept
-        unchanged."""
-        stats = TrapFilterStats()
-        if not self.cfg.enabled:
-            return recs, stats
+        urls = pa.array([record.get('url') for record in recs],type=pa.string())
+        decisions = self.evaluate_urls(urls)
+        metadata = pa.table({'url':urls})
+        if self.cfg.log_dir:
+            for name, typ in [('domain_id',pa.int64()),('shard_id',pa.int64()),('discovered_from',pa.string())]:
+                metadata = metadata.append_column(name,pa.array([record.get(name) for record in recs],type=typ))
+        stats = self.record_decisions(metadata,decisions)
+        kept = [record if url==record.get('url') else {**record,'url':url}
+                for record,url,drop in zip(recs,decisions['normalized_url'].to_pylist(),decisions['dropped'].to_pylist())
+                if not drop]
+        return kept,stats
 
-        ts = self._now().replace(microsecond=0)
-        ts_iso = ts.isoformat()
-        kept: list[dict] = []
-        events: list[dict] = []
-        for rec in recs:
-            url = rec.get("url")
-            if not url:
-                kept.append(rec)
-                continue
-            new_url = url
-            if self.cfg.normalize:
-                new_url = strip_named_params(url, self.cfg.normalize_params)
-            shadow_url = None
-            if self.cfg.shadow_normalize:
-                full = strip_params(url, generic_session_tokens=True)
-                if full != new_url:
-                    shadow_url = full
-            hits = []
-            if self.cfg.drop:
-                hits = [r for r in match_rules(new_url) if r in self.cfg.drop_rules]
-            if new_url == url and not hits and shadow_url is None:
-                kept.append(rec)
-                continue
-
-            if hits:
-                action = "drop"
-                stats.dropped += 1
-                stats.by_rule.update(hits)
-            elif new_url != url:
-                action = "normalize"
-                stats.normalized += 1
-                kept.append({**rec, "url": new_url})
-            else:
-                action = "would_normalize"
-                kept.append(rec)
-            if shadow_url is not None:
-                stats.would_normalize += 1
-
-            event = {"ts": ts_iso, "action": action, "url": url}
-            if new_url != url:
-                event["normalized_url"] = new_url
-            if shadow_url is not None:
-                event["would_normalize_url"] = shadow_url
-            if hits:
-                event["rules"] = hits
-            event["domain_id"] = rec.get("domain_id")
-            event["shard_id"] = rec.get("shard_id")
-            event["discovered_from"] = rec.get("discovered_from")
-            events.append(event)
-
-        if events and self.cfg.log_dir:
-            self._write_log(ts, events)
-        return kept, stats
+    def apply_one(self, record):
+        kept, _ = self.apply([record])
+        return kept[0] if kept else None
 
     def _write_log(self, ts: datetime, events: list[dict]) -> None:
         self._audit.write(ts, events)

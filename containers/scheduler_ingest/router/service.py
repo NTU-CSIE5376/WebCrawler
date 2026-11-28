@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
-import os
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -15,6 +13,7 @@ from typing import Any, Dict, Optional, Set
 logger = logging.getLogger("router")
 
 import psycopg2
+import pyarrow as pa
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import OperationalError, InterfaceError
@@ -23,10 +22,12 @@ from libs.config.loader import load_yaml, require
 from libs.db.sharding.key import load_sharding_config
 from libs.db.sharding.router import ShardRouter, host_of
 from libs.ipc.jsonio import read_json, read_jsonl
+from libs.ipc.parquet import ParquetBatchWriter, routed_columns
+from libs.ipc.routed_schema import ROUTED_SCHEMAS
 from libs.ipc.new_link_record import (
     DISCOVERY_SOURCE_PAGE_OUTLINK,
     SOURCE_YOUTUBE_CHANNEL,
-    build_new_link_record,
+    SOURCE_NATURAL,
 )
 from libs.stats.delta_writer import StatsDeltaWriter
 from libs.ipc.folder_reader import current_interval
@@ -37,6 +38,10 @@ from .domain_resolver import DomainResolver
 # manual tier: strictly above the ranker's [0, 1] range, below golden's 3.0.
 MANUAL_PRIORITY_MIN = 1.0
 MANUAL_PRIORITY_MAX = 2.0
+
+
+class RouterOutputError(RuntimeError):
+    """Output failed: the source folder must not be checkpointed."""
 
 # domain_id never changes for a domain and domain_score moves slowly, so the
 # domain cache outlives a folder. It is dropped every DOMAIN_CACHE_TTL_SEC (to
@@ -81,11 +86,18 @@ class RouterConfig:
     split_subdomains: Set[str]
 
     postgres_dsn: str
+    output_batch_records: int = 16384
+    output_max_buffer_mib: int = 64
+    output_flush_seconds: float = 1.0
 
 
 class RouterService:
     def __init__(self, cfg: RouterConfig):
         self.cfg = cfg
+        self.parquet_writer = ParquetBatchWriter(cfg.router_id,
+            batch_records=cfg.output_batch_records,
+            max_buffer_bytes=cfg.output_max_buffer_mib*1024**2,
+            flush_seconds=cfg.output_flush_seconds)
         self.sharder = ShardRouter(
             num_shards=self.cfg.num_shards,
             shards_per_ingestor=self.cfg.shards_per_ingestor,
@@ -118,29 +130,24 @@ class RouterService:
         date, time = current_interval(self.cfg.interval_minutes)
         return base / date / time
 
-    def _out_path(self, ingestor_id: int) -> Path:
-        out_dir = self._out_dir(ingestor_id)
-        if out_dir not in self._made_dirs:
-            out_dir.mkdir(parents=True, exist_ok=True)
-            if len(self._made_dirs) > 10_000:
-                self._made_dirs.clear()
-            self._made_dirs.add(out_dir)
-        return out_dir / f"{datetime.now(timezone.utc).strftime('%H%M')}_router{self.cfg.router_id:02d}.jsonl"
+    @staticmethod
+    def _append_columns(columns, **values):
+        if values.keys() != columns.keys():
+            raise ValueError('output fields do not match the routed schema')
+        for name, column in columns.items():
+            column.append(values[name])
 
-    def _flush(self, pending: Dict[int, list]) -> None:
-        """Write one crawl record's output lines with a single append per
-        ingestor file (was mkdir + open/write/close per outlink)."""
-        for ingestor_id, payloads in pending.items():
-            path = self._out_path(ingestor_id)
-            data = "".join(
-                json.dumps(p, ensure_ascii=False, separators=(",", ":")) + "\n"
-                for p in payloads
-            ).encode("utf-8")
-            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-            try:
-                os.write(fd, data)
-            finally:
-                os.close(fd)
+    def _flush(self, pending) -> None:
+        """Publish only domain-resolved output from successful transactions."""
+        try:
+            for ingestor_id, streams in pending.items():
+                for kind, columns in streams.items():
+                    schema = ROUTED_SCHEMAS[kind]
+                    if columns[schema.names[0]]:
+                        batch = pa.RecordBatch.from_pydict(columns, schema=schema)
+                        self.parquet_writer.append_batch(self._out_dir(ingestor_id), kind, batch)
+        except Exception as exc:
+            raise RouterOutputError('could not publish router output') from exc
 
     def _domain_cache_for_folder(self) -> Dict[str, tuple[int, float]]:
         if (
@@ -153,7 +160,7 @@ class RouterService:
 
     def process_folder(self, folder: Path) -> None:
         """
-        Read all json files under folder; write transformed json to ingestor dirs.
+        Read crawler JSON output; publish typed discovery/content Parquet batches.
         """
         logger.info(
             "route.folder_start",
@@ -201,7 +208,7 @@ class RouterService:
                     # Output lines are buffered per record and written only
                     # after the DB work succeeds, so a retried record no
                     # longer leaves duplicate outlink lines behind.
-                    pending: Dict[int, list] = defaultdict(list)
+                    pending = defaultdict(routed_columns)
                     try:
                         with self.Session() as sess:
                             domain_resolver = DomainResolver(sess, domain_cache)
@@ -232,28 +239,17 @@ class RouterService:
                                     if l:
                                         new_outlinks.append(l)
 
-                        out = {
-                            "url": rec.get("url"),
-                            "status": status,
-                            "fetched_at": rec.get("fetched_at"),
-                            "fail_reason": rec.get("fail_reason"),
-                            "content": content,
-                            "outlinks": new_outlinks,
-                            "shard_id": shard_id,
-                            "domain_id": domain_id,
-                            "domain_score": domain_score,
-                            "content_hash": content_hash,
-                            "title": rec.get("title"),
-                            "hreflang_count": rec.get("hreflang_count"),
-                            "has_json_ld": rec.get("has_json_ld"),
-                            "last_modified": rec.get("last_modified"),
-                            "etag": rec.get("etag"),
-                            "cache_control": rec.get("cache_control"),
-                            "is_redirect": rec.get("is_redirect"),
-                            "redirect_hop_count": rec.get("redirect_hop_count"),
-                        }
+                        self._append_columns(pending[ingestor_id]['content'],
+                            url=rec.get("url"), status=status, fetched_at=rec.get("fetched_at"),
+                            fail_reason=rec.get("fail_reason"), content=content, outlinks=new_outlinks,
+                            shard_id=shard_id, domain_id=domain_id, domain_score=domain_score,
+                            content_hash=content_hash, title=rec.get("title"),
+                            hreflang_count=rec.get("hreflang_count"), has_json_ld=rec.get("has_json_ld"),
+                            last_modified=rec.get("last_modified"), etag=rec.get("etag"),
+                            cache_control=rec.get("cache_control"), is_redirect=rec.get("is_redirect"),
+                            redirect_hop_count=rec.get("redirect_hop_count"),
+                        )
 
-                        pending[ingestor_id].append(out)
                         self._flush(pending)
                         records += 1
                         links += len(new_outlinks)
@@ -279,6 +275,8 @@ class RouterService:
                             pass
                         time.sleep(0.2 * (2 ** attempt))
 
+                    except RouterOutputError:
+                        raise
                     except Exception as e:
                         logger.error(
                             "route.domain_error",
@@ -291,6 +289,8 @@ class RouterService:
                         error += 1
                         break
 
+        # All destination tails must be closed before main.py checkpoints.
+        self.parquet_writer.flush()
         if error:
             self.stats.write(
                 source="router",
@@ -356,7 +356,7 @@ class RouterService:
         domain: str,
         shard_id: int,
         ingestor_id: int,
-        pending: Dict[int, list],
+        pending,
     ) -> Optional[Dict[str, Any]]:
         url = link.get("url")
         anchor = link.get("anchor")
@@ -365,20 +365,15 @@ class RouterService:
 
         try:
             domain_id, domain_score = domain_resolver.ensure_and_get(domain, shard_id)
-            out = build_new_link_record(
-                url=url,
-                shard_id=shard_id,
-                domain_id=domain_id,
-                domain_score=domain_score,
-                discovered_from=src_url,
+            priority = _priority_fields(link)
+            self._append_columns(pending[ingestor_id]['discovery'],
+                url=url, status='new', shard_id=shard_id, domain_id=domain_id,
+                domain_score=domain_score, discovered_from=src_url,
                 discovery_source_type=DISCOVERY_SOURCE_PAGE_OUTLINK,
-                parent_page_score=parent_page_score,
-                inlink_count_external=int(src_domain != domain),
-                anchor_text=anchor,
-                **_priority_fields(link),
+                parent_page_score=parent_page_score, inlink_count_approx=1,
+                inlink_count_external=int(src_domain != domain), anchor_text=anchor,
+                url_priority=priority.get('url_priority'), source=priority.get('source', SOURCE_NATURAL),
             )
-
-            pending[ingestor_id].append(out)
 
             return {
                 "url": url,
@@ -419,4 +414,7 @@ def load_router_config(path: str, router_id: int) -> RouterConfig:
         domain_overrides=overrides,
         split_subdomains=split_subdomains,
         postgres_dsn=dsn,
+        output_batch_records=int(r.get('output_batch_records', 16384)),
+        output_max_buffer_mib=int(r.get('output_max_buffer_mib', 64)),
+        output_flush_seconds=float(r.get('output_flush_seconds', 1.0)),
     )

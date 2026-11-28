@@ -3,7 +3,7 @@ import logging
 import time
 from pathlib import Path
 
-from libs.ipc.jsonio import read_json, read_jsonl
+from libs.ipc.parquet import read_routed_records, routed_files
 from libs.stats.delta_writer import StatsDeltaWriter
 
 from .db_ops import FeatureDB
@@ -32,35 +32,22 @@ class ExtractService:
         # so Grafana can line this stage up with crawler / router / ingestor.
         records = 0
 
-        for f in folder.iterdir():
-            if not f.is_file():
-                continue
-
-            if f.suffix == ".json":
-                recs = [read_json(f)]
-                file_cnt += 1
-            elif f.suffix == ".jsonl":
-                recs = read_jsonl(f)
-                file_cnt += 1
-            else:
-                continue
-
-            for rec in recs:
-                if rec.get("status") != "new":
-                    records += 1
-                try:
-                    if rec.get("status") == "ok":
-                        feat = extract_basic(rec)
-                        self.db.process(feat)
-                        yt = extract_youtube(rec)
-                        if yt:
-                            self.db.process_youtube(yt)
-                except Exception as e:
-                    logger.error(
-                        "extract.record_error",
-                        extra={"event": "extract.record_error", "error": str(e)},
-                    )
-                    error += 1
+        file_cnt = sum(1 for _ in routed_files(folder, 'content'))
+        for rec in read_routed_records(folder, 'content'):
+            records += 1
+            try:
+                if rec.get("status") == "ok":
+                    feat = extract_basic(rec)
+                    self.db.process(feat)
+                    yt = extract_youtube(rec)
+                    if yt:
+                        self.db.process_youtube(yt)
+            except Exception as e:
+                logger.error(
+                    "extract.record_error",
+                    extra={"event": "extract.record_error", "error": str(e)},
+                )
+                error += 1
         if error:
             self.stats.write(
                 source="extractor",

@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 
 from containers.scheduler_ingest.feature_extractor.service import ExtractService
-from containers.scheduler_ingest.ingestor.service import IngestService
+from containers.scheduler_ingest.ingestor.content_ingestor.service import ContentIngestor
+from containers.scheduler_ingest.ingestor.libs.worker import Checkpoint
 
 
 class _Stats:
@@ -26,9 +27,12 @@ def _done(caplog, event):
 
 
 def test_ingest_folder_done_has_duration(tmp_path, caplog):
-    svc = IngestService(0, _IngestDB(), _Stats())
-    with caplog.at_level(logging.INFO, logger="ingestor"):
-        svc.process_folder(tmp_path)
+    svc = ContentIngestor(_IngestDB(), _Stats(),
+                         Checkpoint(tmp_path/'content.json', tmp_path/'legacy.json', tmp_path/'discovery.json'))
+    folder = tmp_path/'input'
+    folder.mkdir()
+    with caplog.at_level(logging.INFO, logger="content_ingestor"):
+        svc.process_folder(folder, "20261128", "0000")
     assert _done(caplog, "ingest.folder_done").duration_s >= 0
 
 
@@ -40,12 +44,12 @@ def test_extract_folder_done_has_duration(tmp_path, caplog):
 
 
 def test_extract_folder_done_counts_crawl_results_not_links(tmp_path, caplog):
-    import json
-    (tmp_path / "part.jsonl").write_text("".join(json.dumps(r) + "\n" for r in [
-        {"url": "https://a.example/", "status": "fail", "fail_reason": "HttpError 404"},
-        {"url": "https://a.example/x", "status": "new"},
-        {"url": "https://a.example/y", "status": "new"},
-    ]))
+    from containers.scheduler_ingest.tests.helpers.parquet_records import write_records
+    write_records(tmp_path, [
+        {"url":"https://a.example/", "status":"fail", "fail_reason":"HttpError 404"},
+        {"url":"https://a.example/x", "status":"new"},
+        {"url":"https://a.example/y", "status":"new"},
+    ])
     svc = ExtractService(0, db=None, stats=_Stats())
     with caplog.at_level(logging.INFO):
         svc.process_folder(tmp_path)

@@ -6,8 +6,8 @@ import threading
 
 import pytest
 
-from containers.scheduler_ingest.ingestor import trap_filter as module
-from containers.scheduler_ingest.ingestor.trap_filter import TrapFilter, TrapFilterConfig, read_audit_log
+from containers.scheduler_ingest.ingestor.libs import trap_filter as module
+from containers.scheduler_ingest.ingestor.libs.trap_filter import TrapFilter, TrapFilterConfig, read_audit_log
 
 
 NOW = datetime(2026, 11, 28, 12, tzinfo=timezone.utc)
@@ -167,7 +167,7 @@ def test_invalid_limits_fail_at_startup(setting, value):
 
 
 def test_yaml_overrides_audit_limits():
-    from containers.scheduler_ingest.ingestor.main import _load_trap_filter
+    from containers.scheduler_ingest.ingestor.libs.config import _load_trap_filter
     f = _load_trap_filter({"trap_filter": dict(audit_batch_size=16000,
                           audit_max_buffer_bytes=2048, audit_flush_interval_seconds=2.5)}, 0)
     assert f.cfg.audit_batch_size == 16000
@@ -178,10 +178,11 @@ def test_yaml_overrides_audit_limits():
 
 def test_discovery_failure_still_flushes_audit_tail(tmp_path):
     from containers.scheduler_ingest.tests.test_split_ingestors import setup, link
+    from containers.scheduler_ingest.tests.helpers.parquet_records import add
     f = TrapFilter(TrapFilterConfig(log_dir=str(tmp_path / "audit"), audit_flush_interval_seconds=60),
                    now=lambda: NOW)
     svc, _, _, _ = setup(tmp_path, trap_filter=f)
-    svc.add(link("https://example.test/a?srsltid=1"))
+    add(svc, link("https://example.test/a?srsltid=1"))
     svc.db.process_batch.side_effect = RuntimeError("DB failed")
     with pytest.raises(RuntimeError, match="DB failed"):
         svc.close()

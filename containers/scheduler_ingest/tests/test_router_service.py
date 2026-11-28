@@ -8,6 +8,7 @@ from sqlalchemy import create_engine, event, text
 
 from containers.scheduler_ingest.router import service as router_service
 from containers.scheduler_ingest.router.service import RouterConfig, RouterService
+from libs.ipc.parquet import read_routed_records
 
 NUM_SHARDS = 4
 
@@ -78,8 +79,9 @@ def _record(url, links):
 
 def _output_lines(tmp_path):
     lines = []
-    for f in sorted(tmp_path.glob("ingestor_*/*/*/*.jsonl")):
-        lines.extend(json.loads(line) for line in f.read_text().splitlines())
+    for folder in sorted(tmp_path.glob('ingestor_*/*/*')):
+        for kind in ('discovery','content'):
+            lines.extend(read_routed_records(folder, kind))
     return lines
 
 
@@ -87,7 +89,7 @@ def _domain_sql(statements):
     return [s for s in statements if "domain_state" in s]
 
 
-def test_outlinks_resolve_domains_in_one_batch_and_write_once_per_file(router, monkeypatch):
+def test_outlinks_resolve_domains_in_one_batch_and_publish_batched_files(router, monkeypatch):
     svc, statements, tmp_path = router
     links = [
         "https://known.example/a", "https://new-one.example/b",
@@ -95,11 +97,6 @@ def test_outlinks_resolve_domains_in_one_batch_and_write_once_per_file(router, m
     ]
     folder = _crawl_folder(tmp_path, "f1", [_record("https://known.example/", links)])
 
-    opened = []
-    real_open = router_service.os.open
-    monkeypatch.setattr(
-        router_service.os, "open", lambda path, *a: opened.append(path) or real_open(path, *a),
-    )
     svc.process_folder(folder)
 
     out = _output_lines(tmp_path)
@@ -111,9 +108,10 @@ def test_outlinks_resolve_domains_in_one_batch_and_write_once_per_file(router, m
     ids = {r["url"].split("/")[2]: r["domain_id"] for r in new_links}
     assert ids["known.example"] == 1
     assert len(set(ids.values())) == 3
-    # One append per distinct ingestor file for the whole record.
-    opened = [p for p in opened if "_router03.jsonl" in p]
-    assert opened and len(opened) == len(set(opened))
+    # One closed output file for each destination/stream, not each outlink.
+    files = list(tmp_path.glob('ingestor_*/*/*/*.parquet'))
+    assert len(files) <= 3
+    assert not list(tmp_path.glob('ingestor_*/*/*/*.tmp'))
     # SELECT for the crawled domain, then one SELECT / INSERT / SELECT for
     # the two unknown outlink domains together.
     domain_sql = _domain_sql(statements)

@@ -113,11 +113,9 @@ class Checkpoint:
                 atomic_write_json(str(self.legacy_path), {"date": mark[0], "time": mark[1]})
 
 
-def run(kind):
+def run(kind, service_factory):
     import argparse
-    from .main import _load_inline_ranker, _load_trap_filter, _inline_score_timeout_sec, _inline_score_batch_size
-    from ..discovery_ingestor.service import DiscoveryIngestor
-    from ..content_ingestor.service import ContentIngestor
+    from .config import _load_inline_ranker, _load_trap_filter, _inline_score_timeout_sec, _inline_score_batch_size
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -125,7 +123,7 @@ def run(kind):
     args = parser.parse_args()
     raw = load_yaml(args.config)
     settings = require(raw, kind)
-    legacy = require(raw, "ingestor")
+    ingestion = require(raw, "ingestion")
     shards_per_worker = int(require(raw["router"], "shards_per_ingestor"))
     num_shards = int(require(raw["router"], "num_shards"))
     if not 0 <= args.worker_id < (num_shards + shards_per_worker - 1) // shards_per_worker:
@@ -146,7 +144,7 @@ def run(kind):
     with exclusive(lock_dir / f"{kind}_{args.worker_id:02d}.lock", nonblocking=True):
         # An old combined worker must be stopped before starting this pair.
         checkpoint = Checkpoint(fmt(require(settings, "progress_template")),
-                                fmt(require(legacy, "progress_template")),
+                                fmt(require(ingestion, "legacy_progress_template")),
                                 fmt(require(raw[peer_kind], "progress_template")))
         reader = FolderReader(fmt(require(settings, "result_dir_template")), checkpoint.progress,
                               int(settings.get("interval_minutes", 10)))
@@ -163,12 +161,12 @@ def run(kind):
         kwargs = dict(db=writer, stats=StatsDeltaWriter(require(settings, "stats_dir")),
                       checkpoint=checkpoint, max_buffer_bytes=int(settings.get("max_buffer_mib", 2048 if is_discovery else 64)) * 1024**2)
         if is_discovery:
-            service = DiscoveryIngestor(**kwargs, trap_filter=_load_trap_filter(raw, args.worker_id),
+            service = service_factory(**kwargs, trap_filter=_load_trap_filter(raw, args.worker_id),
                        distinct_url_limit=int(settings.get("distinct_urls_per_shard", 64000)),
                        idle_seconds=float(settings.get("idle_flush_seconds", 600)),
                        max_age_seconds=float(settings.get("max_buffer_age_seconds", 600)))
         else:
-            service = ContentIngestor(**kwargs)
+            service = service_factory(**kwargs)
         try:
             while not stopping:
                 progressed = False

@@ -224,7 +224,7 @@ def test_build_new_link_record_marks_external():
     assert rec["inlink_count_external"] == 1
 
 
-# ----- IngestorEmitter writes JSONL where the FolderReader expects it -----
+# ----- IngestorEmitter publishes the shared Parquet discovery contract -----
 
 def test_emitter_writes_to_time_bucket_folder(tmp_path):
     template = str(tmp_path / "ingestor_{id:02d}")
@@ -237,15 +237,16 @@ def test_emitter_writes_to_time_bucket_folder(tmp_path):
         inlink_count_external=0,
     )
     emitter.emit(ingestor_id=3, record=rec)
+    emitter.flush()
 
     ingestor_dir = tmp_path / "ingestor_03"
     assert ingestor_dir.exists()
-    files = list(ingestor_dir.glob("*/*/*.jsonl"))
+    files = list(ingestor_dir.glob("*/*/*.parquet"))
     assert len(files) == 1
     out_file = files[0]
-    assert "sitemap_testtag" in out_file.name
+    assert out_file.name.startswith("discovery-")
     assert out_file.parent.name.isdigit() and len(out_file.parent.name) == 4   # HHMM
     assert out_file.parent.parent.name.isdigit() and len(out_file.parent.parent.name) == 8  # YYYYMMDD
 
-    line = out_file.read_text(encoding="utf-8").strip()
-    assert json.loads(line) == rec
+    from libs.ipc.parquet import read_routed_records
+    assert list(read_routed_records(out_file.parent, "discovery")) == [rec]

@@ -1,5 +1,4 @@
 """Exercise retry boundaries against real transactions without production writes."""
-import json
 import sqlite3
 from unittest.mock import MagicMock
 
@@ -9,8 +8,10 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import InterfaceError, OperationalError
 from sqlalchemy.orm import sessionmaker
 
-from containers.scheduler_ingest.ingestor.db_ops import IngestDB
-from containers.scheduler_ingest.ingestor.service import IngestService
+from containers.scheduler_ingest.ingestor.libs.db_ops import IngestDB
+from containers.scheduler_ingest.ingestor.discovery_ingestor.service import DiscoveryIngestor
+from containers.scheduler_ingest.tests.helpers.parquet_records import write_records
+from containers.scheduler_ingest.ingestor.libs.worker import Checkpoint, ShardWriter
 
 
 class Cursor(sqlite3.Cursor):
@@ -269,9 +270,12 @@ def test_service_counts_recovered_records_only_once(transaction_db, tmp_path):
     db._bulk_links = bulk
     folder = tmp_path / "folder"
     folder.mkdir()
-    (folder / "input.jsonl").write_text(json.dumps(link()) + "\n")
+    write_records(folder, [link()])
     stats = MagicMock()
-    IngestService(0, db, stats).process_folder(folder)
+    checkpoint = Checkpoint(tmp_path/'discovery.json', tmp_path/'legacy.json', tmp_path/'content.json')
+    service = DiscoveryIngestor(ShardWriter(db, 0, 16, tmp_path/'locks', True), stats, checkpoint)
+    service.process_folder(folder, '20261128', '0000')
+    service.close()
     stats.write.assert_called_once()
     counters = stats.write.call_args.kwargs["counters"]
     assert counters["new_links"] == 1
@@ -380,7 +384,7 @@ def test_missing_partition_recovery_preserves_transaction_retry_boundary(
     transaction_db, monkeypatch, disconnect_after_provisioning,
 ):
     from datetime import datetime, timezone
-    from containers.scheduler_ingest.ingestor import db_ops
+    from containers.scheduler_ingest.ingestor.libs import db_ops
 
     db, engine, sleep, invalidations = transaction_db
     attempts = []

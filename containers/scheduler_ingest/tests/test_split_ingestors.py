@@ -4,16 +4,16 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from containers.scheduler_ingest.discovery_ingestor.service import DiscoveryIngestor
-from containers.scheduler_ingest.content_ingestor.service import ContentIngestor
-from containers.scheduler_ingest.ingestor.trap_filter import TrapFilter, TrapFilterConfig
-from containers.scheduler_ingest.ingestor.worker import Checkpoint, ShardWriter, exclusive
+from containers.scheduler_ingest.ingestor.discovery_ingestor.service import DiscoveryIngestor
+from containers.scheduler_ingest.ingestor.content_ingestor.service import ContentIngestor
+from containers.scheduler_ingest.ingestor.libs.trap_filter import TrapFilter, TrapFilterConfig
+from containers.scheduler_ingest.ingestor.libs.worker import Checkpoint, ShardWriter, exclusive
 from libs.ipc.folder_reader import Progress
 from scripts.cleanup_crawl_result import discover_stages
 
 
-def link(url='https://example.test/a', sid=0, **kw):
-    return dict(url=url, shard_id=sid, status='new', **kw)
+from containers.scheduler_ingest.tests.helpers.parquet_records import add, link, write_records
+from libs.ipc.parquet import read_routed_records
 
 
 def setup(tmp_path, **kwargs):
@@ -30,18 +30,18 @@ def setup(tmp_path, **kwargs):
 def folder(tmp_path, name, records):
     path = tmp_path/name
     path.mkdir()
-    (path/'part.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in records))
+    write_records(path, records)
     return path
 
 
 def test_unique_limit_aggregates_counts_provenance_priority_and_anchor(tmp_path):
     svc, batches, ck, clock = setup(tmp_path, distinct_url_limit=2)
-    svc.add(link(inlink_count_approx=3, parent_page_score=.1, discovered_from='old'))
-    svc.add(link(inlink_count_approx=4, inlink_count_external=1, anchor_text='first',
+    add(svc, link(inlink_count_approx=3, parent_page_score=.1, discovered_from='old'))
+    add(svc, link(inlink_count_approx=4, inlink_count_external=1, anchor_text='first',
                  parent_page_score=.5, discovered_from='best', url_priority=1.5, source=4))
-    svc.add(link(anchor_text='second', parent_page_score=.2, discovered_from='other',url_priority=1.2))
+    add(svc, link(anchor_text='second', parent_page_score=.2, discovered_from='other',url_priority=1.2))
     assert not batches  # Three inputs, still just one distinct URL.
-    svc.add(link('https://example.test/b'))
+    add(svc, link('https://example.test/b'))
     assert len(batches)==1 and len(batches[0])==2
     a=batches[0][0]
     assert a['inlink_count_approx']==8 and a['inlink_count_external']==1
@@ -51,13 +51,13 @@ def test_unique_limit_aggregates_counts_provenance_priority_and_anchor(tmp_path)
 
 def test_threshold_is_per_shard_and_memory_budget_is_shared(tmp_path):
     svc,batches,_,_=setup(tmp_path,distinct_url_limit=2,max_buffer_bytes=10**6)
-    svc.add(link(sid=0));svc.add(link(sid=1))
+    add(svc, link(sid=0));add(svc, link(sid=1))
     assert not batches
-    svc.add(link('https://example.test/b',sid=0))
+    add(svc, link('https://example.test/b',sid=0))
     assert [r['shard_id'] for r in batches[0]]==[0,0]
     assert list(svc.buffers)==[1]
     tiny,batches,_,_=setup(tmp_path/'tiny',max_buffer_bytes=1)
-    tiny.add(link(anchor_text='x'*10000))
+    add(tiny, link(anchor_text='x'*10000))
     assert len(batches)==1 and tiny.buffered_bytes==0
 
 
@@ -76,8 +76,8 @@ def test_tails_span_folders_checkpoint_only_after_commit(tmp_path):
 def test_continuous_duplicate_traffic_cannot_hold_checkpoint_forever(tmp_path):
     svc,batches,ck,clock=setup(tmp_path)
     svc.process_folder(folder(tmp_path,'one',[link()]),'20261125','0000')
-    clock[0]=599;svc.add(link());svc.flush_if_due();assert not batches
-    clock[0]=600;svc.add(link());svc.flush_if_due()
+    clock[0]=599;add(svc, link());svc.flush_if_due();assert not batches
+    clock[0]=600;add(svc, link());svc.flush_if_due()
     assert batches[0][0]['inlink_count_approx']==3
     assert ck.progress.seen('20261125','0000')
 
@@ -88,8 +88,8 @@ def test_failures_keep_input_checkpoint_and_buffer(tmp_path):
     svc.db.process_batch.side_effect=RuntimeError('write failed')
     with pytest.raises(RuntimeError,match='write failed'):svc.close()
     assert ck.progress.state['date'] is None
-    assert svc.buffers[0]['https://example.test/a']['inlink_count_approx']==1
-    assert (tmp_path/"one"/"part.jsonl").exists()  # Durable input is retained.
+    assert svc.buffers[0]['inlink_count_approx'].to_pylist()==[1]
+    assert list((tmp_path/"one").glob("*.parquet"))  # Durable input is retained.
 
 
 def test_filter_normalizes_before_aggregation_and_never_filters_results(tmp_path):
@@ -107,10 +107,10 @@ def test_content_does_not_wait_for_discovery_and_preserves_result_order(tmp_path
     db.process_batch.side_effect=lambda records:batches.append(list(records)) or []
     ck=Checkpoint(tmp_path/'content.json',tmp_path/'legacy.json',tmp_path/'discovery.json')
     svc=ContentIngestor(db,MagicMock(),ck,batch_size=2)
-    results=[dict(url='https://example.test/a',status='ok',shard_id=0,n=i) for i in range(3)]
+    results=[dict(url='https://example.test/a',status='ok',shard_id=0,title=str(i)) for i in range(3)]
     svc.process_folder(folder(tmp_path,'one',[link(),*results]),'20261125','0000')
     assert [len(b) for b in batches]==[2,1]
-    assert [r['n'] for b in batches for r in b]==[0,1,2]
+    assert [r['title'] for b in batches for r in b]==['0','1','2']
     assert ck.progress.seen('20261125','0000')
     assert not (tmp_path/'legacy.json').exists()  # Discovery has not committed.
 
@@ -174,4 +174,4 @@ def test_content_buffer_excludes_unused_html_and_outlinks(tmp_path):
     assert [len(batch) for batch in batches]==[10]
     assert all('content' not in r and 'outlinks' not in r for r in batches[0])
     assert all(r['content_hash']=='hash' and r['title']=='title' for r in batches[0])
-    assert json.loads((path/'part.jsonl').read_text().splitlines()[0])['content']=='x'*100000
+    assert list(read_routed_records(path, 'content'))[0]['content']=='x'*100000

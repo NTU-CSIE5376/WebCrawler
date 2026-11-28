@@ -1,22 +1,13 @@
+"""Ingestion filtering and inline-scoring configuration."""
 from __future__ import annotations
-import time
-import argparse
+
 import logging
 import os
 from pathlib import Path
 from typing import Any
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 
-from libs.config.loader import load_yaml, require
-from libs.ipc.folder_reader import Progress, FolderReader
-from libs.obslog import configure as configure_logging
 from libs.scoring.golden_discovery_runtime import GoldenDiscoveryRuntimeScorer
-from libs.stats.delta_writer import StatsDeltaWriter
-
-from .service import IngestService
 from .trap_filter import DEFAULT_NORMALIZE_PARAMS, TrapFilter, TrapFilterConfig
-from .db_ops import IngestDB
 
 
 LOGGER = logging.getLogger("ingestor")
@@ -146,85 +137,3 @@ def _load_trap_filter(raw: dict[str, Any], ingestor_id: int) -> TrapFilter | Non
                "audit_flush_interval_seconds": cfg.audit_flush_interval_seconds},
     )
     return TrapFilter(cfg)
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True)
-    ap.add_argument("--ingestor-id", type=int, required=True)
-    args = ap.parse_args()
-
-    raw = load_yaml(args.config)
-    ingestor_id = args.ingestor_id
-    configure_logging(service="ingestor", worker_id=ingestor_id)
-
-    ingestor = require(raw, "ingestor")
-    pg = require(raw, "postgres")
-
-    prog = Progress(require(ingestor, "progress_template").format(id=ingestor_id))
-    interval_minutes = int(ingestor.get("interval_minutes", 30))
-    reader = FolderReader(
-        require(ingestor, "result_dir_template").format(id=ingestor_id),
-        prog,
-        interval_minutes
-    )
-
-    engine = create_engine(
-        str(require(pg, "dsn")),
-        pool_pre_ping=True,
-        pool_recycle=1800,
-        pool_size=2,
-        max_overflow=1,
-        pool_timeout=30,
-        future=True,
-        connect_args={
-            "keepalives": 1,
-            "keepalives_idle": 30,
-            "keepalives_interval": 5,
-            "keepalives_count": 5
-        },
-    )
-    Session = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
-
-    db = IngestDB(
-        Session,
-        inline_ranker=_load_inline_ranker(raw),
-        inline_score_timeout_sec=_inline_score_timeout_sec(raw),
-        inline_score_batch_size=_inline_score_batch_size(raw),
-    )
-    stats_dir=require(ingestor, "stats_dir")
-    discovery_batch_size = _env_int(
-        "INGESTOR_DISCOVERY_BATCH_SIZE",
-        int(ingestor.get("discovery_batch_size", 4000)),
-    )
-    max_buffer_mib = _env_int(
-        "INGESTOR_MAX_BUFFER_MIB",
-        int(ingestor.get("max_buffer_mib", 64)),
-    )
-    svc = IngestService(
-        ingestor_id, db, StatsDeltaWriter(stats_dir),
-        trap_filter=_load_trap_filter(raw, ingestor_id),
-        discovery_batch_size=discovery_batch_size,
-        max_buffer_bytes=max_buffer_mib * 1024 * 1024,
-    )
-    LOGGER.info(
-        "ingest.batching_config",
-        extra={"event": "ingest.batching_config",
-               "discovery_batch_size": discovery_batch_size,
-               "max_buffer_bytes": svc.max_buffer_bytes,
-               "inline_score_timeout_sec": db.inline_score_timeout_sec,
-               "inline_score_batch_size": db.inline_score_batch_size},
-    )
-
-    while True:
-        progressed = False
-        for date, time_, folder in reader.iter_ready_folders():
-            svc.process_folder(folder)
-            prog.advance(date, time_)
-            progressed = True
-        if not progressed:
-            time.sleep(interval_minutes * 60)
-
-
-if __name__ == "__main__":
-    main()

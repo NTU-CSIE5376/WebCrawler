@@ -17,8 +17,8 @@ from containers.scheduler_control.accounting.service import (
     CounterRolloffConfig,
     CounterRolloffService,
 )
-from containers.scheduler_ingest.ingestor import db_ops as ingest_db_ops
-from containers.scheduler_ingest.ingestor.db_ops import IngestDB
+from containers.scheduler_ingest.ingestor.libs import db_ops as ingest_db_ops
+from containers.scheduler_ingest.ingestor.libs.db_ops import IngestDB
 from libs.db.sharding.history_partition import (
     ensure_partitions,
     missing_partition_target,

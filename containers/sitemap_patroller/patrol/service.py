@@ -22,11 +22,13 @@ from urllib.request import Request, urlopen
 from xml.etree import ElementTree as ET
 
 import psycopg2
+import pyarrow as pa
 
 from containers.sitemap_patroller import SITEMAP_USER_AGENT
 from libs.db.sharding.router import ShardRouter, host_of
 from libs.ipc.folder_reader import current_interval
-from libs.ipc.jsonio import append_jsonl
+from libs.ipc.parquet import ParquetBatchWriter
+from libs.ipc.routed_schema import DISCOVERY_SCHEMA
 from libs.ipc.new_link_record import (
     DISCOVERY_SOURCE_SITEMAP,
     build_new_link_record,
@@ -244,23 +246,37 @@ def ensure_domain(cur, domain: str, shard_id: int) -> tuple[int, float]:
 # ----- IPC emit -----
 
 class IngestorEmitter:
-    """Writes router "new outlink" records to the per-ingestor time-bucketed
-    JSONL files the ingestor's FolderReader scans."""
-
+    """Emit the same typed discovery batches as the router."""
     def __init__(self, ingestor_dir_template: str, interval_minutes: int, run_tag: str):
         self.template = ingestor_dir_template
         self.interval_minutes = interval_minutes
-        self.run_tag = run_tag
+        self.pending = {}
+        self.writer = ParquetBatchWriter(os.getpid())
 
-    def _out_path(self, ingestor_id: int) -> Path:
-        base = Path(self.template.format(id=ingestor_id))
-        date, time_ = current_interval(self.interval_minutes)
-        out_dir = base / date / time_
-        fname = f"{datetime.now(timezone.utc).strftime('%H%M')}_sitemap_{self.run_tag}.jsonl"
-        return out_dir / fname
+    def _out_dir(self, ingestor_id):
+        date, bucket = current_interval(self.interval_minutes)
+        return Path(self.template.format(id=ingestor_id))/date/bucket
 
     def emit(self, *, ingestor_id: int, record: dict) -> None:
-        append_jsonl(str(self._out_path(ingestor_id)), record)
+        folder = self._out_dir(ingestor_id)
+        if folder not in self.pending:
+            self.pending[folder] = {name: [] for name in DISCOVERY_SCHEMA.names}
+        columns = self.pending[folder]
+        if record.keys() != columns.keys():
+            raise ValueError('output fields do not match the discovery schema')
+        for name, column in columns.items():
+            column.append(record[name])
+        if len(columns['url']) >= 4096:
+            batch = pa.RecordBatch.from_pydict(columns, schema=DISCOVERY_SCHEMA)
+            self.writer.append_batch(folder, 'discovery', batch)
+            del self.pending[folder]
+
+    def flush(self):
+        for folder, columns in list(self.pending.items()):
+            batch = pa.RecordBatch.from_pydict(columns, schema=DISCOVERY_SCHEMA)
+            self.writer.append_batch(folder, 'discovery', batch)
+            del self.pending[folder]
+        self.writer.flush()
 
 
 # ----- per-row processing -----
@@ -398,6 +414,7 @@ def run_once(cfg: PatrolConfig) -> dict:
             per_domain_last[row["domain"]] = last_fetch
 
             result = process_row(row, cfg, emitter, cur, domain_cache)
+            emitter.flush()
             totals["urls_emitted"] += result["urls_emitted"]
             totals["nested_registered"] += result["nested_registered"]
 
