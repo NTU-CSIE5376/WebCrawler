@@ -11,6 +11,7 @@ set (see crawler-db-url-eviction/reports/phase1/trap_ab/SUMMARY.md).
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 # --- Tier A ---------------------------------------------------------------
@@ -22,8 +23,10 @@ SESSION_PARAMS_STRICT = frozenset({
 })
 # Session id only when the value looks like a random token (sid=154 is a category id).
 SESSION_PARAMS_TOKEN = frozenset({"sid", "sessionid", "session_id", "sessid", "sess", "s"})
+SESSION_HEX_PATTERN = r"[0-9a-f]{16,}"
+SESSION_ALNUM_PATTERN = r"[0-9a-z]{20,}"
 _PATH_SESSION = re.compile(r";(jsessionid|phpsessid)=", re.I)
-_SESSION_VALUE = re.compile(r"^(?:[0-9a-f]{16,}|(?=.*\d)(?=.*[a-z])[0-9a-z]{20,})$", re.I)
+_SESSION_VALUE = re.compile(rf"^(?:{SESSION_HEX_PATTERN}|(?=.*\d)(?=.*[a-z]){SESSION_ALNUM_PATTERN})$", re.I)
 
 # --- Tier B ---------------------------------------------------------------
 MAX_PAGE = 1000
@@ -61,6 +64,66 @@ _HEX_TOKEN = re.compile(r"^[0-9a-f]{32,}$", re.I)
 _B64_TOKEN = re.compile(r"^[A-Za-z0-9_\-+/=]{40,}$")
 
 
+ALL_RULES = (
+    "A_path_repeat", "A_too_many_segments", "A_session_id",
+    "B_big_page", "B_big_offset", "B_calendar", "B_future_date",
+    "B_nested_redirect", "B_faceted", "B_tracking_params", "B_many_params",
+    "B_long_url", "B_random_token",
+)
+# Rules judged precise enough to act on after review (see SUMMARY.md).
+HIGH_CONFIDENCE = frozenset({
+    "A_path_repeat", "A_too_many_segments", "B_nested_redirect", "B_calendar", "B_faceted",
+})
+# Not traps but duplicates of a canonical URL: strip the parameter instead.
+DUPLICATE_CLASS = frozenset({"A_session_id", "B_tracking_params"})
+
+# Python's $ accepts a final newline. Keep Arrow's regex variants together
+# with the scalar patterns so thresholds and character classes cannot drift.
+COLUMNAR_SESSION_HEX_PATTERN = '^'+SESSION_HEX_PATTERN+r'\n?$'
+COLUMNAR_SESSION_ALNUM_PATTERN = '^'+SESSION_ALNUM_PATTERN+r'\n?$'
+COLUMNAR_HEX_TOKEN_PATTERN = _HEX_TOKEN.pattern[:-1]+r'\n?$'
+COLUMNAR_BASE64_TOKEN_PATTERN = _B64_TOKEN.pattern[:-1]+r'\n?$'
+CASE_INSENSITIVE_TRANSLATION = str.maketrans({'İ':'i','ı':'i','ſ':'s','K':'k'})
+FUTURE_DATE_PARAMS = frozenset({'date','year','month','day','start_date','end_date'})
+
+
+DEFAULT_NORMALIZE_PARAMS = frozenset({'srsltid'})
+
+
+@dataclass(frozen=True)
+class URLPolicy:
+    enabled: bool = True
+    normalize: bool = True
+    normalize_params: frozenset[str] = DEFAULT_NORMALIZE_PARAMS
+    shadow_normalize: bool = True
+    drop: bool = True
+    drop_rules: frozenset[str] = HIGH_CONFIDENCE
+
+
+def selected_rules(policy):
+    """Return enabled rules in the same stable order for both backends."""
+    if not policy.enabled or not policy.drop:
+        return []
+    return [name for name in (*ALL_RULES,'unparseable') if name in policy.drop_rules]
+
+
+def parse_integer(v: str) -> int | None:
+    # isdecimal, not isdigit: "²" and "①" pass isdigit() but int() rejects
+    # them. Every isdecimal() string is accepted by int().
+    v = v.strip()
+    if not v.isdecimal() or len(v) >= 12 or (len(v) > 1 and v[0] == "0"):
+        return None
+    return int(v)
+
+
+def is_tracking_parameter(name: str) -> bool:
+    return name in TRACKING_PARAMS or name.startswith('utm_')
+
+
+def is_named_session_parameter(name: str) -> bool:
+    return name in SESSION_PARAMS_STRICT or name.startswith('aspsessionid')
+
+
 def _segments(path: str) -> list[str]:
     return [s for s in path.split("/") if s]
 
@@ -74,19 +137,6 @@ def path_repeat(path: str) -> bool:
         if seen[s] >= PATH_REPEAT_MAX:
             return True
     return False
-
-
-def _int(v: str) -> int | None:
-    # isdecimal, not isdigit: "²" and "①" pass isdigit() but int() rejects
-    # them. Every isdecimal() string is accepted by int().
-    v = v.strip()
-    if not v.isdecimal() or len(v) >= 12 or (len(v) > 1 and v[0] == "0"):
-        return None
-    return int(v)
-
-
-def _is_tracking(name: str) -> bool:
-    return name in TRACKING_PARAMS or name.startswith("utm_")
 
 
 def match_rules(url: str) -> list[str]:
@@ -110,16 +160,16 @@ def match_rules(url: str) -> list[str]:
         hits.append("A_session_id")
 
     # Tier B
-    if any(k in PAGE_PARAMS and (_int(v) or 0) > MAX_PAGE for k, v in params) \
+    if any(k in PAGE_PARAMS and (parse_integer(v) or 0) > MAX_PAGE for k, v in params) \
             or any(int(m) > MAX_PAGE for m in _PAGE_PATH.findall(path) if len(m) < 12):
         hits.append("B_big_page")
-    if any(k in OFFSET_PARAMS and (_int(v) or 0) > MAX_OFFSET for k, v in params):
+    if any(k in OFFSET_PARAMS and (parse_integer(v) or 0) > MAX_OFFSET for k, v in params):
         hits.append("B_big_offset")
     if _CAL_PLUGIN_PATH.search(path) or _CAL_PLUGIN_PARAMS.intersection(names):
         hits.append("B_calendar")
     future = any(int(m[0]) > YEAR_MAX for m in _DATE_PATH.findall(path))
     future = future or any(
-        k in ("date", "year", "month", "day", "start_date", "end_date") and (m := _DATE_PARAM.match(v))
+        k in FUTURE_DATE_PARAMS and (m := _DATE_PARAM.match(v))
         and int(m.group(1)) > YEAR_MAX for k, v in params)
     if future:
         hits.append("B_future_date")
@@ -129,26 +179,12 @@ def match_rules(url: str) -> list[str]:
     facets = {n for n in names if n in FACET_PARAMS or n.startswith(("filter[", "f[", "facet"))}
     if len(facets) >= MIN_FACET_PARAMS:
         hits.append("B_faceted")
-    if any(_is_tracking(n) for n in names):
+    if any(is_tracking_parameter(n) for n in names):
         hits.append("B_tracking_params")
-    if sum(not _is_tracking(n) for n in names) >= MAX_PARAMS:
+    if sum(not is_tracking_parameter(n) for n in names) >= MAX_PARAMS:
         hits.append("B_many_params")
     if len(unquote(url)) > MAX_URL_LEN:
         hits.append("B_long_url")
-    if any(not _is_tracking(k) and (_HEX_TOKEN.match(v) or _B64_TOKEN.match(v)) for k, v in params):
+    if any(not is_tracking_parameter(k) and (_HEX_TOKEN.match(v) or _B64_TOKEN.match(v)) for k, v in params):
         hits.append("B_random_token")
     return hits
-
-
-ALL_RULES = (
-    "A_path_repeat", "A_too_many_segments", "A_session_id",
-    "B_big_page", "B_big_offset", "B_calendar", "B_future_date",
-    "B_nested_redirect", "B_faceted", "B_tracking_params", "B_many_params",
-    "B_long_url", "B_random_token",
-)
-# Rules judged precise enough to act on after review (see SUMMARY.md).
-HIGH_CONFIDENCE = frozenset({
-    "A_path_repeat", "A_too_many_segments", "B_nested_redirect", "B_calendar", "B_faceted",
-})
-# Not traps but duplicates of a canonical URL: strip the parameter instead.
-DUPLICATE_CLASS = frozenset({"A_session_id", "B_tracking_params"})

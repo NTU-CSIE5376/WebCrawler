@@ -21,4 +21,7 @@ tasks:
     cmds:
       - >-
         '{{.TASKFILE_DIR}}/.venv/bin/python'
-        -m pytest containers/scheduler_ingest/tests -q -p no:cacheprovider {{.CLI_ARGS}}
+        -m pytest containers/scheduler_ingest/tests
+        tests/test_ingestor_streaming.py tests/test_ingestor_round_trips.py
+        tests/test_ingestor_connection_retries.py tests/test_ingest_trap_filter.py
+        tests/test_cleanup_crawl_result.py -q -p no:cacheprovider {{.CLI_ARGS}}

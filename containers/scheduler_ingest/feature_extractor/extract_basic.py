@@ -1,16 +1,15 @@
-from datetime import datetime, timezone
+import pyarrow as pa
+import pyarrow.compute as pc
 
-def extract_basic(rec: dict):
-    if rec.get("status") != "ok":
-        return None
+def extract_basic_batch(batch: pa.RecordBatch) -> pa.RecordBatch:
+    """Extract successful rows column-wise, retaining ISO dates until SQL binding.
 
-    return {
-        "url": rec.get("url"),
-        "shard_id": int(rec.get("shard_id")),
-        "domain_id": int(rec.get("domain_id")),
-        "fetched_at": datetime.fromisoformat(rec["fetched_at"]) if rec.get("fetched_at") else datetime.now(timezone.utc),
-        "content_length": len(rec.get("content", "")),
-        "content_hash": rec.get("content_hash"),
-        "num_links": len(rec.get("outlinks", [])),
-    }
-
+    The caller filters status first. Null lengths remain null so the caller can
+    report malformed records individually before writing to the database.
+    """
+    return pa.RecordBatch.from_arrays([
+        batch['url'], batch['shard_id'], batch['domain_id'], batch['fetched_at'],
+        pc.utf8_length(batch['content']), batch['content_hash'],
+        pc.list_value_length(batch['outlinks']),
+    ], names=['url', 'shard_id', 'domain_id', 'fetched_at', 'content_length',
+              'content_hash', 'num_links'])

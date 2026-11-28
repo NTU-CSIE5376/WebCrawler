@@ -13,8 +13,8 @@ from containers.scheduler_control.scorer.service import (
     GoldenDiscoveryRankerConfig,
     GoldenDiscoveryRankerService,
 )
-from containers.scheduler_ingest.ingestor import db_ops as ingest_db_ops
-from containers.scheduler_ingest.ingestor.db_ops import IngestDB
+from containers.scheduler_ingest.ingestor.libs import db_ops as ingest_db_ops
+from containers.scheduler_ingest.ingestor.libs.db_ops import IngestDB
 from scripts import migrate_add_url_score_updated_at as migration
 from scripts import migrate_add_golden_rescore_index as rescore_migration
 

@@ -10,9 +10,12 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from containers.scheduler_ingest.ingestor.db_ops import IngestDB
-from containers.scheduler_ingest.ingestor.service import IngestService
-from containers.scheduler_ingest.ingestor.trap_filter import (
+from containers.scheduler_ingest.ingestor.libs.db_ops import IngestDB
+from containers.scheduler_ingest.ingestor.discovery_ingestor.service import DiscoveryIngestor
+from containers.scheduler_ingest.ingestor.content_ingestor.service import ContentIngestor
+from containers.scheduler_ingest.tests.helpers.parquet_records import write_records
+from containers.scheduler_ingest.ingestor.libs.worker import Checkpoint
+from containers.scheduler_ingest.ingestor.libs.trap_filter import (
     TrapFilter,
     TrapFilterConfig,
     read_audit_log,
@@ -27,6 +30,8 @@ def _link(url, **kw):
 
 
 def _filter(log_dir=None, **kw):
+    # Policy tests keep immediate visibility; bounded writer tests are separate.
+    kw.setdefault("audit_batch_size", 1)
     return TrapFilter(TrapFilterConfig(log_dir=log_dir, **kw), now=lambda: NOW)
 
 
@@ -161,7 +166,7 @@ class _FakeDB:
     def __init__(self):
         self.batches = []
 
-    aggregate_links = staticmethod(IngestDB.aggregate_links)
+    validate = staticmethod(lambda rec: int(rec["shard_id"]))
 
     def process_batch(self, batch):
         self.batches.append(batch)
@@ -173,7 +178,7 @@ class _FakeStats:
         self.last = kw
 
 
-class IngestServiceTrapFilterTest(unittest.TestCase):
+class SplitIngestorTrapFilterTest(unittest.TestCase):
     def test_process_folder_filters_links_but_not_results(self):
         recs = [
             _link("https://example.com/a?srsltid=x", inlink_count_approx=1),
@@ -185,10 +190,16 @@ class IngestServiceTrapFilterTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             folder = Path(d) / "in"
             folder.mkdir()
-            (folder / "part.jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs))
+            write_records(folder, recs)
             db = _FakeDB()
-            svc = IngestService(1, db, _FakeStats(), trap_filter=_filter(log_dir=str(Path(d) / "log")))
-            svc.process_folder(folder)
+            discovery = DiscoveryIngestor(db, _FakeStats(),
+                Checkpoint(Path(d)/'discovery.json', Path(d)/'legacy.json', Path(d)/'content.json'),
+                trap_filter=_filter(log_dir=str(Path(d)/'log')))
+            discovery.process_folder(folder, '20261128', '0000')
+            discovery.close()
+            content = ContentIngestor(db, _FakeStats(),
+                Checkpoint(Path(d)/'content.json', Path(d)/'legacy.json', Path(d)/'discovery.json'))
+            content.process_folder(folder, '20261128', '0000')
             events = list(read_audit_log(Path(d) / "log"))
         links, results = db.batches
         # Both stripped variants collapse into one row with summed inlinks.
@@ -214,10 +225,16 @@ class IngestServiceTrapFilterTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             folder = Path(d) / "in"
             folder.mkdir()
-            (folder / "part.jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs))
+            write_records(folder, recs)
             db = _FakeDB()
-            svc = IngestService(1, db, _FakeStats(), trap_filter=_filter(log_dir=str(Path(d) / "log")))
-            svc.process_folder(folder)
+            discovery = DiscoveryIngestor(db, _FakeStats(),
+                Checkpoint(Path(d)/'discovery.json', Path(d)/'legacy.json', Path(d)/'content.json'),
+                trap_filter=_filter(log_dir=str(Path(d)/'log')))
+            discovery.process_folder(folder, '20261128', '0000')
+            discovery.close()
+            content = ContentIngestor(db, _FakeStats(),
+                Checkpoint(Path(d)/'content.json', Path(d)/'legacy.json', Path(d)/'discovery.json'))
+            content.process_folder(folder, '20261128', '0000')
         links, results = db.batches
         self.assertEqual(sorted(r["url"] for r in links), [
             "https://example.com/article?page=%C2%B2",
@@ -290,7 +307,7 @@ class LoadTrapFilterConfigTest(unittest.TestCase):
     """Rollout must not depend on the host's ingest.yaml carrying the block."""
 
     def _load(self, raw):
-        from containers.scheduler_ingest.ingestor import main as ingest_main
+        from containers.scheduler_ingest.ingestor.libs import config as ingest_main
         with self.assertLogs("ingestor", level="INFO") as logs:
             tf = ingest_main._load_trap_filter(raw, 4)
         events = [r.event for r in logs.records if hasattr(r, "event")]

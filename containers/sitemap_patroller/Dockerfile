@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 RUN pip install --no-cache-dir \
+    pyarrow==26.0.0 \
     tldextract==5.1.1 \
     pyyaml==6.0.2 \
     psycopg2-binary==2.9.11 \

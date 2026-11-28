@@ -1,195 +1,149 @@
-"""Bounded ingestion keeps database batches and discovery ordering intact."""
-import json
+"""Split ingestion streams Arrow batches with bounded, independent buffers."""
 from collections import Counter
 from unittest.mock import MagicMock
 
 import pytest
 
-from containers.scheduler_ingest.ingestor import service
-from containers.scheduler_ingest.ingestor.db_ops import IngestDB
-from containers.scheduler_ingest.ingestor.trap_filter import TrapFilter, TrapFilterConfig
+from containers.scheduler_ingest.ingestor.discovery_ingestor import service as discovery_module
+from containers.scheduler_ingest.ingestor.discovery_ingestor.service import DiscoveryIngestor
+from containers.scheduler_ingest.ingestor.content_ingestor import service as content_module
+from containers.scheduler_ingest.ingestor.content_ingestor.service import ContentIngestor
+from containers.scheduler_ingest.tests.helpers.parquet_records import columns, link, write_records
+from containers.scheduler_ingest.ingestor.libs.trap_filter import TrapFilter, TrapFilterConfig
+from containers.scheduler_ingest.ingestor.libs.worker import Checkpoint
 
 
-def link(url, shard=1, **fields):
-    return {"url": url, "status": "new", "shard_id": shard, **fields}
+def checkpoint(root, kind):
+    return Checkpoint(root/f'{kind}.json', root/'legacy.json', root/'peer.json')
 
 
-def write_records(path, records):
-    path.write_text("".join(json.dumps(rec) + "\n" for rec in records), encoding="utf-8")
+def database():
+    db = MagicMock()
+    db.validate.side_effect = lambda row: int(row['shard_id'])
+    db.process_batch.return_value = []
+    return db
 
 
-def test_writes_full_batches_before_input_is_exhausted(tmp_path, monkeypatch):
-    monkeypatch.setattr(service, "BATCH_SIZE", 4)
-    (tmp_path / "records.jsonl").touch()
-    consumed = 0
-    writes = []
-
-    def records(path):
-        nonlocal consumed
+def test_discovery_writes_full_batches_before_input_is_exhausted(tmp_path, monkeypatch):
+    consumed, writes = [], []
+    def batches(*args, **kwargs):
         for i in range(40):
-            consumed += 1
-            yield link(f"https://example.test/{i}", shard=i % 2)
-
-    db = MagicMock()
-    db.aggregate_links.side_effect = IngestDB.aggregate_links
-    db.process_batch.side_effect = lambda batch: writes.append((consumed, len(batch))) or []
-    monkeypatch.setattr(service, "read_jsonl", records)
-    service.IngestService(0, db, MagicMock()).process_folder(tmp_path)
-    assert writes[0][0] == 7  # Four records for shard zero, three for shard one.
+            consumed.append(i)
+            yield columns([link(f'https://example.test/{i}', sid=i % 2)])['discovery']
+    monkeypatch.setattr(discovery_module, 'routed_files', lambda *args: [tmp_path/'input.parquet'])
+    monkeypatch.setattr(discovery_module, 'read_parquet_batches', batches)
+    db = database()
+    db.process_batch.side_effect = lambda batch: writes.append((len(consumed), len(batch))) or []
+    service = DiscoveryIngestor(db, MagicMock(), checkpoint(tmp_path, 'discovery'), distinct_url_limit=4)
+    service.process_folder(tmp_path, '20261128', '0000')
+    service.close()
+    assert writes[0] == (7, 4)
     assert all(size == 4 for _, size in writes)
-    assert len(writes) == 10
-    assert consumed == 80  # Two passes; the second skips all discovery records.
+    assert len(writes) == 10 and len(consumed) == 40
 
 
-def test_duplicates_across_batches_preserve_additive_inlinks(tmp_path, monkeypatch):
-    monkeypatch.setattr(service, "BATCH_SIZE", 2)
-    shared = "https://example.test/shared"
-    write_records(tmp_path / "records.jsonl", [
-        link(shared, inlink_count_approx=2),
-        link("https://example.test/other"),
-        link(shared, inlink_count_approx=3),
-        link(shared, inlink_count_approx=4),
-    ])
-    counts = Counter()
-    batch_sizes = []
-    db = MagicMock()
-    db.aggregate_links.side_effect = IngestDB.aggregate_links
-
+def test_duplicates_across_batches_preserve_additive_inlinks(tmp_path):
+    shared = 'https://example.test/shared'
+    records = [link(shared, inlink_count_approx=2), link('https://example.test/other'),
+               link(shared, inlink_count_approx=3), link(shared, inlink_count_approx=4)]
+    write_records(tmp_path/'input', records, batch_records=1)
+    counts, sizes = Counter(), []
+    db, stats = database(), MagicMock()
     def upsert(batch):
-        batch_sizes.append(len(batch))
+        sizes.append(len(batch))
         results = []
         for rec in batch:
-            results.append(rec["url"] not in counts)
-            counts[rec["url"]] += rec["inlink_count_approx"]
+            results.append(rec['url'] not in counts)
+            counts[rec['url']] += rec['inlink_count_approx']
         return results
-
     db.process_batch.side_effect = upsert
-    stats = MagicMock()
-    service.IngestService(0, db, stats).process_folder(tmp_path)
-    assert batch_sizes == [2, 1]
+    service = DiscoveryIngestor(db, stats, checkpoint(tmp_path, 'discovery'), distinct_url_limit=2)
+    service.process_folder(tmp_path/'input', '20261128', '0000')
+    service.close()
+    assert sizes == [2, 1]
     assert counts[shared] == 9
-    assert stats.write.call_args.kwargs["counters"]["new_links"] == 2
+    assert sum(call.kwargs['counters'].get('new_links', 0) for call in stats.write.call_args_list) == 2
 
 
-def test_filtering_and_normalization_across_batch_boundaries(tmp_path, monkeypatch, caplog):
-    monkeypatch.setattr(service, "BATCH_SIZE", 2)
-    write_records(tmp_path / "records.jsonl", [
-        link("https://example.test/a?srsltid=1"),
-        link("https://example.test/a?srsltid=2"),
-        link("https://example.test/a?srsltid=3"),
-        link("https://example.test/x/x/x/"),
-    ])
-    # JSON and JSONL are both supported; unrelated files and directories aren't.
-    result = {"url": "https://example.test/a", "status": "ok", "shard_id": 1}
-    (tmp_path / "result.json").write_text(json.dumps(result), encoding="utf-8")
-    (tmp_path / "ignore.txt").write_text("not JSON", encoding="utf-8")
-    (tmp_path / "ignore.jsonl").mkdir()
-    db = MagicMock()
-    db.aggregate_links.side_effect = IngestDB.aggregate_links
-    batches = []
-    db.process_batch.side_effect = lambda batch: batches.append(batch) or []
-    with caplog.at_level("INFO", logger="ingestor"):
-        service.IngestService(0, db, MagicMock(), TrapFilter(TrapFilterConfig())).process_folder(tmp_path)
-    assert [batch[0]["status"] for batch in batches] == ["new", "new", "ok"]
-    assert sum(rec["inlink_count_approx"] for b in batches[:2] for rec in b) == 3
-    assert batches[-1] == [result]
-    done = next(r for r in caplog.records if r.msg == "ingest.folder_done")
-    assert (done.file_cnt, done.trap_dropped, done.url_normalized) == (2, 1, 3)
+def test_filter_normalizes_duplicates_across_input_batches(tmp_path):
+    write_records(tmp_path/'input', [link(f'https://example.test/a?srsltid={i}') for i in range(3)] +
+                  [link('https://example.test/x/x/x/')], batch_records=1)
+    db = database()
+    service = DiscoveryIngestor(db, MagicMock(), checkpoint(tmp_path, 'discovery'),
+                               distinct_url_limit=2, trap_filter=TrapFilter(TrapFilterConfig()))
+    service.process_folder(tmp_path/'input', '20261128', '0000')
+    service.close()
+    batch = db.process_batch.call_args.args[0]
+    assert len(batch) == 1 and batch[0]['url'] == 'https://example.test/a'
+    assert batch[0]['inlink_count_approx'] == 3
 
 
-def test_failed_batch_is_counted_and_later_batches_continue(tmp_path, monkeypatch):
-    monkeypatch.setattr(service, "BATCH_SIZE", 2)
-    write_records(tmp_path / "records.jsonl", [link(f"https://example.test/{i}") for i in range(5)])
-    db = MagicMock()
-    db.aggregate_links.side_effect = IngestDB.aggregate_links
-    db.process_batch.side_effect = [RuntimeError("write failed"), [True, True], [True]]
-    stats = MagicMock()
-    service.IngestService(0, db, stats).process_folder(tmp_path)
-    counters = stats.write.call_args.kwargs["counters"]
-    assert db.process_batch.call_count == 3
-    assert counters["ingest_error"] == counters["error_count"] == 2
-    assert counters["new_links"] == 3
+def test_failed_discovery_batch_retains_checkpoint_for_retry(tmp_path):
+    write_records(tmp_path/'input', [link(f'https://example.test/{i}') for i in range(5)])
+    db, ck = database(), checkpoint(tmp_path, 'discovery')
+    db.process_batch.side_effect = RuntimeError('write failed')
+    service = DiscoveryIngestor(db, MagicMock(), ck, distinct_url_limit=2)
+    with pytest.raises(RuntimeError, match='write failed'):
+        service.process_folder(tmp_path/'input', '20261128', '0000')
+    assert ck.progress.state['date'] is None
+    assert db.process_batch.call_count == 1
+    assert service.buffers  # The failed batch is retained; no silent skipping.
 
 
-def test_byte_budget_flushes_large_records_across_shards(tmp_path, monkeypatch):
-    monkeypatch.setattr(service, "BATCH_SIZE", 2000)
-    (tmp_path / "records.jsonl").touch()
-    consumed = 0
-    writes = []
-
-    def records(path):
-        nonlocal consumed
+def test_content_byte_budget_writes_before_input_is_exhausted(tmp_path, monkeypatch):
+    consumed, writes = [], []
+    def batches(*args, **kwargs):
         for i in range(20):
-            consumed += 1
-            yield {"url": f"https://example.test/{i}", "status": "ok",
-                   "shard_id": i % 4, "content": "x" * 10000}
-
-    db = MagicMock()
-    db.process_batch.side_effect = lambda batch: writes.append((consumed, len(batch))) or []
-    monkeypatch.setattr(service, "read_jsonl", records)
-    service.IngestService(0, db, MagicMock(), max_buffer_bytes=25000).process_folder(tmp_path)
-    # The first pass skips all results. The second writes after three records,
-    # before even one per shard has been read, well below the count limit.
-    assert writes[0][0] == 23
+            consumed.append(i)
+            batch = columns([dict(url=f'https://example.test/{i}', status='ok',
+                                  shard_id=i % 4, title='x'*10000)])['content']
+            yield batch.select([n for n in batch.schema.names if n not in {'content', 'outlinks'}])
+    monkeypatch.setattr(content_module, 'routed_files', lambda *args: [tmp_path/'input.parquet'])
+    monkeypatch.setattr(content_module, 'read_parquet_batches', batches)
+    db = database()
+    db.process_batch.side_effect = lambda batch: writes.append((len(consumed), len(batch))) or []
+    service = ContentIngestor(db, MagicMock(), checkpoint(tmp_path, 'content'), max_buffer_bytes=25000)
+    service.process_folder(tmp_path, '20261128', '0000')
+    assert writes[0][0] <= 3
     assert sum(size for _, size in writes) == 20
     assert max(size for _, size in writes) < 2000
 
 
-def test_single_oversized_record_is_processed_immediately(tmp_path):
-    write_records(tmp_path / "records.jsonl", [
-        {"url": "https://example.test/large", "status": "ok", "shard_id": 1,
-         "content": "x" * 10000},
-    ])
-    db = MagicMock()
-    db.process_batch.return_value = []
-    service.IngestService(0, db, MagicMock(), max_buffer_bytes=1000).process_folder(tmp_path)
+def test_single_oversized_content_record_is_processed(tmp_path):
+    write_records(tmp_path/'input', [dict(url='https://example.test/large', status='ok',
+                                        shard_id=0, title='x'*10000)])
+    db = database()
+    ContentIngestor(db, MagicMock(), checkpoint(tmp_path, 'content'), max_buffer_bytes=1000).process_folder(
+        tmp_path/'input', '20261128', '0000')
     assert len(db.process_batch.call_args.args[0]) == 1
 
 
-def test_larger_discovery_batches_preserve_result_batch_size_and_order(tmp_path, monkeypatch, caplog):
-    monkeypatch.setattr(service, "BATCH_SIZE", 2)
-    results = [{"url": f"https://example.test/result/{i}", "status": "ok", "shard_id": 1} for i in range(5)]
-    links = [link(f"https://example.test/link/{i}") for i in range(13)]
-    write_records(tmp_path / "records.jsonl", [*results, *links])
-    db = MagicMock()
-    db.aggregate_links.side_effect = IngestDB.aggregate_links
-    batches = []
-    db.process_batch.side_effect = lambda batch: batches.append(batch) or []
-    with caplog.at_level("INFO", logger="ingestor"):
-        service.IngestService(0, db, MagicMock(), discovery_batch_size=4).process_folder(tmp_path)
-    assert [len(b) for b in batches if b[0]["status"] == "new"] == [4, 4, 4, 1]
-    assert [len(b) for b in batches if b[0]["status"] != "new"] == [2, 2, 1]
-    assert [r for b in batches[4:] for r in b] == results
-    logged = [r for r in caplog.records if r.msg == "ingest.batch_done"]
-    assert [(r.batch_kind, r.input_records, r.records) for r in logged] == [
-        ("discovery", 4, 4), ("discovery", 4, 4), ("discovery", 4, 4), ("discovery", 1, 1),
-        ("result", 2, 2), ("result", 2, 2), ("result", 1, 1),
-    ]
-    assert all(r.duration_s >= 0 for r in logged)
+def test_discovery_byte_budget_flushes_before_count_limit(tmp_path):
+    write_records(tmp_path/'input', [link(f'https://example.test/{i}', anchor_text='x'*10000)
+                                    for i in range(5)], batch_records=1)
+    db, sizes = database(), []
+    db.process_batch.side_effect = lambda batch: sizes.append(len(batch)) or []
+    service = DiscoveryIngestor(db, MagicMock(), checkpoint(tmp_path, 'discovery'),
+                               max_buffer_bytes=25000, distinct_url_limit=4000)
+    service.process_folder(tmp_path/'input', '20261128', '0000')
+    service.close()
+    assert sizes == [3, 2]
 
 
-def test_byte_budget_still_flushes_before_larger_discovery_limit(tmp_path):
-    write_records(tmp_path / "records.jsonl", [
-        link(f"https://example.test/{i}", anchor_text="x" * 10000) for i in range(5)
-    ])
-    db = MagicMock()
-    db.aggregate_links.side_effect = IngestDB.aggregate_links
-    batches = []
-    db.process_batch.side_effect = lambda batch: batches.append(batch) or []
-    service.IngestService(0, db, MagicMock(), max_buffer_bytes=25000, discovery_batch_size=4000).process_folder(tmp_path)
-    assert [len(b) for b in batches] == [3, 2]
+@pytest.mark.parametrize('size', [0, -1])
+def test_invalid_discovery_batch_size_is_rejected(tmp_path, size):
+    with pytest.raises(ValueError, match='discovery buffer limits'):
+        DiscoveryIngestor(database(), MagicMock(), checkpoint(tmp_path, 'discovery'), distinct_url_limit=size)
 
 
-@pytest.mark.parametrize("size", [0, -1])
-def test_invalid_discovery_batch_size_is_rejected(size):
-    with pytest.raises(ValueError, match="discovery_batch_size must be positive"):
-        service.IngestService(0, MagicMock(), MagicMock(), discovery_batch_size=size)
-
-
-@pytest.mark.parametrize("records", [[], [link("https://example.test/x/x/x/")]])
-def test_empty_or_entirely_filtered_input_never_writes_empty_batch(tmp_path, records):
-    write_records(tmp_path / "records.jsonl", records)
-    db = MagicMock()
-    db.aggregate_links.side_effect = IngestDB.aggregate_links
-    service.IngestService(0, db, MagicMock(), TrapFilter(TrapFilterConfig())).process_folder(tmp_path)
+@pytest.mark.parametrize('records', [[], [link('https://example.test/x/x/x/')]])
+def test_empty_or_filtered_input_never_writes_empty_batch(tmp_path, records):
+    folder = tmp_path/'input'
+    folder.mkdir()
+    write_records(folder, records)
+    db = database()
+    service = DiscoveryIngestor(db, MagicMock(), checkpoint(tmp_path, 'discovery'),
+                               trap_filter=TrapFilter(TrapFilterConfig()))
+    service.process_folder(folder, '20261128', '0000')
+    service.close()
     db.process_batch.assert_not_called()

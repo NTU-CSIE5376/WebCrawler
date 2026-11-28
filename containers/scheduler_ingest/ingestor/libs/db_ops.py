@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -11,7 +12,7 @@ from psycopg2.extras import execute_values
 from sqlalchemy.dialects.postgresql.psycopg2 import PGDialect_psycopg2
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import sessionmaker
-from tenacity import before_sleep_log, retry, retry_if_exception, stop_after_attempt, wait_exponential
+from tenacity import before_sleep_log, retry, retry_if_exception, stop_after_attempt, wait_exponential, wait_random_exponential
 
 from libs.db.sharding.history_partition import ensure_partitions, missing_partition_target
 from libs.ipc.new_link_record import SOURCE_NATURAL, SOURCE_YOUTUBE_CHANNEL
@@ -55,6 +56,38 @@ def _connection_error(exc: Exception, raw_connection=None) -> bool:
     if raw_connection is None and isinstance(original, psycopg2.OperationalError):
         return True  # Connection acquisition failed; no transaction exists yet.
     return _DIALECT.is_disconnect(original, raw_connection, None)
+
+
+def _transaction_aborted(exc: Exception) -> bool:
+    """Only explicit server aborts are safe to replay, including at COMMIT.
+
+    Do not infer an abort from timeout messages or lost commit acknowledgments:
+    replaying an uncertain commit can double additive inlink/fetch counters.
+    """
+    original = exc.orig if isinstance(exc, DBAPIError) else exc
+    return getattr(original, "pgcode", None) in {"40001", "40P01"}
+
+
+def _duplicate_write_rpc(exc: Exception) -> bool:
+    """Recognize Yugabyte's specific retryable-RPC replay error, not XX000 generally.
+
+    This is safe to replay only before COMMIT, after rolling back the whole
+    explicit transaction. A replicated RPC is not proof of a committed SQL
+    transaction, nor is it proof that a COMMIT did not take effect.
+    """
+    original = exc.orig if isinstance(exc, DBAPIError) else exc
+    if getattr(original, "pgcode", None) != "XX000":
+        return False
+    message = getattr(getattr(original, "diag", None), "message_primary", None) or str(original)
+    return re.fullmatch(
+        r"Duplicate request \d+ from client "
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12} "
+        r"\(min running \d+\)", message.strip(),
+    ) is not None
+
+
+def _retryable_execution_error(exc: Exception) -> bool:
+    return _connection_error(exc) or _duplicate_write_rpc(exc)
 
 ROBOTS_UNKNOWN = 0
 ROBOTS_ALLOWED = 1
@@ -109,6 +142,9 @@ _CUR_INSERT_COLS = (
     "is_redirect",
     "redirect_hop_count",
     "robots_bits",
+    "domain_score",
+    "url_score",
+    "source",
 )
 
 # snapshot_id / snapshot_at have DB defaults so they're omitted here.
@@ -174,6 +210,36 @@ def _prefer_higher_priority(dst: dict, src: dict) -> None:
         dst["source"] = src.get("source", SOURCE_NATURAL)
 
 
+class _TimedCursor:
+    """Record statement wall time without logging SQL or URL values."""
+    def __init__(self, cursor, observer):
+        self.cursor, self.observer = cursor, observer
+
+    def __getattr__(self, name):
+        return getattr(self.cursor, name)
+
+    def execute(self, query, *args, **kwargs):
+        prefix = query[:1024].decode(errors="replace") if isinstance(query, bytes) else str(query)[:1024]
+        prefix = prefix.lstrip().lower()
+        if prefix.startswith("select url, content_hash from"):
+            stage = "result_hash_lookup"
+        elif prefix.startswith("select url from"):
+            stage = "discovery_lookup"
+        elif prefix.startswith("insert into url_state_current_"):
+            stage = "discovery_upsert" if "(url, domain_id, domain_score" in prefix else "content_upsert"
+        elif prefix.startswith("insert into url_state_history_"):
+            stage = "history_insert"
+        elif prefix.startswith("insert into url_event_counter_"):
+            stage = "event_counter"
+        else:
+            stage = "other_sql"
+        started = time.monotonic()
+        try:
+            return self.cursor.execute(query, *args, **kwargs)
+        finally:
+            self.observer(stage, time.monotonic()-started)
+
+
 class IngestDB:
     def __init__(
         self,
@@ -183,6 +249,7 @@ class IngestDB:
         inline_score_batch_size: int = 5000,
     ):
         self.Session = Session
+        self.timing_observer = None
         self.inline_ranker = inline_ranker
         self.inline_score_timeout_sec = inline_score_timeout_sec
         self.inline_score_batch_size = max(1, inline_score_batch_size)
@@ -366,6 +433,7 @@ class IngestDB:
                 "idx": idx,
                 "url": url,
                 "domain_id": int(rec["domain_id"]),
+                "domain_score": float(rec.get("domain_score") or 0.0),
                 "fetched_at": (
                     datetime.fromisoformat(rec["fetched_at"])
                     if rec.get("fetched_at")
@@ -427,6 +495,12 @@ class IngestDB:
                 d["is_redirect"],
                 d["redirect_hop_count"],
                 d["robots_bits"],
+                # Content may now arrive before discovery. Seed a usable
+                # natural frontier row; the conflict branch preserves existing
+                # scores and source ownership.
+                d["domain_score"],
+                0.0,
+                SOURCE_NATURAL,
             )
             for d in decoded
         ]
@@ -622,7 +696,12 @@ class IngestDB:
                 score_urls = [url for url in unique_urls if url not in existing_before]
             else:
                 score_urls = unique_urls
-            score_by_url, score_updated_at = self._score_new_links(score_urls)
+            scoring_started = time.monotonic()
+            try:
+                score_by_url, score_updated_at = self._score_new_links(score_urls)
+            finally:
+                if self.timing_observer is not None:
+                    self.timing_observer("inline_scoring", time.monotonic()-scoring_started)
 
         priority_at = datetime.now(timezone.utc)
         link_rows = []
@@ -787,19 +866,35 @@ class IngestDB:
             )
         return self._process_batch_once(recs)
 
+    @retry(
+        retry=retry_if_exception(_transaction_aborted),
+        stop=stop_after_attempt(3),
+        wait=wait_random_exponential(multiplier=0.2, max=2),
+        before_sleep=before_sleep_log(LOGGER, logging.WARNING),
+        reraise=True,
+    )
     def _process_batch_once(self, recs: list[dict]) -> list[IngestResult | bool | None]:
-        """Retry transaction execution, but never replay an uncertain commit."""
+        """Retry confirmed aborts in a fresh transaction, with bounded jitter.
+
+        Connection failures and exact duplicate-write-RPC errors are retried
+        only during execution by _execute_batch; an uncertain COMMIT still
+        escapes without replay.
+        """
         sess, results = self._execute_batch(recs)
         try:
-            # Keep COMMIT outside Tenacity: a lost acknowledgment may mean the
-            # additive counters were already committed successfully.
+            # Keep COMMIT outside the connection retry: a lost acknowledgment
+            # may mean the additive counters were already committed. Only an
+            # explicit serialization/deadlock abort is eligible for replay.
+            started = time.monotonic()
             sess.commit()
+            if self.timing_observer is not None:
+                self.timing_observer("commit", time.monotonic()-started)
             return results
         finally:
             sess.close()
 
     @retry(
-        retry=retry_if_exception(_connection_error),
+        retry=retry_if_exception(_retryable_execution_error),
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=0.2),
         before_sleep=before_sleep_log(LOGGER, logging.WARNING),
@@ -829,7 +924,8 @@ class IngestDB:
             sess.begin()
             connection = sess.connection().connection
             raw_connection = connection.driver_connection
-            with connection.cursor() as cur:
+            with connection.cursor() as raw_cur:
+                cur = _TimedCursor(raw_cur, self.timing_observer) if self.timing_observer is not None else raw_cur
                 # Links first so discovery metadata is set before a matching
                 # crawl result updates the same URL.
                 for sid, items in links_by_shard.items():

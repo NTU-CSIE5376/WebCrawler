@@ -1,8 +1,8 @@
 """Offline cache rollover regressions at the real configured capacity."""
 from unittest.mock import patch
 
-from containers.scheduler_ingest.ingestor import db_ops
-from containers.scheduler_ingest.ingestor.db_ops import IngestDB
+from containers.scheduler_ingest.ingestor.libs import db_ops
+from containers.scheduler_ingest.ingestor.libs.db_ops import IngestDB
 
 NOW = 1000.0
 MAX = db_ops.FROZEN_DOMAIN_CACHE_MAX

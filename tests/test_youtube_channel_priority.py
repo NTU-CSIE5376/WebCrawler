@@ -6,8 +6,8 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from containers.scheduler_ingest.ingestor import db_ops as ingest_db_ops
-from containers.scheduler_ingest.ingestor.db_ops import IngestDB
+from containers.scheduler_ingest.ingestor.libs import db_ops as ingest_db_ops
+from containers.scheduler_ingest.ingestor.libs.db_ops import IngestDB
 from containers.scheduler_ingest.router.service import _priority_fields
 from libs.ipc.new_link_record import SOURCE_YOUTUBE_CHANNEL
 

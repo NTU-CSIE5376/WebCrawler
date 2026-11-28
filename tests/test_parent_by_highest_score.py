@@ -7,8 +7,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from containers.scheduler_ingest.ingestor import db_ops as ingest_db_ops
-from containers.scheduler_ingest.ingestor.db_ops import (
+from containers.scheduler_ingest.ingestor.libs import db_ops as ingest_db_ops
+from containers.scheduler_ingest.ingestor.libs.db_ops import (
     IngestDB,
     _prefer_higher_parent,
 )

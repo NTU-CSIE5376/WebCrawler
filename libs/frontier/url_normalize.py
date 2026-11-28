@@ -5,7 +5,7 @@ session id (`;jsessionid=`, phpBB `sid`) or a tracking parameter (`utm_*`,
 `gclid`, `srsltid`). They are rediscovered on every visit, so stripping them
 before a URL enters the frontier would stop that inflow.
 
-The ingest trap filter (containers/scheduler_ingest/ingestor/trap_filter.py)
+The ingest trap filter (containers/scheduler_ingest/ingestor/libs/trap_filter.py)
 strips only an approved subset with `strip_named_params` (default `srsltid`,
 identical to libs.urls.strip_srsltid used by golden_inject) and logs what
 `strip_params` would remove beyond that, without applying it.
@@ -26,20 +26,15 @@ import re
 from typing import Callable
 from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
-from libs.frontier.trap_rules import SESSION_PARAMS_STRICT, TRACKING_PARAMS
+from .trap_rules import (
+    SESSION_PARAMS_STRICT, SESSION_PARAMS_TOKEN, TRACKING_PARAMS,
+    is_tracking_parameter as _is_tracking, is_named_session_parameter as _is_named_session,
+)
 
 GENERIC_SESSION_PARAMS = frozenset({"sid", "s", "sessionid", "session_id", "sessid", "sess"})
 _SESSION_TOKEN = re.compile(r"^[0-9a-f]{32}$", re.I)
 _PATH_SESSION = re.compile(r";(jsessionid|phpsessid)=[^/?#;]*", re.I)
 PATH_SESSION_PARAMS = frozenset({"jsessionid", "phpsessid"})
-
-
-def _is_tracking(name: str) -> bool:
-    return name in TRACKING_PARAMS or name.startswith("utm_")
-
-
-def _is_named_session(name: str) -> bool:
-    return name in SESSION_PARAMS_STRICT or name.startswith("aspsessionid")
 
 
 def _strip(

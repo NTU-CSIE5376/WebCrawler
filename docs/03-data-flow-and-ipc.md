@@ -1,5 +1,12 @@
 # 03. Data Flow and IPC Contracts
 
+
+The split ingestion workers retain these IPC paths. Discovery aggregates URL
+metadata independently; content commits parsed results without waiting for a
+discovery folder pass. Cleanup waits for both checkpoints and the extractor.
+See [split ingestion and rollout](18-split-ingestion.md) for limits, recovery,
+and migration requirements.
+
 ## 3.1 End-to-End Flow
 
 1. `offerer` reads eligible URLs from sharded DB tables and writes queue batch JSON files.
