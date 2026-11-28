@@ -10,5 +10,6 @@ tenacity==9.2.1
 python-json-logger==2.0.7
 joblib==1.5.3
 numpy==2.1.2
+pyarrow==26.0.0
 scipy==1.17.0
 scikit-learn==1.8.0
