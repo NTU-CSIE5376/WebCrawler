@@ -98,7 +98,7 @@ Code:
 - `containers/crawler/crawler/spiders/spider.py` — generic-link normalization, extractor hook
 - `containers/scheduler_ingest/router/service.py` — `_priority_fields`
 - `libs/ipc/new_link_record.py` — `url_priority` / `source` fields, `SOURCE_YOUTUBE_CHANNEL = 4`
-- `containers/scheduler_ingest/ingestor/db_ops.py` — `_prefer_higher_priority`, `_bulk_links`
+- `containers/scheduler_ingest/ingestor/libs/db_ops.py` — `_prefer_higher_priority`, `_bulk_links`
 
 No schema change: `source` already exists on `url_state_current_*` and
 `url_state_history_*` (`scripts/migrate_add_source.py`).
